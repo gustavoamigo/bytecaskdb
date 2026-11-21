@@ -2463,7 +2463,7 @@ TEST_CASE("embedded API: a database written before #780's row and key format is 
     }
     REQUIRE(records.size() == 1);
     auto& [key, record] = records[0];
-    REQUIRE(record[0] == std::byte{7});
+    REQUIRE(record[0] == std::byte{8});
     record[0] = std::byte{6};
     engine.put({}, key, record);
     engine.close();

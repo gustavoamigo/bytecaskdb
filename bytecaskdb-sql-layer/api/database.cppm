@@ -213,6 +213,9 @@ public:
 // The HINT PostgreSQL reports with the error, empty for none: an
 // ast::SqlError's own, and the one PostgreSQL gives a runtime error.
 [[nodiscard]] auto error_hint(const std::exception& e) noexcept -> std::string_view;
+// PostgreSQL's DETAIL for the error, empty where it has none or the layer
+// gives none: a DDL's refusal (DdlRefused::detail) or ast::SqlError's.
+[[nodiscard]] auto error_detail(const std::exception& e) noexcept -> std::string_view;
 
 class Database;
 
@@ -243,6 +246,8 @@ enum class Command {
   DropDomain,
   DropType,
   DropSequence,
+  CreateSchema,
+  DropSchema,
 };
 
 // The command's name, as PostgreSQL's messages give it: "CREATE TABLE".
@@ -998,7 +1003,11 @@ public:
   // The stored procedure `name` as the transaction's catalog has it; null
   // when it has none (the caller's 42883). SerializationFailure, the
   // transaction ended, when it has none and the live catalog is past the pin.
+  // `name` alone is public's, a session's path; `schema` names its schema
+  // as SQL writes it ("" for none), and one the transaction's catalog lacks
+  // is ast::SqlError 3F000.
   auto procedure(std::string_view name) -> std::shared_ptr<const Procedure>;
+  auto procedure(std::string_view schema, std::string_view name) -> std::shared_ptr<const Procedure>;
   // Runs the stored procedure `procedure` in the transaction
   // (docs/procedures_design.md, *Running a procedure*). `args` holds a value
   // for each of its arguments, OUT ones included (ignored, as PostgreSQL's
@@ -1008,7 +1017,9 @@ public:
   // ast::SqlError 42883 for a procedure that does not exist, ParamError for
   // arguments of the wrong number or type, ExecError BC_C_RANGE for one
   // outside its type, and what its statements throw; the transaction is
-  // then aborted, as for a failed statement.
+  // then aborted, as for a failed statement. `procedure` alone is public's,
+  // a session's path.
+  auto call(const QualifiedName& procedure, const std::vector<Value>& args, const ExecutionOptions& opts = {}) -> Rows;
   auto call(std::string_view procedure, const std::vector<Value>& args, const ExecutionOptions& opts = {}) -> Rows;
   // Runs an UPDATE or DELETE ... WHERE CURRENT OF (Statement::current_of) on
   // the row `cursor` stands on: `params` are the statement's own, and the
@@ -1205,7 +1216,7 @@ private:
   // `reads`, when given, is set to what the plan reads, null for a DDL.
   auto refit_locked(const Target& t, std::shared_ptr<const PortalReads>* reads = nullptr) -> StatementRecord;
   auto open_locked(const Target& t, const std::vector<Value>& params, Holdability hold, Scrolling scrolling) -> Cursor;
-  auto call_locked(std::string_view procedure, const std::vector<Value>& args, const ExecutionOptions& opts,
+  auto call_locked(const QualifiedName& procedure, const std::vector<Value>& args, const ExecutionOptions& opts,
                    bool share) -> Rows;
   // Runs `body` as one statement: a SerializationFailure ends the
   // transaction, any other failure aborts it.
@@ -1317,7 +1328,9 @@ public:
   // Transaction::call, then commit(). A conflict reruns the procedure from
   // its arguments, on a fresh snapshot, as many times as an autocommit
   // statement is retried; past that it throws SerializationFailure (40001).
-  // Throws what Transaction::call and commit() throw.
+  // Throws what Transaction::call and commit() throw. `procedure` alone is
+  // public's, a session's path.
+  auto call(const QualifiedName& procedure, const std::vector<Value>& args, const ExecutionOptions& opts = {}) -> Rows;
   auto call(std::string_view procedure, const std::vector<Value>& args, const ExecutionOptions& opts = {}) -> Rows;
   // Binds the statement's plan again if the live catalog has moved past it,
   // as its next run would. Runs nothing. Throws what that rebind throws,
@@ -1780,8 +1793,15 @@ auto sqlstate(const std::exception& e) noexcept -> std::string_view {
   return "XX000";
 }
 
+auto error_detail(const std::exception& e) noexcept -> std::string_view {
+  if (const auto* x = dynamic_cast<const ast::SqlError*>(&e)) return x->detail();
+  if (const auto* x = dynamic_cast<const DdlRefused*>(&e)) return x->detail();
+  return {};
+}
+
 auto error_hint(const std::exception& e) noexcept -> std::string_view {
   if (const auto* x = dynamic_cast<const ast::SqlError*>(&e)) return x->hint();
+  if (const auto* x = dynamic_cast<const DdlRefused*>(&e)) return x->hint();
   const auto* x = dynamic_cast<const ExecError*>(&e);
   if (x != nullptr && x->conflict() && std::string_view{x->what()} == kReadWrite) return kRetryHint;
   if (x != nullptr && !x->conflict() && x->code() == BC_E_CARDINALITY &&
@@ -1865,6 +1885,8 @@ auto command_name(Command c) -> std::string_view {
     case Command::DropDomain: return "DROP DOMAIN";
     case Command::DropType: return "DROP TYPE";
     case Command::DropSequence: return "DROP SEQUENCE";
+    case Command::CreateSchema: return "CREATE SCHEMA";
+    case Command::DropSchema: return "DROP SCHEMA";
   }
   return {};
 }
@@ -1916,6 +1938,10 @@ auto Statement::command_of(const ast::Statement& statement) -> Command {
         } else if constexpr (std::is_same_v<T, ast::DropTypeOrSequence>) {
           using K = ast::DropTypeOrSequence::Kind;
           return st.kind == K::Domain ? Command::DropDomain : st.kind == K::Type ? Command::DropType : Command::DropSequence;
+        } else if constexpr (std::is_same_v<T, ast::CreateSchema>) {
+          return Command::CreateSchema;
+        } else if constexpr (std::is_same_v<T, ast::DropSchema>) {
+          return Command::DropSchema;
         } else {
           static_assert(std::is_same_v<T, ast::AddColumn>);
           return Command::AlterTable;
@@ -2494,9 +2520,9 @@ auto notice_type_name(SqlKind k) -> std::string_view {
 }
 
 // The NOTICE PostgreSQL gives for a DDL that IF [NOT] EXISTS skipped.
-auto skipped(const Ddl& ddl) -> Notice {
+auto skipped(const Ddl& ddl, const Catalog& cat) -> Notice {
   return std::visit(
-      [](const auto& d) -> Notice {
+      [&cat](const auto& d) -> Notice {
         using T = std::decay_t<decltype(d)>;
         if constexpr (std::is_same_v<T, CreateTableDdl>) {
           return {"42P07", "relation \"" + d.name.name + "\" already exists, skipping"};
@@ -2509,7 +2535,7 @@ auto skipped(const Ddl& ddl) -> Notice {
         } else if constexpr (std::is_same_v<T, DropRoleDdl>) {
           return {"00000", "role \"" + d.names.front() + "\" does not exist, skipping"};
         } else if constexpr (std::is_same_v<T, DropTypeDdl>) {
-          return {"00000", "type \"" + d.name.name + "\" does not exist, skipping"};
+          return {"00000", "type \"" + cat.written(d.name) + "\" does not exist, skipping"};
         } else if constexpr (std::is_same_v<T, DropSequenceDdl>) {
           return {"00000", "sequence \"" + d.name.name + "\" does not exist, skipping"};
         } else if constexpr (std::is_same_v<T, CreateSequenceDdl>) {
@@ -2519,7 +2545,11 @@ auto skipped(const Ddl& ddl) -> Notice {
           for (const auto& t : d.arg_types.value_or(std::vector<SqlType>{})) {
             args += (args.empty() ? "" : ",") + std::string{notice_type_name(t.kind)};
           }
-          return {"00000", "procedure " + d.name.name + "(" + args + ") does not exist, skipping"};
+          return {"00000", "procedure " + cat.written(d.name) + "(" + args + ") does not exist, skipping"};
+        } else if constexpr (std::is_same_v<T, CreateSchemaDdl>) {
+          return {"42P06", "schema \"" + d.name + "\" already exists, skipping"};
+        } else if constexpr (std::is_same_v<T, SkippedDdl>) {
+          return {"00000", d.notice};
         } else {
           throw std::logic_error("a DDL that never skips changed nothing");
         }
@@ -2539,7 +2569,16 @@ auto skip_notices(const Ddl& ddl, const Catalog& before, bool changed) -> std::v
     }
     return out;
   }
-  if (!changed) out.push_back(skipped(ddl));
+  if (const auto* ds = std::get_if<DropSchemaDdl>(&ddl)) {
+    if (!ds->if_exists) return out;
+    for (const auto& name : ds->names) {
+      if (name != "public" && system_schema(name) == 0 && before.schema(name) == nullptr) {
+        out.push_back({"00000", "schema \"" + name + "\" does not exist, skipping"});
+      }
+    }
+    return out;
+  }
+  if (!changed) out.push_back(skipped(ddl, before));
   return out;
 }
 
@@ -2681,13 +2720,13 @@ auto Database::create_table_as(const Statement& stmt, const std::vector<Value>& 
   const auto& query = *stmt.query_;
   Rows out;
   CreateTableDdl ddl;
-  ddl.name = ctas.table;
+  ddl.name = bound::creation_name(ctas.table, true, *live_->current(), ctas.pos);
   ddl.if_not_exists = ctas.if_not_exists;
   // As PostgreSQL: a relation of the name is found before the query is
   // planned, and IF NOT EXISTS then skips the statement.
-  if (relation_taken(*live_->current(), ctas.table)) {
+  if (relation_taken(*live_->current(), ddl.name)) {
     if (!ctas.if_not_exists) throw DdlRefused("relation \"" + ctas.table.name + "\" already exists", kDuplicateTable);
-    out.notices.push_back(skipped(Ddl{ddl}));
+    out.notices.push_back(skipped(Ddl{ddl}, *live_->current()));
     return out;
   }
   if (stmt.query_error_) {
@@ -2726,7 +2765,7 @@ auto Database::create_table_as(const Statement& stmt, const std::vector<Value>& 
     throw ExecError(e.what(), BC_E_LIMIT);  // the backfill, a row or the ids over the engine's limits: 54000
   }
   if (!changed) {
-    out.notices.push_back(skipped(Ddl{std::move(ddl)}));
+    out.notices.push_back(skipped(Ddl{std::move(ddl)}, *live_->current()));
     return out;
   }
   out.affected = ctas.with_data ? n : -1;
@@ -3174,6 +3213,10 @@ auto Database::run_procedure(const CompiledProcedure& p, const Procedure& def, c
 }
 
 auto Database::call(std::string_view procedure, const std::vector<Value>& args, const ExecutionOptions& opts) -> Rows {
+  return call(QualifiedName{kPublicSchema, std::string{procedure}}, args, opts);
+}
+
+auto Database::call(const QualifiedName& procedure, const std::vector<Value>& args, const ExecutionOptions& opts) -> Rows {
   // Rerun from the arguments on a conflict, as an autocommit statement is
   // retried: kMaxRetries attempts in all.
   for (std::uint32_t attempt = 1;; ++attempt) {
@@ -3672,13 +3715,13 @@ auto Transaction::create_table_as(const Target& t, const ast::CreateTableAs& cta
   const auto cat = bc_txn_catalog(h.txn);
   Rows out;
   CreateTableDdl ddl;
-  ddl.name = ctas.table;
+  ddl.name = bound::creation_name(ctas.table, true, *cat, ctas.pos);
   ddl.if_not_exists = ctas.if_not_exists;
   // As PostgreSQL: a relation of the name is found before the query is
   // planned, and IF NOT EXISTS then skips the statement.
-  if (relation_taken(*cat, ctas.table)) {
+  if (relation_taken(*cat, ddl.name)) {
     if (!ctas.if_not_exists) throw DdlRefused("relation \"" + ctas.table.name + "\" already exists", kDuplicateTable);
-    out.notices.push_back(skipped(Ddl{ddl}));
+    out.notices.push_back(skipped(Ddl{ddl}, *cat));
     return out;
   }
   // The query, compiled privately against the transaction's catalog and run
@@ -4275,7 +4318,9 @@ auto Database::txn_procedure(TxnHandle& h, const Procedure& def, const TxnCatalo
   return {std::shared_ptr<const TxnPlan>{std::move(plan)}, proc};
 }
 
-auto Transaction::procedure(std::string_view name) -> std::shared_ptr<const Procedure> {
+auto Transaction::procedure(std::string_view name) -> std::shared_ptr<const Procedure> { return procedure("", name); }
+
+auto Transaction::procedure(std::string_view schema, std::string_view name) -> std::shared_ptr<const Procedure> {
   if (!h_) throw std::logic_error("the transaction has ended");
   std::shared_lock<std::shared_mutex> lock{life_->mu};
   check_usable();
@@ -4283,11 +4328,13 @@ auto Transaction::procedure(std::string_view name) -> std::shared_ptr<const Proc
     for (auto attempt = 0;; ++attempt) {
       const auto fresh = bc_txn_catalog_version(h_->txn) == 0;
       auto cat = bc_txn_catalog(h_->txn);
-      const auto* def = cat->procedure(QualifiedName{kPublicSchema, std::string{name}});  // the session's path
+      const auto at = bound::schema_id(schema, *cat);
+      const auto* def = at ? cat->procedure(QualifiedName{*at, std::string{name}}) : nullptr;
       if (def != nullptr) return {cat, def};
       // A binder error at a stale pin (exception 1); a first statement
       // re-pins. A transaction that has run DDL reports its own catalog's.
       if (bc_txn_has_ddl(h_->txn) || db_->live_->current()->version() == bc_txn_catalog_version(h_->txn)) {
+        if (!at) throw ast::SqlError{"schema \"" + std::string{schema} + "\" does not exist", -1, kInvalidSchemaName};
         return nullptr;
       }
       if (fresh && bc_txn_first_statement(h_->txn) && attempt < kTxnPlanAttempts && bc_txn_repin(h_->txn)) {
@@ -4301,13 +4348,18 @@ auto Transaction::procedure(std::string_view name) -> std::shared_ptr<const Proc
 
 auto Transaction::call(std::string_view procedure, const std::vector<Value>& args, const ExecutionOptions& opts)
     -> Rows {
+  return call(QualifiedName{kPublicSchema, std::string{procedure}}, args, opts);
+}
+
+auto Transaction::call(const QualifiedName& procedure, const std::vector<Value>& args, const ExecutionOptions& opts)
+    -> Rows {
   if (!h_) throw std::logic_error("the transaction has ended");
   std::shared_lock<std::shared_mutex> lock{life_->mu};
   check_usable();
   return call_locked(procedure, args, opts, false);
 }
 
-auto Transaction::call_locked(std::string_view procedure, const std::vector<Value>& args, const ExecutionOptions& opts,
+auto Transaction::call_locked(const QualifiedName& procedure, const std::vector<Value>& args, const ExecutionOptions& opts,
                               bool share) -> Rows {
   return as_statement([&] {
     for (auto attempt = 0;; ++attempt) {
@@ -4318,12 +4370,12 @@ auto Transaction::call_locked(std::string_view procedure, const std::vector<Valu
       const Database::TxnCatalog tc{bc_txn_pinned_catalog(h_->txn), cat};
       const auto base = tc.base->version();
       const auto first = fresh && bc_txn_first_statement(h_->txn);
-      const auto* def = cat->procedure(QualifiedName{kPublicSchema, std::string{procedure}});  // the session's path
+      const auto* def = cat->procedure(procedure);
       std::shared_ptr<const CompiledProcedure> plan;
       std::exception_ptr bind_error;
       if (def == nullptr) {
         bind_error = std::make_exception_ptr(
-            ast::SqlError{"procedure " + std::string{procedure} + " does not exist", -1, kUndefinedFunction});
+            ast::SqlError{"procedure " + procedure.name + " does not exist", -1, kUndefinedFunction});
       } else {
         try {
           plan = db_->txn_procedure(*h_, *def, tc, share);

@@ -1,0 +1,19 @@
+A view name the record stores no schema for is read through the session's path, public, instead of failing.
+Expected: caught.
+Guarded-by: "schemas: a view whose stored names lack one its query reads is XX000 at use\, never a search"
+
+diff --git a/bytecaskdb-sql-layer/sql/binder.cppm b/bytecaskdb-sql-layer/sql/binder.cppm
+index 1c3212e..6c96f86 100644
+--- a/bytecaskdb-sql-layer/sql/binder.cppm
++++ b/bytecaskdb-sql-layer/sql/binder.cppm
+@@ -5847,9 +5847,7 @@ void stored_names(ast::Select& s, const View& v, const Catalog& cat) {
+   for (auto& item : s.from) {
+     if (!item.table.schema.empty()) continue;
+     auto it = std::ranges::find(v.names, item.table.name, &ViewName::name);
+-    if (it == v.names.end()) {
+-      throw SqlError{"view " + v.name + " has no stored resolution for " + item.table.name, -1, kInternalError};
+-    }
++    if (it == v.names.end()) continue;  // the session's path
+     item.table.schema = cat.schema_name(it->schema);
+   }
+   each_subquery(s, [&](std::shared_ptr<const ast::Select>& q) {

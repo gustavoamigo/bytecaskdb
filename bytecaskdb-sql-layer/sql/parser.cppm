@@ -21,6 +21,7 @@ module;
 #include <memory>
 #include <optional>
 #include <string>
+#include <span>
 #include <string_view>
 #include <utility>
 #include <system_error>
@@ -80,21 +81,35 @@ auto str(const PgQuery__Node* n) -> std::string {
   return n->string->sval;
 }
 
-// An unqualified name of a relation, procedure or type: of public, the one
-// schema of a session's path (docs/catalog_design.md, *Name resolution with
-// schemas*). A qualified name is refused until stage 1b.
-auto in_public(std::string name) -> QualifiedName { return QualifiedName{kPublicSchema, std::move(name)}; }
-
-// A FROM item's table; its alias, if any, is read by select().
-auto from_relation(const PgQuery__RangeVar* rv) -> QualifiedName {
-  if (rv == nullptr) reject("expected a table", -1);
-  if (!empty(rv->schemaname)) {
-    reject("schema-qualified names are not supported", rv->location);
+// A name of a relation, procedure or type, as written: [schema.]name
+// (docs/catalog_design.md, *Name resolution with schemas*). A third part
+// names a database, which the layer does not reach (0A000, PostgreSQL's
+// "cross-database references"; `quoted` as PostgreSQL quotes a relation's);
+// a fourth is malformed (42601), as `kind` words it.
+auto dotted_name(PgQuery__Node* const* items, std::size_t n, std::int32_t pos, bool quoted = false,
+                 std::string_view kind = "qualified name") -> ObjectName {
+  if (n == 0) reject("expected a name", pos);
+  std::string all;
+  for (std::size_t i = 0; i < n; ++i) all += (i == 0 ? "" : ".") + str(items[i]);
+  if (n > 3) reject("improper " + std::string{kind} + " (too many dotted names): " + all, pos);
+  if (n == 3) {
+    reject("cross-database references are not implemented: " + (quoted ? "\"" + all + "\"" : all), pos, kFeatureNotSupported);
   }
-  return in_public(rv->relname);
+  return n == 2 ? ObjectName{str(items[0]), str(items[1])} : ObjectName{"", str(items[0])};
 }
 
-auto relation(const PgQuery__RangeVar* rv) -> QualifiedName {
+// A FROM item's table; its alias, if any, is read by select().
+auto from_relation(const PgQuery__RangeVar* rv) -> ObjectName {
+  if (rv == nullptr) reject("expected a table", -1);
+  if (!empty(rv->catalogname)) {
+    reject("cross-database references are not implemented: \"" + std::string{rv->catalogname} + "." +
+               std::string{rv->schemaname} + "." + std::string{rv->relname} + "\"",
+           rv->location, kFeatureNotSupported);
+  }
+  return ObjectName{empty(rv->schemaname) ? "" : rv->schemaname, rv->relname};
+}
+
+auto relation(const PgQuery__RangeVar* rv) -> ObjectName {
   auto name = from_relation(rv);
   if (rv->alias != nullptr) reject("table aliases are not supported", rv->location);
   return name;
@@ -127,14 +142,16 @@ auto is_grammar_alias(std::string_view name) -> bool {
   return false;
 }
 
-// A type name's schema, refused as PostgreSQL 17 refuses it while the layer
-// has no schemas (docs/catalog_design.md, *Stages of schemas*): only
-// pg_catalog holds types, and not under the grammar's SQL spellings. A
-// schema PostgreSQL always has holds none of them (42704); any other does
-// not exist (3F000). Three parts name a database (0A000), four or more are
-// malformed (42601).
-void check_type_schema(const PgQuery__TypeName* tn, TypeNameUse use) {
-  if (tn->n_names == 1) return;
+// A type name's schema, refused here as PostgreSQL 17 refuses it where the
+// answer needs no catalog (docs/catalog_design.md, *Name resolution with
+// schemas*): pg_catalog holds the built-in types, but not under the
+// grammar's SQL spellings; public and the other schemas PostgreSQL always
+// has hold none the layer can use (42704). Three parts name a database
+// (0A000), four or more are malformed (42601). Any other schema is
+// returned: a user schema's, which only the binder can tell missing (3F000)
+// from present (42704), and "" for none or pg_catalog.
+auto type_schema(const PgQuery__TypeName* tn, TypeNameUse use) -> std::string {
+  if (tn->n_names == 1) return {};
   std::string dotted;
   for (std::size_t i = 0; i < tn->n_names; ++i) dotted += (i == 0 ? "" : ".") + str(tn->names[i]);
   if (tn->n_names > 3) reject("improper qualified name (too many dotted names): " + dotted, tn->location);
@@ -146,10 +163,10 @@ void check_type_schema(const PgQuery__TypeName* tn, TypeNameUse use) {
   auto schema = str(tn->names[0]);
   if (schema == "pg_catalog") {
     if (is_grammar_alias(str(tn->names[1]))) missing_type();
-    return;
+    return {};
   }
-  if (schema == "public" || schema == "information_schema" || schema == "pg_toast") missing_type();
-  reject("schema \"" + schema + "\" does not exist", tn->location, kInvalidSchemaName);
+  if (system_schema(schema) != 0 || schema == "public") missing_type();
+  return schema;
 }
 
 // A type as a column, a cast or an argument names it: libpg_query's last
@@ -158,9 +175,11 @@ void check_type_schema(const PgQuery__TypeName* tn, TypeNameUse use) {
 auto type_ast(const PgQuery__TypeName* tn, std::string name, std::int32_t pos, TypeNameUse use = TypeNameUse::Quoted)
     -> ColumnDefAst {
   if (tn == nullptr || tn->n_names == 0 || tn->setof || tn->pct_type) reject("type not supported", pos);
-  check_type_schema(tn, use);
-  if (tn->n_array_bounds != 0) reject("type not supported", pos);
+  auto schema = type_schema(tn, use);
+  // A user schema's type is refused by the binder, its schema first.
+  if (tn->n_array_bounds != 0 && schema.empty()) reject("type not supported", pos);
   ColumnDefAst out;
+  out.type_schema = std::move(schema);
   out.name = std::move(name);
   out.type = str(tn->names[tn->n_names - 1]);
   out.pos = pos;
@@ -184,7 +203,7 @@ auto call_clock(std::string_view name) -> const char* {
   return nullptr;
 }
 auto literal(const PgQuery__Node* n) -> Literal;
-auto object_name(const PgQuery__Node* n, std::int32_t pos) -> QualifiedName;
+auto object_name(const PgQuery__Node* n, std::int32_t pos) -> ObjectName;
 // `into_taken`: the statement's INTO, which its caller reads (SELECT … INTO);
 // an INTO anywhere else is refused. `nested`: a subquery's, whose
 // qualifiers may name the query around it (resolve_aliases).
@@ -235,16 +254,29 @@ auto expr(const PgQuery__Node* n) -> Expr {
   // if-chains, not switches: libpg_query's node enum has 268 values.
   if (n->node_case == PG_QUERY__NODE__NODE_COLUMN_REF) {
     const auto* c = n->column_ref;
-    if (c->n_fields != 1 && c->n_fields != 2) reject("column names take at most a table's name", c->location);
     const auto* last = c->fields[c->n_fields - 1];
+    // [[database.]schema.]table.column, or .*: a database is not reached
+    // (0A000), more parts are malformed (42601), as PostgreSQL 17 words them.
+    if (c->n_fields > 3) {
+      std::string all;
+      for (std::size_t i = 0; i < c->n_fields; ++i) {
+        all += (i == 0 ? "" : ".") + (c->fields[i]->node_case == PG_QUERY__NODE__NODE_A_STAR ? std::string{"*"} : str(c->fields[i]));
+      }
+      if (c->n_fields > 4) reject("improper qualified name (too many dotted names): " + all, c->location);
+      reject("cross-database references are not implemented: " + all, c->location, kFeatureNotSupported);
+    }
+    auto qualify = [&](Expr& e) {
+      if (c->n_fields >= 2) e.table = str(c->fields[c->n_fields - 2]);
+      if (c->n_fields == 3) e.schema = str(c->fields[0]);
+    };
     if (last->node_case == PG_QUERY__NODE__NODE_A_STAR) {
       Expr star{Expr::Kind::Star, {}, 0, nullptr, nullptr, c->location};
-      if (c->n_fields == 2) star.table = str(c->fields[0]);
+      qualify(star);
       return star;
     }
     if (last->node_case != PG_QUERY__NODE__NODE_STRING) reject("column reference not supported", c->location);
     Expr e{Expr::Kind::Column, str(last), 0, nullptr, nullptr, c->location};
-    if (c->n_fields == 2) e.table = str(c->fields[0]);
+    qualify(e);
     return e;
   }
   if (n->node_case == PG_QUERY__NODE__NODE_PARAM_REF) {
@@ -444,6 +476,7 @@ auto expr(const PgQuery__Node* n) -> Expr {
     Expr e{Expr::Kind::Cast, {}, 0, nullptr, nullptr, c->location};
     e.cast_type = std::move(type.type);
     e.cast_typmods = std::move(type.typmods);
+    e.cast_schema = std::move(type.type_schema);
     e.rhs = std::make_unique<Expr>(operand(c->arg));
     return e;
   }
@@ -910,8 +943,7 @@ auto drop_procedure(const PgQuery__DropStmt* s, std::int32_t pos) -> DropProcedu
   const auto* obj = s->objects[0];
   if (obj->node_case != PG_QUERY__NODE__NODE_OBJECT_WITH_ARGS) reject("expected a procedure", pos);
   const auto* o = obj->object_with_args;
-  if (o->n_objname != 1) reject("schema-qualified names are not supported", pos);
-  DropProcedure out{in_public(str(o->objname[0])), std::nullopt, s->missing_ok != 0, pos};
+  DropProcedure out{dotted_name(o->objname, o->n_objname, pos), std::nullopt, s->missing_ok != 0, pos};
   if (o->args_unspecified) return out;
   out.arg_types.emplace();
   for (std::size_t i = 0; i < o->n_objargs; ++i) {
@@ -921,8 +953,21 @@ auto drop_procedure(const PgQuery__DropStmt* s, std::int32_t pos) -> DropProcedu
   return out;
 }
 
-// DROP TABLE, INDEX, VIEW and PROCEDURE, one object each, RESTRICT (the default).
+// DROP SCHEMA [IF EXISTS] name [, …] [RESTRICT]: CASCADE is stage 5's
+// (docs/catalog_design.md, *Stages of schemas*).
+auto drop_schema(const PgQuery__DropStmt* s, std::int32_t pos) -> DropSchema {
+  if (s->behavior == PG_QUERY__DROP_BEHAVIOR__DROP_CASCADE) {
+    reject("DROP SCHEMA … CASCADE is not supported yet", pos, kFeatureNotSupported);
+  }
+  DropSchema out{{}, s->missing_ok != 0, pos};
+  for (std::size_t i = 0; i < s->n_objects; ++i) out.names.push_back(str(s->objects[i]));
+  return out;
+}
+
+// DROP TABLE, INDEX, VIEW and PROCEDURE, one object each, RESTRICT (the
+// default); DROP SCHEMA of a list.
 auto drop(const PgQuery__DropStmt* s, std::int32_t pos) -> Statement {
+  if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_SCHEMA) return drop_schema(s, pos);
   if (s->n_objects != 1 || s->behavior == PG_QUERY__DROP_BEHAVIOR__DROP_CASCADE || s->concurrent) {
     reject("DROP takes one object, without CASCADE or CONCURRENTLY", pos);
   }
@@ -934,10 +979,8 @@ auto drop(const PgQuery__DropStmt* s, std::int32_t pos) -> Statement {
                : s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_SEQUENCE ? std::optional{K::Sequence}
                                                                           : std::nullopt;
   if (other) return DropTypeOrSequence{*other, object_name(obj, pos), s->missing_ok != 0, pos};
-  if (obj->node_case != PG_QUERY__NODE__NODE_LIST || obj->list->n_items != 1) {
-    reject("schema-qualified names are not supported", pos);
-  }
-  auto name = in_public(str(obj->list->items[0]));
+  if (obj->node_case != PG_QUERY__NODE__NODE_LIST) reject("expected a name", pos);
+  auto name = dotted_name(obj->list->items, obj->list->n_items, pos, true, "relation name");
   if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_TABLE) return DropTable{name, s->missing_ok != 0, pos};
   if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_INDEX) return DropIndex{name, s->missing_ok != 0, pos};
   if (s->remove_type == PG_QUERY__OBJECT_TYPE__OBJECT_VIEW) return DropView{name, s->missing_ok != 0, pos};
@@ -976,38 +1019,59 @@ auto drop_role(const PgQuery__DropRoleStmt* s, std::int32_t pos) -> DropRole {
 }
 
 // One name a DROP or a GRANT lists: a relation's RangeVar, a type's TypeName
-// or a list of one String. A qualified one is refused.
-auto object_name(const PgQuery__Node* n, std::int32_t pos) -> QualifiedName {
-  if (n->node_case == PG_QUERY__NODE__NODE_RANGE_VAR) {
-    const auto* rv = n->range_var;
-    if (!empty(rv->schemaname) || !empty(rv->catalogname)) reject("schema-qualified names are not supported", rv->location);
-    return in_public(rv->relname);
-  }
+// or a list of Strings, each [schema.]name.
+auto object_name(const PgQuery__Node* n, std::int32_t pos) -> ObjectName {
+  if (n->node_case == PG_QUERY__NODE__NODE_RANGE_VAR) return from_relation(n->range_var);
   if (n->node_case == PG_QUERY__NODE__NODE_TYPE_NAME) {
     const auto* tn = n->type_name;
-    if (tn->n_names != 1 || tn->n_typmods != 0 || tn->n_array_bounds != 0) reject("a type is named by one name", tn->location);
-    return in_public(str(tn->names[0]));
+    if (tn->n_typmods != 0 || tn->n_array_bounds != 0) reject("a type is named without modifiers", tn->location);
+    return dotted_name(tn->names, tn->n_names, tn->location);
   }
-  if (n->node_case == PG_QUERY__NODE__NODE_LIST && n->list->n_items == 1) return in_public(str(n->list->items[0]));
-  reject("schema-qualified names are not supported", pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_LIST) return dotted_name(n->list->items, n->list->n_items, pos, true, "relation name");
+  reject("expected a name", pos);
+}
+
+// CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION role], or CREATE SCHEMA
+// AUTHORIZATION role. Elements are stage 2's (docs/catalog_design.md,
+// *Stages of schemas*); PUBLIC is no role (42704), as in PostgreSQL 17.
+auto create_schema(const PgQuery__CreateSchemaStmt* s, std::int32_t pos) -> CreateSchema {
+  if (s->n_schema_elts != 0) reject("CREATE SCHEMA with schema elements is not supported yet", pos, kFeatureNotSupported);
+  CreateSchema out{empty(s->schemaname) ? "" : s->schemaname, std::nullopt, s->if_not_exists != 0, pos};
+  if (const auto* r = s->authrole) {
+    switch (r->roletype) {
+      case PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_CSTRING: out.authorization = r->rolename; break;
+      case PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_CURRENT_ROLE:
+      case PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_CURRENT_USER:
+      case PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_SESSION_USER: out.authorization = ""; break;
+      case PG_QUERY__ROLE_SPEC_TYPE__ROLESPEC_PUBLIC: reject("role \"public\" does not exist", r->location, kUndefinedObject);
+      case PG_QUERY__ROLE_SPEC_TYPE__ROLE_SPEC_TYPE_UNDEFINED:
+      case _PG_QUERY__ROLE_SPEC_TYPE_IS_INT_SIZE: reject("expected a role", r->location);
+    }
+  }
+  // CREATE SCHEMA AUTHORIZATION CURRENT_USER names the schema after the
+  // session's user, which the bootstrap role every session is has no name for.
+  if (out.name.empty() && out.authorization && out.authorization->empty()) {
+    reject("CREATE SCHEMA AUTHORIZATION CURRENT_USER without a schema name is not supported", pos, kFeatureNotSupported);
+  }
+  if (out.name.empty()) out.name = *out.authorization;
+  return out;
 }
 
 // CREATE DOMAIN name [AS] type: no constraint, DEFAULT or COLLATE yet.
 auto create_domain(const PgQuery__CreateDomainStmt* s, std::int32_t pos) -> CreateDomain {
-  if (s->n_domainname != 1) reject("schema-qualified names are not supported", pos);
   if (s->n_constraints != 0 || s->coll_clause != nullptr) {
     reject("a domain's DEFAULT, NOT NULL, CHECK and COLLATE are not supported yet", pos);
   }
-  return CreateDomain{in_public(str(s->domainname[0])), type_ast(s->type_name, "", pos), pos};
+  return CreateDomain{dotted_name(s->domainname, s->n_domainname, pos), type_ast(s->type_name, "", pos), pos};
 }
 
 // CREATE SEQUENCE [IF NOT EXISTS] name, with no option yet.
 auto create_sequence(const PgQuery__CreateSeqStmt* s, std::int32_t pos) -> CreateSequence {
   const auto* rv = s->sequence;
-  if (!empty(rv->schemaname) || !empty(rv->catalogname)) reject("schema-qualified names are not supported", rv->location);
+  auto name = from_relation(rv);
   if (!empty(rv->relpersistence) && rv->relpersistence[0] != 'p') reject("CREATE TEMPORARY SEQUENCE is not supported", pos);
   if (s->n_options != 0 || s->for_identity) reject("a sequence's options are not supported yet", pos);
-  return CreateSequence{in_public(rv->relname), s->if_not_exists != 0, pos};
+  return CreateSequence{std::move(name), s->if_not_exists != 0, pos};
 }
 
 // CREATE TYPE name, the shell type; any other CREATE TYPE, and the other
@@ -1017,8 +1081,7 @@ auto create_type(const PgQuery__DefineStmt* s, std::int32_t pos) -> CreateType {
   if (s->kind != PG_QUERY__OBJECT_TYPE__OBJECT_TYPE || s->n_definition != 0 || s->n_args != 0 || s->replace) {
     reject("only CREATE TYPE name, a shell type, is supported", pos);
   }
-  if (s->n_defnames != 1) reject("schema-qualified names are not supported", pos);
-  return CreateType{in_public(str(s->defnames[0])), pos};
+  return CreateType{dotted_name(s->defnames, s->n_defnames, pos), pos};
 }
 
 // GRANT and REVOKE of privileges ON [TABLE] names TO or FROM roles or
@@ -1027,8 +1090,13 @@ auto create_type(const PgQuery__DefineStmt* s, std::int32_t pos) -> CreateType {
 // session is the bootstrap superuser, so every grant's grantor is the
 // owner and no grant depends on another's grant option.
 auto grant(const PgQuery__GrantStmt* s, std::int32_t pos) -> Grant {
+  // Privileges on a schema are not stored yet (docs/catalog_design.md,
+  // *Schema owner and privileges*, #873).
   if (s->targtype != PG_QUERY__GRANT_TARGET_TYPE__ACL_TARGET_OBJECT) {
-    reject("GRANT and REVOKE ON ALL … IN SCHEMA are not supported", pos);
+    reject("GRANT and REVOKE ON ALL … IN SCHEMA are not supported yet", pos, kFeatureNotSupported);
+  }
+  if (s->objtype == PG_QUERY__OBJECT_TYPE__OBJECT_SCHEMA) {
+    reject("GRANT and REVOKE ON SCHEMA are not supported yet", pos, kFeatureNotSupported);
   }
   Grant out;
   if (s->objtype == PG_QUERY__OBJECT_TYPE__OBJECT_TABLE) {
@@ -1070,8 +1138,7 @@ auto grant(const PgQuery__GrantStmt* s, std::int32_t pos) -> Grant {
 auto create_procedure(const PgQuery__CreateFunctionStmt* s, std::int32_t pos, const std::string& text)
     -> CreateProcedure {
   if (!s->is_procedure) reject("CREATE FUNCTION is not supported yet: only procedures are", pos, kFeatureNotSupported);
-  if (s->n_funcname != 1) reject("schema-qualified names are not supported", pos);
-  CreateProcedure out{in_public(str(s->funcname[0])), s->replace != 0, {}, pos, {}};
+  CreateProcedure out{dotted_name(s->funcname, s->n_funcname, pos), s->replace != 0, {}, pos, {}};
   for (std::size_t i = 0; i < s->n_parameters; ++i) {
     if (s->parameters[i]->node_case != PG_QUERY__NODE__NODE_FUNCTION_PARAMETER) reject("expected an argument", pos);
     const auto* p = s->parameters[i]->function_parameter;
@@ -1185,6 +1252,26 @@ auto on_conflict(const PgQuery__OnConflictClause* c) -> Insert::OnConflict {
   return out;
 }
 
+void resolve_schema_qualifier(Expr& e, std::span<const FromItem> items, bool nested);
+auto target_item(const ObjectName& table) -> FromItem;
+
+// An INSERT's schema-qualified columns: its RETURNING's and DO UPDATE's
+// name its table; a VALUES row names none.
+void resolve_schema_qualifiers(Insert& ins) {
+  const auto target = target_item(ins.table);
+  std::span<const FromItem> items{&target, 1};
+  for (auto& e : ins.returning) resolve_schema_qualifier(e, items, false);
+  for (auto& row : ins.rows) {
+    for (auto& e : row) resolve_schema_qualifier(e, {}, false);
+  }
+  if (ins.on_conflict && ins.on_conflict->update) {
+    auto set = std::vector<Assignment>{};
+    for (const auto& a : *ins.on_conflict->update) set.push_back(Assignment{a.column, clone(a.value), a.pos});
+    for (auto& a : set) resolve_schema_qualifier(a.value, items, false);
+    ins.on_conflict->update = std::make_shared<const std::vector<Assignment>>(std::move(set));
+  }
+}
+
 auto insert(const PgQuery__InsertStmt* s, std::int32_t pos) -> Insert {
   if (s->with_clause != nullptr) reject("INSERT option not supported", s->relation->location);
   Insert ins{relation(s->relation), {}, {}, pos};
@@ -1195,6 +1282,7 @@ auto insert(const PgQuery__InsertStmt* s, std::int32_t pos) -> Insert {
   if (sel->n_values_lists == 0) {
     ins.query = std::make_shared<const Select>(select(sel, pos));
     ins.returning = returning_list(s->returning_list, s->n_returning_list);
+    resolve_schema_qualifiers(ins);
     return ins;
   }
   for (std::size_t r = 0; r < sel->n_values_lists; ++r) {
@@ -1206,6 +1294,7 @@ auto insert(const PgQuery__InsertStmt* s, std::int32_t pos) -> Insert {
     }
   }
   ins.returning = returning_list(s->returning_list, s->n_returning_list);
+  resolve_schema_qualifiers(ins);
   return ins;
 }
 
@@ -1476,7 +1565,72 @@ void check_on_scope(const Select& sel, const Names& n) {
   }
 }
 
+// Whether two schemas as written are one: an unqualified FROM item is
+// public's, the one schema of a session's path (docs/catalog_design.md,
+// *The path*).
+auto same_schema(std::string_view a, std::string_view b) -> bool {
+  auto of = [](std::string_view x) { return x.empty() ? std::string_view{"public"} : x; };
+  return of(a) == of(b);
+}
+
+// A column qualified by a schema, s.t.c (or s.t.*), names the FROM item of
+// table t of schema s that has no alias: t.c alone then names that item, so
+// the schema is dropped. Otherwise PostgreSQL 17's 42P01, in its three
+// forms (docs/catalog_design.md, *FROM and column references*). In a
+// subquery, one that names no item of its own FROM is not supported yet.
+void resolve_schema_qualifier(Expr& e, std::span<const FromItem> items, bool nested) {
+  if (!e.schema.empty()) {
+    auto named = [&](const FromItem& item) { return item.table.name == e.table && same_schema(item.table.schema, e.schema); };
+    if (std::ranges::any_of(items, [&](const FromItem& item) { return item.alias.empty() && named(item); })) {
+      e.schema.clear();
+    } else {
+      // In a subquery the name may be an enclosing query's item, which
+      // PostgreSQL then reads; this scope's items decide nothing.
+      if (nested) {
+        reject("a schema-qualified column of the query around a subquery is not supported yet", e.pos, kFeatureNotSupported);
+      }
+      SqlError invalid{"invalid reference to FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable};
+      for (const auto& item : items) {
+        if (!item.alias.empty() && named(item)) {
+          throw std::move(invalid).with_notes("", "Perhaps you meant to reference the table alias \"" + item.alias + "\".");
+        }
+      }
+      if (std::ranges::any_of(items, [&](const FromItem& item) { return item.name() == e.table; })) {
+        throw std::move(invalid).with_notes(
+            "There is an entry for table \"" + e.table + "\", but it cannot be referenced from this part of the query.", "");
+      }
+      reject("missing FROM-clause entry for table \"" + e.table + "\"", e.pos, kUndefinedTable);
+    }
+  }
+  if (e.lhs) resolve_schema_qualifier(*e.lhs, items, nested);
+  if (e.rhs) resolve_schema_qualifier(*e.rhs, items, nested);
+  for (auto& a : e.args) resolve_schema_qualifier(a, items, nested);
+}
+
+void resolve_schema_qualifier(Compare& c, std::span<const FromItem> items, bool nested) {
+  resolve_schema_qualifier(c.lhs, items, nested);
+  resolve_schema_qualifier(c.rhs, items, nested);
+  for (auto& a : c.args) resolve_schema_qualifier(a, items, nested);
+}
+
+void resolve_schema_qualifiers(Select& sel, bool nested) {
+  for (auto& e : sel.targets) resolve_schema_qualifier(e, sel.from, nested);
+  for (auto& c : sel.where) resolve_schema_qualifier(c, sel.from, nested);
+  for (auto& c : sel.having) resolve_schema_qualifier(c, sel.from, nested);
+  for (auto& e : sel.group_by) resolve_schema_qualifier(e, sel.from, nested);
+  for (auto& o : sel.order_by) resolve_schema_qualifier(o.expr, sel.from, nested);
+}
+
+// An INSERT's, UPDATE's or DELETE's table, as the one FROM item its own
+// expressions' schema-qualified columns may name.
+auto target_item(const ObjectName& table) -> FromItem {
+  FromItem item;
+  item.table = table;
+  return item;
+}
+
 void resolve_aliases(Select& sel, bool nested) {
+  resolve_schema_qualifiers(sel, nested);
   Names names;
   for (const auto& item : sel.from) {
     names.tables.push_back(item.table.name);  // bare: alias erasure compares names alone
@@ -1488,6 +1642,14 @@ void resolve_aliases(Select& sel, bool nested) {
     // would be that table once the aliases are dropped.
     names.keep = names.keep || std::ranges::contains(names.joins, names.tables[i]);
     for (std::size_t j = 0; j < i; ++j) {
+      if (names.visible(i) == names.visible(j) && sel.from[i].alias.empty() && sel.from[j].alias.empty() &&
+          !same_schema(sel.from[i].table.schema, sel.from[j].table.schema)) {
+        // PostgreSQL reads both; a qualifier then picks one, an unqualified
+        // one is 42P09. Not built: the binder tells FROM items apart by
+        // name alone.
+        reject("a FROM of one table name from two schemas, neither aliased, is not supported yet: give one an alias",
+               sel.from[i].pos, kFeatureNotSupported);
+      }
       if (names.visible(i) == names.visible(j)) {
         reject("table name \"" + names.visible(i) + "\" specified more than once", sel.from[i].pos, kDuplicateAlias);
       }
@@ -1793,6 +1955,11 @@ auto update(const PgQuery__UpdateStmt* s, std::int32_t pos) -> Update {
     where(s->where_clause, u.where);
   }
   u.returning = returning_list(s->returning_list, s->n_returning_list);
+  const auto target = target_item(u.table);
+  std::span<const FromItem> items{&target, 1};
+  for (auto& a : u.set) resolve_schema_qualifier(a.value, items, false);
+  for (auto& e : u.returning) resolve_schema_qualifier(e, items, false);
+  for (auto& c : u.where) resolve_schema_qualifier(c, items, false);
   return u;
 }
 
@@ -1807,6 +1974,10 @@ auto del(const PgQuery__DeleteStmt* s, std::int32_t pos) -> Delete {
     where(s->where_clause, d.where);
   }
   d.returning = returning_list(s->returning_list, s->n_returning_list);
+  const auto target = target_item(d.table);
+  std::span<const FromItem> items{&target, 1};
+  for (auto& e : d.returning) resolve_schema_qualifier(e, items, false);
+  for (auto& c : d.where) resolve_schema_qualifier(c, items, false);
   return d;
 }
 
@@ -1978,9 +2149,9 @@ auto parse_call(std::string_view sql) -> std::optional<Call> {
   if (n->node_case != PG_QUERY__NODE__NODE_CALL_STMT) return std::nullopt;
   const auto* f = n->call_stmt->funccall;
   auto pos = res.tree->stmts[0]->stmt_location;
-  if (f == nullptr || f->n_funcname != 1) reject("schema-qualified names are not supported", pos);
+  if (f == nullptr) reject("expected a procedure", pos);
   if (f->func_variadic) reject("VARIADIC is not supported", f->location, kFeatureNotSupported);
-  Call out{in_public(str(f->funcname[0])), {}, pos};
+  Call out{dotted_name(f->funcname, f->n_funcname, f->location), {}, pos};
   for (std::size_t i = 0; i < f->n_args; ++i) {
     if (f->args[i]->node_case == PG_QUERY__NODE__NODE_NAMED_ARG_EXPR) {
       reject("named arguments are not supported", f->location, kFeatureNotSupported);
@@ -2025,7 +2196,11 @@ auto parse(std::string_view sql) -> Statement {
   ParseResources res;
   res.raw = pg_query_parse_protobuf(text.c_str());
   if (res.raw.error != nullptr) {
-    reject(res.raw.error->message, res.raw.error->cursorpos > 0 ? res.raw.error->cursorpos - 1 : -1);
+    // PostgreSQL's grammar raises this one as 0A000, not as a syntax error.
+    auto state = std::string_view{res.raw.error->message} == "CREATE SCHEMA IF NOT EXISTS cannot include schema elements"
+                     ? kFeatureNotSupported
+                     : kSyntaxError;
+    reject(res.raw.error->message, res.raw.error->cursorpos > 0 ? res.raw.error->cursorpos - 1 : -1, state);
   }
   res.tree = pg_query__parse_result__unpack(nullptr, res.raw.parse_tree.len,
                                             reinterpret_cast<const std::uint8_t*>(res.raw.parse_tree.data));
@@ -2052,6 +2227,7 @@ auto parse(std::string_view sql) -> Statement {
     reject("CALL runs as a simple Query, not as a prepared statement", pos, kFeatureNotSupported);
   }
   if (n->node_case == PG_QUERY__NODE__NODE_CREATE_ROLE_STMT) return create_role(n->create_role_stmt, pos);
+  if (n->node_case == PG_QUERY__NODE__NODE_CREATE_SCHEMA_STMT) return create_schema(n->create_schema_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_DROP_ROLE_STMT) return drop_role(n->drop_role_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_GRANT_STMT) return grant(n->grant_stmt, pos);
   if (n->node_case == PG_QUERY__NODE__NODE_CREATE_DOMAIN_STMT) return create_domain(n->create_domain_stmt, pos);

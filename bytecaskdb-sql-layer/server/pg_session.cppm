@@ -488,6 +488,8 @@ auto command_tag(Command c, const Rows& r) -> std::string {
     case Command::DropDomain: return "DROP DOMAIN";
     case Command::DropType: return "DROP TYPE";
     case Command::DropSequence: return "DROP SEQUENCE";
+    case Command::CreateSchema: return "CREATE SCHEMA";
+    case Command::DropSchema: return "DROP SCHEMA";
   }
   return {};
 }
@@ -816,7 +818,7 @@ private:
         fatal("25P04", "terminating connection due to transaction timeout");
         return;
       }
-      send_fields('E', "ERROR", sqlstate(e), e.what(), 0, {}, error_hint(e));
+      send_fields('E', "ERROR", sqlstate(e), e.what(), 0, error_detail(e), error_hint(e));
     }
   }
 
@@ -1789,22 +1791,28 @@ private:
     refuse_if_failed();
     if ((in_block_ || implicit_) && read_only_) throw SessionError("cannot execute CALL in a read-only transaction", "25006");
     if (in_block_ || implicit_) block_used_ = true;
-    // The procedure as the block's catalog has it, in a block.
+    // The procedure as the block's catalog has it, in a block; its schema
+    // as written, public for none (docs/catalog_design.md, *The path*).
+    const auto& name = c.call->procedure;
     std::shared_ptr<const Procedure> def;
     if (auto* b = block()) {
-      def = b->procedure(c.call->procedure.name);  // the embedded API resolves a name in public
+      def = b->procedure(name.schema, name.name);
     } else {
       auto cat = db_.catalog();
-      if (const auto* d = cat->procedure(c.call->procedure)) def = {cat, d};
+      auto schema = bound::schema_id(name.schema, *cat);
+      if (!schema) throw ast::SqlError{"schema \"" + name.schema + "\" does not exist", c.call->pos, kInvalidSchemaName};
+      if (const auto* d = cat->procedure(QualifiedName{*schema, name.name})) def = {cat, d};
     }
     if (def == nullptr) {
-      throw ast::SqlError{"procedure " + c.call->procedure.name + " does not exist", c.call->pos, kUndefinedFunction};
+      throw ast::SqlError{"procedure " + name.written() + "() does not exist", c.call->pos, kUndefinedFunction}.with_notes(
+          "", "No procedure matches the given name and argument types. You might need to add explicit type casts.");
     }
     auto args = bound::call_arguments(*c.call, *def);
     auto opts = run_options();
-    auto rows = in_block_  ? txn_->call(def->name, args, opts)
-                : implicit_ ? implicit_->call(def->name, args, opts)
-                            : db_.call(def->name, args, opts);
+    auto at = QualifiedName{def->schema, def->name};
+    auto rows = in_block_  ? txn_->call(at, args, opts)
+                : implicit_ ? implicit_->call(at, args, opts)
+                            : db_.call(at, args, opts);
     if (!rows.columns.empty()) {
       row_description(result_columns(rows));
       data_rows(rows);

@@ -111,7 +111,7 @@ private:
       } else if (i == fn.found) {
         t = SqlType{SqlKind::Boolean};
       } else {
-        t = bound::declared_type(v.type);
+        t = bound::declared_type(v.type, cat_);
         if (v.not_null) refuse("a NOT NULL variable");
       }
       constant_.push_back(v.constant);

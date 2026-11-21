@@ -242,7 +242,8 @@ jobs:
           status=0
           for p in tests/soak_mutations/*.patch tests/chaos_mutations/*.patch \
                    tests/durability_mutations/*.patch \
-                   bytecaskdb-sql-layer/tests/serializable_mutations/*.patch; do
+                   bytecaskdb-sql-layer/tests/serializable_mutations/*.patch \
+                   bytecaskdb-sql-layer/tests/schema_mutations/*.patch; do
             if ! scripts/mutation_patch.sh check "$p"; then
               echo "::error file=$p::conflicts with the current code; regenerate it"
               status=1

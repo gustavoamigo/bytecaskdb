@@ -75,6 +75,10 @@ inline constexpr SqlState kReadOnlySqlTransaction{"25006"};
 inline constexpr SqlState kActiveSqlTransaction{"25001"};
 inline constexpr SqlState kObjectInUse{"55006"};
 inline constexpr SqlState kInvalidSchemaName{"3F000"};
+inline constexpr SqlState kDuplicateSchema{"42P06"};
+inline constexpr SqlState kInvalidName{"42602"};
+inline constexpr SqlState kInsufficientPrivilege{"42501"};
+inline constexpr SqlState kInternalError{"XX000"};
 
 // The constant above whose code is `code`, or nullopt.
 [[nodiscard]] constexpr auto known_sqlstate(std::string_view code) noexcept -> std::optional<SqlState> {
@@ -84,7 +88,8 @@ inline constexpr SqlState kInvalidSchemaName{"3F000"};
                  kInvalidTextRepresentation, kStringDataRightTruncation, kInvalidDatetimeFormat,
                  kDatetimeFieldOverflow, kInvalidTimeZoneDisplacement, kCharacterNotInRepertoire, kInvalidParameterValue, kInvalidEscapeSequence, kSubstringError, kCannotCoerce,
                  kInvalidRowCountInLimit, kInvalidRowCountInOffset, kReservedName, kInvalidGrantOperation,
-                 kInvalidSavepointSpecification, kReadOnlySqlTransaction, kActiveSqlTransaction, kObjectInUse, kInvalidSchemaName}) {
+                 kInvalidSavepointSpecification, kReadOnlySqlTransaction, kActiveSqlTransaction, kObjectInUse, kInvalidSchemaName,
+                 kDuplicateSchema, kInvalidName, kInsufficientPrivilege, kInternalError}) {
     if (s.view() == code) return s;
   }
   return std::nullopt;

@@ -114,6 +114,21 @@ struct Bound {
   std::uint32_t key_params{0};
 };
 
+// The schema a name's qualifier names (docs/catalog_design.md, *Name
+// resolution with schemas*): public for none, a session's one-schema path;
+// a system schema's id (names.cppm); a user schema's; nullopt for a schema
+// that does not exist.
+[[nodiscard]] auto schema_id(std::string_view written, const Catalog& cat) -> std::optional<std::uint32_t>;
+// Where a name as written is looked up: in its schema, or in
+// kMissingSchema, where nothing is, when that schema does not exist.
+[[nodiscard]] auto lookup_name(const ast::ObjectName& name, const Catalog& cat) -> QualifiedName;
+// The name a CREATE of a relation (`relation`) or of a type or procedure
+// writes: in its schema, which must exist (3F000) and be one the layer
+// writes in (42501 in pg_catalog for a relation, else 0A000 for a system
+// schema). docs/catalog_design.md, *System schema names*.
+[[nodiscard]] auto creation_name(const ast::ObjectName& name, bool relation, const Catalog& cat, std::int32_t pos)
+    -> QualifiedName;
+
 // Throws ast::SqlError with a message and the position of the offending node.
 [[nodiscard]] auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound;
 // The same with $1 .. $n of the types `fixed_params` gives, as PostgreSQL
@@ -178,11 +193,23 @@ struct ProcedureStatement {
 // A declared variable's type as PL/pgSQL gives its text (int, numeric(12,2)),
 // read as a cast's type is: a qualifier other than pg_catalog, or
 // pg_catalog with a grammar spelling (pg_catalog.integer), is refused.
-[[nodiscard]] auto declared_type(const std::string& text) -> SqlType;
+// A type qualified by a user schema is resolved against `cat` as bind's is.
+[[nodiscard]] auto declared_type(const std::string& text, const Catalog& cat) -> SqlType;
 
 }  // namespace bytecask::sql::bound
 
 namespace bytecask::sql::bound {
+
+auto schema_id(std::string_view written, const Catalog& cat) -> std::optional<std::uint32_t> {
+  if (written.empty() || written == "public") return kPublicSchema;
+  if (auto id = system_schema(written); id != 0) return id;
+  if (const auto* sc = cat.schema(written)) return sc->id;
+  return std::nullopt;
+}
+
+auto lookup_name(const ast::ObjectName& name, const Catalog& cat) -> QualifiedName {
+  return QualifiedName{schema_id(name.schema, cat).value_or(kMissingSchema), name.name};
+}
 
 namespace {
 
@@ -202,6 +229,9 @@ auto type_name(PhysType t) -> std::string {
 // SQL type names as libpg_query canonicalises them, onto the stage-1 types of
 // docs/types_design.md.
 auto sql_type(const ast::ColumnDefAst& c) -> SqlType {
+  // A user schema's type: none is usable, so only whether the schema exists
+  // is left to tell, which bind's caller does (ast::QualifiedTypeName).
+  if (!c.type_schema.empty()) throw ast::QualifiedTypeName{c.type_schema, c.type, c.pos};
   auto no_mods = [&](SqlKind k) {
     if (!c.typmods.empty()) throw SqlError{"type " + c.type + " takes no modifier", c.pos};
     return SqlType{k};
@@ -266,6 +296,13 @@ auto sql_type(const ast::ColumnDefAst& c) -> SqlType {
     return t;
   }
   throw SqlError{"type " + c.type + " is not supported", c.pos};
+}
+
+// A cast's type, as a column definition names one.
+auto cast_def(const ast::Expr& e) -> ast::ColumnDefAst {
+  ast::ColumnDefAst c{"", e.cast_type, e.cast_typmods, false, false, std::nullopt, e.pos, {}};
+  c.type_schema = e.cast_schema;
+  return c;
 }
 
 // A number's text as a NUMERIC stores it (numeric_in): its error, at pos,
@@ -535,6 +572,57 @@ auto clock_words(const ast::Expr& e) -> std::string {
 [[noreturn]] void not_supported(const std::string& what, std::int32_t pos) {
   throw SqlError{what + " is not supported yet", pos, kFeatureNotSupported};
 }
+
+// A type qualified by a user schema, as PostgreSQL 17 refuses it: 3F000
+// when the schema does not exist, else 42704, no domain or shell type
+// being a usable type yet (docs/catalog_design.md, *A type name is resolved
+// whole*).
+auto qualified_type_error(const ast::QualifiedTypeName& e, const Catalog& cat) -> SqlError {
+  if (cat.schema(e.schema()) == nullptr) return e;
+  const auto* t = cat.type(QualifiedName{cat.schema(e.schema())->id, e.name()});
+  if (t != nullptr) return SqlError{"type " + e.schema() + "." + e.name() + " is not supported", e.pos(), kFeatureNotSupported};
+  return SqlError{"type \"" + e.schema() + "." + e.name() + "\" does not exist", e.pos(), kUndefinedObject};
+}
+
+// 3F000 for a schema that does not exist, as PostgreSQL 17 words it.
+auto missing_schema(const std::string& schema, std::int32_t pos) -> SqlError {
+  return SqlError{"schema \"" + schema + "\" does not exist", pos, kInvalidSchemaName};
+}
+
+// A name a CREATE writes (docs/catalog_design.md, *System schema names*):
+// in its schema, which must exist (3F000) and be one the layer writes in.
+// A relation in pg_catalog is PostgreSQL's 42501; a domain, type or
+// procedure there, anything in information_schema and a temporary object,
+// which PostgreSQL creates, are 0A000.
+auto created_name(const ast::ObjectName& n, bool relation, const Catalog& cat, std::int32_t pos) -> QualifiedName {
+  if (n.schema == "pg_catalog" || n.schema == "pg_toast") {
+    if (relation) {
+      throw SqlError{"permission denied to create \"" + n.written() + "\"", pos, kInsufficientPrivilege}.with_notes(
+          "System catalog modifications are currently disallowed.", "");
+    }
+    not_supported("creating a domain, type or procedure in " + n.schema, pos);
+  }
+  if (n.schema == "information_schema") not_supported("creating an object in information_schema", pos);
+  if (n.schema == "pg_temp") not_supported("creating a temporary object", pos);
+  auto id = schema_id(n.schema, cat);
+  if (!id) throw missing_schema(n.schema, pos);
+  return QualifiedName{*id, n.name};
+}
+
+// A name a DROP names, in its schema; nullopt for a schema that does not
+// exist under IF EXISTS (skipped_schema), 3F000 without it. A name of a
+// system schema is looked for there, where nothing is.
+auto dropped_name(const ast::ObjectName& n, bool if_exists, const Catalog& cat, std::int32_t pos)
+    -> std::optional<QualifiedName> {
+  if (auto id = schema_id(n.schema, cat)) return QualifiedName{*id, n.name};
+  if (!if_exists) throw missing_schema(n.schema, pos);
+  return std::nullopt;
+}
+
+auto skipped_schema(const ast::ObjectName& n) -> Ddl {
+  return Ddl{SkippedDdl{"schema \"" + n.schema + "\" does not exist, skipping"}};
+}
+
 
 // A Clock expression where the layer does not take it: a session function
 // is a gap of PostgreSQL's dialect (0A000), the clock keeps its 42601.
@@ -1254,7 +1342,7 @@ auto cast_typed(const Constant& arg, SqlType t, std::int32_t pos) -> Constant {
 // for a date, time or timestamp. A cast to VARCHAR(n) or CHAR(n), which
 // PostgreSQL's cast truncates or pads, is not taken yet.
 auto cast_constant(const ast::Expr& e, const Constant& arg) -> Constant {
-  auto t = sql_type(ast::ColumnDefAst{"", e.cast_type, e.cast_typmods, false, false, std::nullopt, e.pos, {}});
+  auto t = sql_type(cast_def(e));
   if (t.kind == SqlKind::Varchar) not_yet("a cast to VARCHAR(n)", e.pos);
   if (t.kind == SqlKind::Char) not_yet("a cast to CHAR(n)", e.pos);
   auto temporal = !arg.unknown && type_class(arg.type.kind) == TypeClass::Temporal;
@@ -2281,6 +2369,9 @@ public:
   // table a view's body brought in (ast::FromItem::of_view) is the view's,
   // not recorded. CREATE VIEW's dependencies come from it.
   [[nodiscard]] auto resolved_relations() const -> const std::vector<std::uint32_t>& { return resolved_; }
+  // Each unqualified table name it resolved so, and the schema it found the
+  // table in: a view's stored names (docs/catalog_design.md, rule 2).
+  [[nodiscard]] auto resolved_names() const -> const std::vector<ViewName>& { return resolved_names_; }
 
   // $1 .. $n start typed (bind's fixed_params): each as a column of its type,
   // which its first use is then checked against.
@@ -2561,7 +2652,7 @@ public:
     for (const auto& item : q.from) {
       if (item.derived) {  // its columns are its aliases
         if (std::ranges::contains(item.column_aliases, e.column)) return false;
-      } else if (const auto* t = cat_.table(item.table); t != nullptr && t->column(e.column) != nullptr) {
+      } else if (const auto* t = cat_.table(lookup_name(item.table, cat_)); t != nullptr && t->column(e.column) != nullptr) {
         return false;
       }
     }
@@ -3395,20 +3486,24 @@ public:
   }
 
   // The table an UPDATE or DELETE writes; a view is refused (#678).
-  auto updated_table(const QualifiedName& name, std::int32_t pos) const -> const Table* {
-    if (cat_.table(name) == nullptr && cat_.view(name) != nullptr) {
+  auto updated_table(const ast::ObjectName& name, std::int32_t pos) const -> const Table* {
+    auto at = lookup_name(name, cat_);
+    if (cat_.table(at) == nullptr && cat_.view(at) != nullptr) {
       throw SqlError{"\"" + name.name + "\" is a view: UPDATE and DELETE through a view are not supported yet (#678)", pos,
                      kFeatureNotSupported};
     }
     return table(name, pos);
   }
 
-  auto table(const QualifiedName& name, std::int32_t pos) const -> const Table* {
-    const auto* t = cat_.table(name);
-    if (t == nullptr && cat_.view(name) != nullptr) {
+  // A table by name as written: a missing schema is a missing relation
+  // (42P01), named as written, as PostgreSQL 17 names it.
+  auto table(const ast::ObjectName& name, std::int32_t pos) const -> const Table* {
+    auto at = lookup_name(name, cat_);
+    const auto* t = cat_.table(at);
+    if (t == nullptr && cat_.view(at) != nullptr) {
       throw SqlError{"\"" + name.name + "\" is a view, not a table", pos, kFeatureNotSupported};
     }
-    if (t == nullptr) throw SqlError{"relation \"" + name.name + "\" does not exist", pos, kUndefinedTable};
+    if (t == nullptr) throw SqlError{"relation \"" + name.written() + "\" does not exist", pos, kUndefinedTable};
     return t;
   }
 
@@ -4041,7 +4136,7 @@ public:
   }
 
   static auto cast_type(const ast::Expr& e) -> SqlType {
-    return sql_type(ast::ColumnDefAst{"", e.cast_type, e.cast_typmods, false, false, std::nullopt, e.pos, {}});
+    return sql_type(cast_def(e));
   }
 
   // One WHERE conjunct as column <op> operand, the column resolved by
@@ -4412,7 +4507,7 @@ public:
     for (const auto& item : s.from) {
       if (!item.derived) continue;
       for (const auto& inner : item.derived->from) {
-        if (const auto* t = cat_.table(inner.table)) read.push_back(t);
+        if (const auto* t = cat_.table(lookup_name(inner.table, cat_))) read.push_back(t);
       }
     }
     for (const auto& item : s.from) {
@@ -4424,7 +4519,10 @@ public:
       auto seen = read;
       seen.insert(seen.end(), rels.begin(), rels.end());
       const auto* t = table(item.table, pos);
-      if (!item.of_view) resolved_.push_back(t->id);
+      if (!item.of_view) {
+        resolved_.push_back(t->id);
+        if (item.table.schema.empty()) resolved_names_.push_back(ViewName{ViewName::Kind::Relation, item.table.name, t->schema});
+      }
       rels.push_back(instance(*t, item.name(), seen));
       if (!item.column_aliases.empty()) rename_columns(*rels.back(), item, pos);
       // Two views of one table are merged into the query under one name.
@@ -4466,7 +4564,7 @@ public:
       t->columns.push_back(Column{bytecask::sql::narrow<std::uint32_t>(i), item.column_aliases[i], e.type, e.phys(), nullable, std::monostate{}});
     }
     t->next_col_id = bytecask::sql::narrow<std::uint32_t>(t->columns.size());
-    const auto* first = cat_.table(item.derived->from.at(0).table);
+    const auto* first = cat_.table(lookup_name(item.derived->from.at(0).table, cat_));
     auto source = first != nullptr ? first->id : 0;
     derived_.push_back({std::move(t), std::move(root), source});
     return derived_.back().table.get();
@@ -5560,6 +5658,7 @@ private:
   };
   std::vector<DerivedRelation> derived_;
   std::vector<std::uint32_t> resolved_;
+  std::vector<ViewName> resolved_names_;
   std::vector<ParamUse> params_;
   std::size_t fixed_params_{0};      // $1 .. $fixed_params_ were typed by fix_params
   std::deque<Column> typed_params_;  // what a $n typed by its place (function_value) is used as; never moves
@@ -5726,7 +5825,47 @@ struct ViewBody {
   // the tables the binder resolved and, for the view being created (depth
   // 0), the views the expander expanded. CREATE VIEW's dependencies.
   std::vector<std::uint32_t> reads;
+  // Of those, each read by an unqualified name, and the schema the name
+  // resolved to, once each: CREATE VIEW's stored names.
+  std::vector<ViewName> resolved;
 };
+
+// A view's definition, as it is read at each use: its CREATE VIEW parsed,
+// each unqualified relation name of its query, in every position, given
+// the schema the view stores for it (docs/catalog_design.md, *Views resolve
+// against what they were created against*, rule 3). Never a search: a name
+// the view stores no schema for is an internal error. A view written before
+// schemas stores none, and its names are public's, the only schema there was.
+void stored_names(ast::Select& s, const View& v, const Catalog& cat) {
+  if (s.set) {
+    ast::SetOperation set{s.set->kind, s.set->all, ast::clone(s.set->left), ast::clone(s.set->right)};
+    stored_names(set.left, v, cat);
+    stored_names(set.right, v, cat);
+    s.set = std::make_shared<const ast::SetOperation>(std::move(set));
+    return;
+  }
+  for (auto& item : s.from) {
+    if (!item.table.schema.empty()) continue;
+    auto it = std::ranges::find(v.names, item.table.name, &ViewName::name);
+    if (it == v.names.end()) {
+      throw SqlError{"view " + v.name + " has no stored resolution for " + item.table.name, -1, kInternalError};
+    }
+    item.table.schema = cat.schema_name(it->schema);
+  }
+  each_subquery(s, [&](std::shared_ptr<const ast::Select>& q) {
+    auto copy = ast::clone(*q);
+    stored_names(copy, v, cat);
+    q = std::make_shared<const ast::Select>(std::move(copy));
+  });
+}
+
+auto view_definition(const View& v, const Catalog& cat) -> ast::CreateView {
+  auto parsed = ast::parse(v.definition);
+  auto* def = std::get_if<ast::CreateView>(&parsed);
+  if (def == nullptr) throw SqlError{"the definition of view \"" + v.name + "\" is not a CREATE VIEW", -1};
+  if (!v.public_names) stored_names(def->query, v, cat);
+  return std::move(*def);
+}
 
 // A view's body, expanded, marked as the view's own: each FROM item of it,
 // its subqueries' and a derived relation's among them, is of_view. A
@@ -5790,7 +5929,7 @@ public:
       return std::optional<ast::Statement>{std::in_place, std::in_place_type<ast::Select>, expand(*s)};
     }
     if (const auto* i = std::get_if<ast::Insert>(&stmt)) {
-      const auto* view = cat_.view(i->table);
+      const auto* view = cat_.view(lookup_name(i->table, cat_));
       auto found = view != nullptr;
       ast::Insert out{i->table, i->columns, {}, i->pos, cloned(i->returning), i->query, i->on_conflict};
       if (i->query && mentions(*i->query)) {
@@ -5834,8 +5973,11 @@ public:
   // stars written out, its columns named and checked.
   auto describe(const ast::Select& query, const std::vector<std::string>& columns) -> ViewBody {
     auto top = depth_ == 0;
-    if (top) views_read_.clear();
-    ViewBody b{expand(query), {}, {}};
+    if (top) {
+      views_read_.clear();
+      view_names_read_.clear();
+    }
+    ViewBody b{expand(query), {}, {}, {}};
     Binder scratch{cat_, 0};
     if (!b.select.set &&
         std::ranges::any_of(b.select.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Star; })) {
@@ -5851,7 +5993,19 @@ public:
     }
     std::ranges::copy(columns, b.names.begin());
     b.reads = scratch.resolved_relations();
-    if (top) b.reads.insert(b.reads.end(), views_read_.begin(), views_read_.end());
+    if (top) {
+      b.reads.insert(b.reads.end(), views_read_.begin(), views_read_.end());
+      auto all = scratch.resolved_names();
+      all.insert(all.end(), view_names_read_.begin(), view_names_read_.end());
+      for (auto& n : all) {
+        auto same = std::ranges::find(b.resolved, n.name, &ViewName::name);
+        if (same == b.resolved.end()) {
+          b.resolved.push_back(std::move(n));
+        } else if (same->schema != n.schema) {
+          throw std::logic_error{"one unqualified name of a view resolved to two schemas"};
+        }
+      }
+    }
     for (std::size_t i = 0; i < b.names.size(); ++i) {
       if (std::ranges::find(b.names, b.names[i]) != b.names.begin() + static_cast<std::ptrdiff_t>(i)) {
         throw SqlError{"column \"" + b.names[i] + "\" specified more than once", b.select.pos, kDuplicateColumn};
@@ -5892,10 +6046,10 @@ private:
     // Each view of the chain down to the table, its own definition as
     // written, as PostgreSQL rewrites them one at a time: its shape, then the
     // columns filled, each mapped to its relation's, which must differ.
-    QualifiedName table{};
+    ast::ObjectName table{};
     for (const auto* at = &v; at != nullptr;) {
-      auto parsed = ast::parse(at->definition);
-      const auto& q = std::get<ast::CreateView>(parsed).query;
+      auto def = view_definition(*at, cat_);
+      const auto& q = def.query;
       if (auto why = not_updatable(q); !why.empty()) {
         throw SqlError{"cannot insert into view \"" + at->name + "\"", s.pos, kObjectNotInPrerequisiteState}.with_notes(
             why, "To enable inserting into the view, provide an INSTEAD OF INSERT trigger or an unconditional ON INSERT DO INSTEAD rule.");
@@ -5928,12 +6082,12 @@ private:
       }
       filled = std::move(next);
       table = item.table;
-      at = cat_.view(item.table);
+      at = cat_.view(lookup_name(item.table, cat_));
     }
     // RETURNING reads the view's body, merged down to the table.
     const auto& item = b.select.from.at(0);
-    const auto* base = cat_.table(item.table);
-    if (base == nullptr || base != cat_.table(table)) throw std::logic_error{"an updatable view's body reads another table"};
+    const auto* base = cat_.table(lookup_name(item.table, cat_));
+    if (base == nullptr || base != cat_.table(lookup_name(table, cat_))) throw std::logic_error{"an updatable view's body reads another table"};
     auto visible = relation_columns(table);
     auto base_name = [&](const std::string& column) {
       auto at = std::ranges::find(item.column_aliases, column);
@@ -5978,10 +6132,11 @@ private:
   }
 
   // A table's or view's columns, in order; a table's hidden row id is none.
-  auto relation_columns(const QualifiedName& name) const -> std::vector<std::string> {
-    if (const auto* w = cat_.view(name)) return w->columns;
+  auto relation_columns(const ast::ObjectName& name) const -> std::vector<std::string> {
+    auto at = lookup_name(name, cat_);
+    if (const auto* w = cat_.view(at)) return w->columns;
     std::vector<std::string> out;
-    for (const auto& c : cat_.table(name)->columns) {
+    for (const auto& c : cat_.table(at)->columns) {
       if (!c.hidden) out.push_back(c.name);
     }
     return out;
@@ -6033,7 +6188,7 @@ private:
     }
     auto columns_of = [&](const ast::FromItem& item) -> std::vector<std::string> {
       if (item.derived) return item.column_aliases;
-      if (cat_.table(item.table) == nullptr && cat_.view(item.table) == nullptr) return {};
+      if (cat_.table(lookup_name(item.table, cat_)) == nullptr && cat_.view(lookup_name(item.table, cat_)) == nullptr) return {};
       return relation_columns(item.table);
     };
     auto has = [&](const std::vector<ast::FromItem>& from, const std::string& column) {
@@ -6067,7 +6222,7 @@ private:
   // A FROM item that names a view still to expand: not one already read
   // as a derived relation.
   [[nodiscard]] auto names_view(const ast::FromItem& item) const -> bool {
-    return item.derived == nullptr && cat_.view(item.table) != nullptr;
+    return item.derived == nullptr && cat_.view(lookup_name(item.table, cat_)) != nullptr;
   }
 
   [[nodiscard]] auto mentions(const ast::Select& s) const -> bool {
@@ -6079,7 +6234,7 @@ private:
 
   // Whether a view is named in the SET values or WHERE, subqueries included;
   // if so they are rewritten in place.
-  auto rewrite(const QualifiedName& table, std::vector<ast::Assignment>& set, std::vector<ast::Compare>& where) -> bool {
+  auto rewrite(const ast::ObjectName& table, std::vector<ast::Assignment>& set, std::vector<ast::Compare>& where) -> bool {
     auto found = false;
     ast::FromItem written;
     written.table = table;
@@ -6099,10 +6254,8 @@ private:
     if (auto it = bodies_.find(v.id); it != bodies_.end()) return it->second;
     if (depth_ >= kMaxDepth) throw SqlError{"views are nested too deeply", -1, kFeatureNotSupported};
     ++depth_;
-    auto parsed = ast::parse(v.definition);
-    auto* def = std::get_if<ast::CreateView>(&parsed);
-    if (def == nullptr) throw SqlError{"the definition of view \"" + v.name + "\" is not a CREATE VIEW", -1};
-    auto described = describe(def->query, def->columns);
+    auto def = view_definition(v, cat_);
+    auto described = describe(def.query, def.columns);
     --depth_;
     if (described.names != v.columns) {
       throw SqlError{"view \"" + v.name + "\" no longer has the columns it was created with: the tables it reads changed; drop it and create it again",
@@ -6136,7 +6289,11 @@ private:
     auto views = std::ranges::count_if(s.from, [&](const ast::FromItem& item) { return names_view(item); });
     if (depth_ == 0) {
       for (const auto& item : s.from) {
-        if (names_view(item) && !item.of_view) views_read_.push_back(cat_.view(item.table)->id);
+        if (names_view(item) && !item.of_view) {
+          const auto* read = cat_.view(lookup_name(item.table, cat_));
+          views_read_.push_back(read->id);
+          if (item.table.schema.empty()) view_names_read_.push_back(ViewName{ViewName::Kind::Relation, item.table.name, read->schema});
+        }
       }
     }
     auto expand_slot = [&](std::shared_ptr<const ast::Select>& q) {
@@ -6150,9 +6307,9 @@ private:
       not_yet("a view in a query that names a table twice", s.from[0].pos);
     }
     if (s.from.size() == 1) {
-      merge_one(s, body(*cat_.view(s.from[0].table)));
+      merge_one(s, body(*cat_.view(lookup_name(s.from[0].table, cat_))));
     } else if (s.from.size() == 2) {
-      merge_two(s, cat_.view(s.from[0].table), cat_.view(s.from[1].table));
+      merge_two(s, cat_.view(lookup_name(s.from[0].table, cat_)), cat_.view(lookup_name(s.from[1].table, cat_)));
     } else {
       not_yet("a view in a join of three or more tables", s.from[0].pos);
     }
@@ -6344,8 +6501,8 @@ private:
   };
   void merge_two(ast::Select& s, const View* left, const View* right) {
     const auto& join = s.from[1];
-    Side sides[2]{{s.from[0].table.name, left != nullptr ? &body(*left) : nullptr, cat_.table(s.from[0].table)},
-                  {join.table.name, right != nullptr ? &body(*right) : nullptr, cat_.table(join.table)}};
+    Side sides[2]{{s.from[0].table.name, left != nullptr ? &body(*left) : nullptr, cat_.table(lookup_name(s.from[0].table, cat_))},
+                  {join.table.name, right != nullptr ? &body(*right) : nullptr, cat_.table(lookup_name(join.table, cat_))}};
     for (auto i = 0; i < 2; ++i) {
       if (sides[i].view == nullptr && sides[i].table == nullptr) {
         throw SqlError{"relation \"" + sides[i].name + "\" does not exist", s.from[static_cast<std::size_t>(i)].pos, kUndefinedTable};
@@ -6467,6 +6624,7 @@ private:
   // The views the query being described reads itself (depth 0), as expand
   // resolves them: ViewBody::reads.
   std::vector<std::uint32_t> views_read_;
+  std::vector<ViewName> view_names_read_;  // of views_read_, each read by an unqualified name
   int depth_{0};
 };
 
@@ -6476,7 +6634,8 @@ auto bind_create_view(const ast::CreateView& cv, const Catalog& cat) -> Bound {
   if (select_param_count(cv.query) != 0) throw SqlError{"there is no parameter $1", cv.pos, kUndefinedParameter};
   ViewExpander views{cat};
   auto body = views.describe(cv.query, cv.columns);
-  CreateViewDdl ddl{cv.view, cv.definition, std::move(body.reads), std::move(body.names)};
+  auto name = created_name(cv.view, true, cat, cv.pos);
+  CreateViewDdl ddl{std::move(name), cv.definition, std::move(body.reads), std::move(body.names), std::move(body.resolved)};
   return Bound{Ddl{std::move(ddl)}, {}, {}, {}, {}, {}, {}, {}, {}};
 }
 
@@ -6509,7 +6668,7 @@ public:
             }
           } else if constexpr (std::is_same_v<T, ast::Update>) {
             if (!st.returning.empty()) not_yet("RETURNING in a procedure", st.pos);
-            scope_.insert(st.table);
+            scope_.insert(lookup_name(st.table, cat_));
             for (auto& a : st.set) names(a.value);
             for (auto& c : st.where) names(c);
             for (auto& a : st.set) expr(a.value);
@@ -6517,7 +6676,7 @@ public:
             if (!st.current_of.empty()) not_yet("WHERE CURRENT OF in a procedure", st.pos);
           } else if constexpr (std::is_same_v<T, ast::Delete>) {
             if (!st.returning.empty()) not_yet("RETURNING in a procedure", st.pos);
-            scope_.insert(st.table);
+            scope_.insert(lookup_name(st.table, cat_));
             for (auto& c : st.where) names(c);
             for (auto& c : st.where) compare(c);
             if (!st.current_of.empty()) not_yet("WHERE CURRENT OF in a procedure", st.pos);
@@ -6533,7 +6692,7 @@ public:
 private:
   // The tables and views a statement names, in every FROM, subqueries' included.
   void names(const ast::Select& q) {
-    for (const auto& f : q.from) scope_.insert(f.table);
+    for (const auto& f : q.from) scope_.insert(lookup_name(f.table, cat_));
     for (const auto& e : q.targets) names(e);
     for (const auto& c : q.where) names(c);
     for (const auto& c : q.having) names(c);
@@ -6682,7 +6841,7 @@ auto call_arguments(const ast::Call& call, const Procedure& proc) -> std::vector
   return out;
 }
 
-auto declared_type(const std::string& text) -> SqlType {
+auto declared_type(const std::string& text, const Catalog& cat) -> SqlType {
   auto stmt = ast::parse("SELECT CAST(NULL AS " + text + ")");
   const auto* q = std::get_if<ast::Select>(&stmt);
   if (q == nullptr || q->targets.size() != 1 || q->targets[0].kind != ast::Expr::Kind::Cast) {
@@ -6691,7 +6850,12 @@ auto declared_type(const std::string& text) -> SqlType {
   ast::ColumnDefAst c;
   c.type = q->targets[0].cast_type;
   c.typmods = q->targets[0].cast_typmods;
-  return sql_type(c);
+  c.type_schema = q->targets[0].cast_schema;
+  try {
+    return sql_type(c);
+  } catch (const ast::QualifiedTypeName& e) {
+    throw qualified_type_error(e, cat);
+  }
 }
 
 auto bind_procedure_statement(const std::string& sql, const Table& frame, const Catalog& cat) -> ProcedureStatement {
@@ -6894,7 +7058,27 @@ auto insert_query(Binder& b, const Table& t, const ast::Insert& s) -> logical::N
 
 auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound { return bind(stmt, cat, {}); }
 
+auto creation_name(const ast::ObjectName& name, bool relation, const Catalog& cat, std::int32_t pos) -> QualifiedName {
+  return created_name(name, relation, cat, pos);
+}
+
+namespace {
+
+auto bind_statement(const ast::Statement& stmt, const Catalog& cat, std::span<const SqlType> fixed_params) -> Bound;
+
+}  // namespace
+
 auto bind(const ast::Statement& stmt, const Catalog& cat, std::span<const SqlType> fixed_params) -> Bound {
+  try {
+    return bind_statement(stmt, cat, fixed_params);
+  } catch (const ast::QualifiedTypeName& e) {
+    throw qualified_type_error(e, cat);
+  }
+}
+
+namespace {
+
+auto bind_statement(const ast::Statement& stmt, const Catalog& cat, std::span<const SqlType> fixed_params) -> Bound {
   if (const auto* cv = std::get_if<ast::CreateView>(&stmt)) return bind_create_view(*cv, cat);
   ViewExpander views{cat};
   auto expanded = views.statement(stmt);
@@ -6903,14 +7087,14 @@ auto bind(const ast::Statement& stmt, const Catalog& cat, std::span<const SqlTyp
   auto own = param_count(target);
   std::uint32_t key_params = 0;
   std::uint32_t positioned_table = 0;
-  auto positioned = [&](const QualifiedName& table, const std::string& cursor, std::int32_t pos) {
+  auto positioned = [&](const ast::ObjectName& table, const std::string& cursor, std::int32_t pos) {
     if (cursor.empty()) return;
-    const auto* t = cat.table(table);
+    const auto* t = cat.table(lookup_name(table, cat));
     if (t == nullptr) {
-      if (cat.view(table) != nullptr) {
+      if (cat.view(lookup_name(table, cat)) != nullptr) {
         throw SqlError{"\"" + table.name + "\" is a view: UPDATE and DELETE through a view are not supported yet (#678)", pos, kFeatureNotSupported};
       }
-      throw SqlError{"relation \"" + table.name + "\" does not exist", pos, kUndefinedTable};
+      throw SqlError{"relation \"" + table.written() + "\" does not exist", pos, kUndefinedTable};
     }
     key_params = bytecask::sql::narrow<std::uint32_t>(t->pk_col_ids.size());
     positioned_table = t->storage_id();
@@ -6924,14 +7108,16 @@ auto bind(const ast::Statement& stmt, const Catalog& cat, std::span<const SqlTyp
       [&](const auto& s) -> std::pair<std::variant<Ddl, logical::NodePtr>, std::int32_t> {
         using T = std::decay_t<decltype(s)>;
         if constexpr (std::is_same_v<T, ast::CreateTable>) {
-          // IF NOT EXISTS and the name taken: PostgreSQL skips the statement
-          // before it reads the definition, so a wrong one is skipped too.
-          if (s.if_not_exists && (cat.table(s.table) != nullptr || cat.view(s.table) != nullptr ||
-                                  cat.index(s.table).first != nullptr)) {
-            return {Ddl{CreateTableDdl{s.table, {}, {}, {}, {}, true}}, s.pos};
+          // Its schema first, then, IF NOT EXISTS and the name taken:
+          // PostgreSQL skips the statement before it reads the definition,
+          // so a wrong one is skipped too.
+          auto name = created_name(s.table, true, cat, s.pos);
+          if (s.if_not_exists && (cat.table(name) != nullptr || cat.view(name) != nullptr ||
+                                  cat.index(name).first != nullptr || cat.sequence(name) != nullptr)) {
+            return {Ddl{CreateTableDdl{name, {}, {}, {}, {}, true}}, s.pos};
           }
           if (s.refusal) throw *s.refusal;
-          CreateTableDdl out{s.table, {}, s.pk, {}, {}, s.if_not_exists};
+          CreateTableDdl out{name, {}, s.pk, {}, {}, s.if_not_exists};
           for (const auto& c : s.columns) {
             out.columns.push_back(column_spec(c));
             if (c.primary_key) out.pk.push_back(c.name);
@@ -6954,27 +7140,34 @@ auto bind(const ast::Statement& stmt, const Catalog& cat, std::span<const SqlTyp
           for (const auto& f : s.foreign_keys) {
             // A table may reference itself, by the keys it is created with:
             // the same (schema, name), never the name alone.
-            check_foreign_key(out, f, f.table == s.table ? referenced_keys(out) : referenced_keys(*b.table(f.table, f.pos)));
+            check_foreign_key(out, f, lookup_name(f.table, cat) == name ? referenced_keys(out) : referenced_keys(*b.table(f.table, f.pos)));
           }
           return {Ddl{std::move(out)}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::CreateIndex>) {
+          if (!schema_id(s.table.schema, cat)) throw missing_schema(s.table.schema, s.pos);
           const auto* t = b.table(s.table, s.pos);
-          CreateIndexDdl out{s.index, s.table, {}, s.unique};
+          CreateIndexDdl out{s.index, lookup_name(s.table, cat), {}, s.unique};
           for (const auto& c : s.columns) {
             (void)Binder::column(*t, c.name, s.pos);
             out.columns.push_back({c.name, c.desc});
           }
           return {Ddl{std::move(out)}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::DropTable>) {
-          return {Ddl{DropTableDdl{s.table, s.if_exists}}, s.pos};
+          auto name = dropped_name(s.table, s.if_exists, cat, s.pos);
+          if (!name) return {skipped_schema(s.table), s.pos};
+          return {Ddl{DropTableDdl{*name, s.if_exists}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::DropIndex>) {
-          return {Ddl{DropIndexDdl{s.index, s.if_exists}}, s.pos};
+          auto name = dropped_name(s.index, s.if_exists, cat, s.pos);
+          if (!name) return {skipped_schema(s.index), s.pos};
+          return {Ddl{DropIndexDdl{*name, s.if_exists}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::DropView>) {
-          return {Ddl{DropViewDdl{s.view, s.if_exists}}, s.pos};
+          auto name = dropped_name(s.view, s.if_exists, cat, s.pos);
+          if (!name) return {skipped_schema(s.view), s.pos};
+          return {Ddl{DropViewDdl{*name, s.if_exists}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::CreateView>) {
           throw std::logic_error("CREATE VIEW is bound by bind_create_view");
         } else if constexpr (std::is_same_v<T, ast::CreateProcedure>) {
-          CreateProcedureDdl out{s.procedure, s.definition, s.replace, {}};
+          CreateProcedureDdl out{created_name(s.procedure, false, cat, s.pos), s.definition, s.replace, {}};
           for (const auto& a : s.args) {
             auto mode = a.mode == ast::ProcedureArgAst::Mode::In      ? ProcedureArg::Mode::In
                         : a.mode == ast::ProcedureArgAst::Mode::InOut ? ProcedureArg::Mode::InOut
@@ -6987,7 +7180,12 @@ auto bind(const ast::Statement& stmt, const Catalog& cat, std::span<const SqlTyp
         } else if constexpr (std::is_same_v<T, ast::DropRole>) {
           return {Ddl{DropRoleDdl{s.roles, s.if_exists}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::Grant>) {
-          GrantDdl out{s.grant, s.grant_option, {}, s.objects, s.grantees, s.grantor, GrantDdl::Target::Table};
+          std::vector<QualifiedName> objects;
+          for (const auto& o : s.objects) {
+            if (!schema_id(o.schema, cat)) throw missing_schema(o.schema, s.pos);
+            objects.push_back(lookup_name(o, cat));
+          }
+          GrantDdl out{s.grant, s.grant_option, {}, std::move(objects), s.grantees, s.grantor, GrantDdl::Target::Table};
           switch (s.target) {
             case ast::Grant::Target::Table: out.target = GrantDdl::Target::Table; break;
             case ast::Grant::Target::Sequence: out.target = GrantDdl::Target::Sequence; break;
@@ -6997,17 +7195,27 @@ auto bind(const ast::Statement& stmt, const Catalog& cat, std::span<const SqlTyp
           for (const auto& p : s.privileges) out.privileges.push_back({p.name, p.columns});
           return {Ddl{std::move(out)}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::CreateDomain>) {
-          return {Ddl{CreateDomainDdl{s.domain, sql_type(s.base)}}, s.pos};
+          auto name = created_name(s.domain, false, cat, s.pos);
+          return {Ddl{CreateDomainDdl{std::move(name), sql_type(s.base)}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::CreateType>) {
-          return {Ddl{CreateTypeDdl{s.type}}, s.pos};
+          return {Ddl{CreateTypeDdl{created_name(s.type, false, cat, s.pos)}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::CreateSequence>) {
-          return {Ddl{CreateSequenceDdl{s.sequence, s.if_not_exists}}, s.pos};
+          return {Ddl{CreateSequenceDdl{created_name(s.sequence, true, cat, s.pos), s.if_not_exists}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::DropTypeOrSequence>) {
           using K = ast::DropTypeOrSequence::Kind;
-          if (s.kind == K::Sequence) return {Ddl{DropSequenceDdl{s.name, s.if_exists}}, s.pos};
-          return {Ddl{DropTypeDdl{s.name, s.kind == K::Domain, s.if_exists}}, s.pos};
+          auto name = dropped_name(s.name, s.if_exists, cat, s.pos);
+          if (!name) return {skipped_schema(s.name), s.pos};
+          if (s.kind == K::Sequence) return {Ddl{DropSequenceDdl{*name, s.if_exists}}, s.pos};
+          return {Ddl{DropTypeDdl{*name, s.kind == K::Domain, s.if_exists}}, s.pos};
+        } else if constexpr (std::is_same_v<T, ast::CreateSchema>) {
+          auto owner = s.authorization && !s.authorization->empty() ? s.authorization : std::nullopt;
+          return {Ddl{CreateSchemaDdl{s.name, std::move(owner), s.if_not_exists}}, s.pos};
+        } else if constexpr (std::is_same_v<T, ast::DropSchema>) {
+          return {Ddl{DropSchemaDdl{s.names, s.if_exists}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::DropProcedure>) {
-          DropProcedureDdl out{s.procedure, std::nullopt, s.if_exists};
+          auto name = dropped_name(s.procedure, s.if_exists, cat, s.pos);
+          if (!name) return {skipped_schema(s.procedure), s.pos};
+          DropProcedureDdl out{*name, std::nullopt, s.if_exists};
           if (s.arg_types) {
             out.arg_types.emplace();
             // Only the kind is compared, so a NUMERIC needs no precision here.
@@ -7017,6 +7225,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat, std::span<const SqlTyp
           }
           return {Ddl{std::move(out)}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::AddColumn>) {
+          if (!schema_id(s.table.schema, cat)) throw missing_schema(s.table.schema, s.pos);
           (void)b.table(s.table, s.pos);
           if (s.column.primary_key) throw SqlError{"ADD COLUMN cannot add a primary key column", s.column.pos};
           if (!s.column.unique.empty()) not_yet("ADD COLUMN … UNIQUE", s.column.pos);
@@ -7030,7 +7239,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat, std::span<const SqlTyp
             throw SqlError{"column \"" + s.column.name + "\" is NOT NULL and needs a DEFAULT for the existing rows",
                            s.column.pos};
           }
-          return {Ddl{AddColumnDdl{s.table, std::move(spec)}}, s.pos};
+          return {Ddl{AddColumnDdl{lookup_name(s.table, cat), std::move(spec)}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::CreateTableAs>) {
           // The API binds the query alone and creates the table from its rows.
           throw std::logic_error("CREATE TABLE AS is bound through its query");
@@ -7114,6 +7323,8 @@ auto bind(const ast::Statement& stmt, const Catalog& cat, std::span<const SqlTyp
   out.key_params = key_params;
   return out;
 }
+
+}  // namespace
 
 namespace {
 

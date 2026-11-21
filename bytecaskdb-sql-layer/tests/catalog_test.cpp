@@ -174,16 +174,16 @@ TEST_CASE("catalog: a table record round-trips every field", "[sql][catalog]") {
   CHECK(serialize_table(u) == rec);
 }
 
-TEST_CASE("catalog: every table record is format 7, its CHECK constraints its tail", "[sql][catalog]") {
+TEST_CASE("catalog: every table record is format 8, its CHECK constraints then its schema its tail", "[sql][catalog]") {
   auto plain = rich_table();
   auto rec_plain = serialize_table(plain);
-  CHECK(rec_plain[0] == std::byte{7});
+  CHECK(rec_plain[0] == std::byte{8});
   auto t = rich_table();
   t.columns.back().sql = SqlType{SqlKind::TimestampTz};
   t.columns[2].sql = SqlType{SqlKind::Char, 7};
   t.checks = {{"c1", "a > 0"}, {"c2", "a < b AND b <> 'x(y'"}};
   auto rec = serialize_table(t);
-  CHECK(rec[0] == std::byte{7});
+  CHECK(rec[0] == std::byte{8});
   auto u = parse_table(rec);
   CHECK(u.columns.back().sql.kind == SqlKind::TimestampTz);
   CHECK(u.columns[2].sql == SqlType{SqlKind::Char, 7});
@@ -384,7 +384,7 @@ TEST_CASE("catalog: a damaged or foreign-format record is refused", "[sql][catal
     INFO(int{f});
     CHECK(format(f).find("earlier SQL-layer build") != std::string::npos);
   }
-  CHECK(format(8).find("later SQL-layer build") != std::string::npos);
+  CHECK(format(9).find("later SQL-layer build") != std::string::npos);
 
   // Records that parse but break an invariant.
   auto broken = [](auto&& mutate) {
@@ -760,7 +760,7 @@ TEST_CASE("catalog: every DDL survives a reopen", "[sql][catalog]") {
     CHECK(row_column(row, *t.layout.find(2)).i64() == 20);
     (void)live.apply(DropIndexDdl{{kPublicSchema, "t_by_name"}});
     CHECK(count_prefix(db, prefix_of(kNsIndex, 3)) == 0);
-    CHECK_FALSE(db.contains_key({}, name_entry_key("t_by_name")));
+    CHECK_FALSE(db.contains_key({}, name_entry_key({kPublicSchema, "t_by_name"})));
   });
   reopen([](DB& db, LiveCatalog& live) {
     auto cat = live.current();
@@ -773,8 +773,8 @@ TEST_CASE("catalog: every DDL survives a reopen", "[sql][catalog]") {
     CHECK(count_prefix(db, prefix_of(kNsRow, 1)) == 0);
     CHECK(count_prefix(db, prefix_of(kNsIndex, 4)) == 0);
     CHECK_FALSE(db.contains_key({}, table_record_key(1)));
-    CHECK_FALSE(db.contains_key({}, name_entry_key("t")));
-    CHECK_FALSE(db.contains_key({}, name_entry_key("t_by_qty")));
+    CHECK_FALSE(db.contains_key({}, name_entry_key({kPublicSchema, "t"})));
+    CHECK_FALSE(db.contains_key({}, name_entry_key({kPublicSchema, "t_by_qty"})));
   });
   reopen([](DB&, LiveCatalog& live) {
     auto cat = live.current();
@@ -1120,16 +1120,16 @@ TEST_CASE("catalog: name entries and records must agree at load", "[sql][catalog
     LiveCatalog live{db};
     (void)live.apply(create_t());
     // A name entry with no object behind it.
-    db.put({}, name_entry_key("ghost"), Bytes{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{9}});
+    db.put({}, name_entry_key({kPublicSchema, "ghost"}), Bytes{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{9}});
     db.close();
   }
   {
     auto db = DB::open(dir.path());
     CHECK_THROWS_AS(LiveCatalog{db}, std::runtime_error);
-    (void)db.del({}, name_entry_key("ghost"));
+    (void)db.del({}, name_entry_key({kPublicSchema, "ghost"}));
     LiveCatalog ok{db};  // consistent again
     // An object whose name entry is missing.
-    (void)db.del({}, name_entry_key("t"));
+    (void)db.del({}, name_entry_key({kPublicSchema, "t"}));
     CHECK_THROWS_AS(LiveCatalog{db}, std::runtime_error);
     db.close();
   }
@@ -1259,7 +1259,7 @@ TEST_CASE("catalog: a view's record and name entry must agree at load, and a dam
   }
   with([&](DB& db) {
     auto later = record;
-    later[0] = std::byte{2};
+    later[0] = std::byte{3};
     db.put({}, view_record_key(v_id), later);
   });
   {
@@ -1278,16 +1278,16 @@ TEST_CASE("catalog: a view's record and name entry must agree at load, and a dam
     db.close();
   }
   // A view with no name entry, a name entry that says table.
-  with([&](DB& db) { (void)db.del({}, name_entry_key("v")); });
+  with([&](DB& db) { (void)db.del({}, name_entry_key({kPublicSchema, "v"})); });
   {
     auto db = DB::open(dir.path());
-    db.put({}, name_entry_key("v"), Bytes{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{static_cast<unsigned char>(v_id)}});
+    db.put({}, name_entry_key({kPublicSchema, "v"}), Bytes{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{static_cast<unsigned char>(v_id)}});
     db.close();
   }
   with([&](DB&) {});
   {
     auto db = DB::open(dir.path());
-    db.put({}, name_entry_key("v"), Bytes{std::byte{3}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{static_cast<unsigned char>(v_id)}});
+    db.put({}, name_entry_key({kPublicSchema, "v"}), Bytes{std::byte{3}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{static_cast<unsigned char>(v_id)}});
     LiveCatalog ok{db};  // consistent again
     CHECK(ok.current()->view({kPublicSchema, "v"}) != nullptr);
     db.close();
@@ -1333,7 +1333,7 @@ auto refused_state(LiveCatalog& live, const Ddl& ddl) -> std::string {
 }
 }  // namespace
 
-TEST_CASE("catalog: lookups are keyed by (schema, name), and a DDL naming a schema but public is refused",
+TEST_CASE("catalog: lookups are keyed by (schema, name), and a DDL creating in a schema that does not exist is refused",
           "[sql][catalog][schemas]") {
   sql_test::TempDir dir{"catalog_schemas"};
   auto db = DB::open(dir.path());
@@ -1344,23 +1344,25 @@ TEST_CASE("catalog: lookups are keyed by (schema, name), and a DDL naming a sche
   (void)live.apply(CreateSequenceDdl{{kPublicSchema, "sq"}});
   auto cat = live.current();
   REQUIRE(cat->table({kPublicSchema, "t"}) != nullptr);
-  constexpr std::uint32_t kOther = 7;  // no schema exists but public (stage 1a)
+  constexpr std::uint32_t kOther = 7;  // no schema of this id exists
   CHECK(cat->table({kOther, "t"}) == nullptr);
   CHECK(cat->index({kOther, "t_by_name"}).second == nullptr);
   CHECK(cat->index({kPublicSchema, "t_by_name"}).second != nullptr);
   CHECK(cat->type({kOther, "ty"}) == nullptr);
   CHECK(cat->sequence({kOther, "sq"}) == nullptr);
-  // Only the Catalog API can name another schema: refused, nothing written,
-  // never created in public instead.
+  // Only the Catalog API can name a schema that does not exist: a CREATE is
+  // refused (3F000), never made in public instead; a DROP, ALTER or GRANT
+  // finds nothing there.
   auto version = cat->version();
   CHECK(refused_state(live, CreateTableDdl{{kOther, "u"}, {col("id", SqlKind::BigInt)}, {"id"}}) == "3F000");
-  CHECK(refused_state(live, DropTableDdl{{kOther, "t"}}) == "3F000");
-  CHECK(refused_state(live, CreateIndexDdl{"t_by_qty", {kOther, "t"}, {{"qty"}}}) == "3F000");
   CHECK(refused_state(live, CreateTypeDdl{{kOther, "ty2"}}) == "3F000");
+  CHECK(refused_state(live, CreateTableDdl{{kPgCatalogSchema, "u"}, {col("id", SqlKind::BigInt)}, {"id"}}) == "3F000");
+  CHECK(refused_state(live, DropTableDdl{{kOther, "t"}}) == "42P01");
+  CHECK(refused_state(live, CreateIndexDdl{"t_by_qty", {kOther, "t"}, {{"qty"}}}) == "42P01");
   GrantDdl g;
   g.objects = {{kPublicSchema, "t"}, {kOther, "t"}};
   g.grantees = {""};
-  CHECK(refused_state(live, Ddl{g}) == "3F000");
+  CHECK(refused_state(live, Ddl{g}) == "42P01");
   CHECK(live.current()->version() == version);
   CHECK(live.current()->table({kPublicSchema, "u"}) == nullptr);
   CHECK(live.current()->table({kPublicSchema, "t"}) != nullptr);
@@ -1500,10 +1502,11 @@ TEST_CASE("catalog: a role's record and name entry, and a privileges record, mus
   }
   refused_with(role_record_key(r_id + 1), role_record);  // under another id's key
   refused_with(acl_record_key(t_id + 100), acl);        // of no table or view
-  // The privileges record, little-endian: u16 format, u32 object, u32 n, then
+  // The privileges record, little-endian: u16 format, u32 object, u8
+  // is_default, u32 n, then
   // entries of 16 bytes, (column, grantee) sorted: the column's SELECT of PUBLIC's and r's,
   // then the table's INSERT of PUBLIC's and r's.
-  constexpr std::size_t kFirst = 2 + 4 + 4;
+  constexpr std::size_t kFirst = 2 + 4 + 1 + 4;
   auto entry = [&](std::size_t i, std::size_t field) { return kFirst + 16 * i + field; };
   auto changed = [&](Bytes r, std::size_t at, std::byte b) {
     r[at] = b;
@@ -1628,9 +1631,9 @@ TEST_CASE("catalog: a type's and a sequence's records and name entries must agre
     d_id = live.current()->type({kPublicSchema, "d"})->id;
     s_id = live.current()->sequence({kPublicSchema, "s"})->id;
     REQUIRE(db.snapshot().get({}, type_record_key(d_id), domain));
-    REQUIRE(db.snapshot().get({}, type_name_key("d"), domain_entry));
+    REQUIRE(db.snapshot().get({}, type_name_key({kPublicSchema, "d"}), domain_entry));
     REQUIRE(db.snapshot().get({}, sequence_record_key(s_id), seq));
-    REQUIRE(db.snapshot().get({}, name_entry_key("s"), seq_entry));
+    REQUIRE(db.snapshot().get({}, name_entry_key({kPublicSchema, "s"}), seq_entry));
     db.close();
   }
   auto put = [&](const Bytes& key, const Bytes& value) {
@@ -1640,9 +1643,9 @@ TEST_CASE("catalog: a type's and a sequence's records and name entries must agre
   };
   auto restore = [&] {
     put(type_record_key(d_id), domain);
-    put(type_name_key("d"), domain_entry);
+    put(type_name_key({kPublicSchema, "d"}), domain_entry);
     put(sequence_record_key(s_id), seq);
-    put(name_entry_key("s"), seq_entry);
+    put(name_entry_key({kPublicSchema, "s"}), seq_entry);
   };
   auto refused_with = [&](const Bytes& key, const Bytes& value) {
     put(key, value);
@@ -1677,12 +1680,12 @@ TEST_CASE("catalog: a type's and a sequence's records and name entries must agre
   refused_with(type_record_key(d_id), changed(domain, kKindAt, std::byte{9}));
   refused_with(type_record_key(d_id), changed(domain, kKindAt + 1, std::byte{0xEE}));
   // A name entry of another kind, or missing.
-  refused_with(type_name_key("d"), changed(domain_entry, 0, std::byte{5}));
-  refused_with(name_entry_key("s"), changed(seq_entry, 0, std::byte{1}));
-  refused_with(type_name_key("e"), domain_entry);
+  refused_with(type_name_key({kPublicSchema, "d"}), changed(domain_entry, 0, std::byte{5}));
+  refused_with(name_entry_key({kPublicSchema, "s"}), changed(seq_entry, 0, std::byte{1}));
+  refused_with(type_name_key({kPublicSchema, "e"}), domain_entry);
   {
     auto db = DB::open(dir.path());
-    (void)db.del({}, name_entry_key("s"));
+    (void)db.del({}, name_entry_key({kPublicSchema, "s"}));
     CHECK_THROWS_AS(LiveCatalog{db}, std::runtime_error);
     db.close();
   }
@@ -1760,7 +1763,7 @@ TEST_CASE("catalog: a procedure is a record and a name entry of its own namespac
     CHECK(live.apply(DropProcedureDdl{{kPublicSchema, "p"}, Types{SqlType{SqlKind::Integer}}, true}) == live.current());  // IF EXISTS: no-op
     (void)live.apply(DropProcedureDdl{{kPublicSchema, "p"}, Types{SqlType{SqlKind::Integer}, SqlType{SqlKind::Text}}});
     CHECK(count_prefix(db, procedure_record_key(p_id)) == 0);
-    CHECK(count_prefix(db, procedure_name_key("p")) == 0);
+    CHECK(count_prefix(db, procedure_name_key({kPublicSchema, "p"})) == 0);
     (void)live.apply(DropProcedureDdl{{kPublicSchema, "t"}, Types{SqlType{SqlKind::Integer}, SqlType{SqlKind::Varchar, 3},
                                                  SqlType{SqlKind::Decimal, 0, 5, 0}}});
     (void)live.apply(DropProcedureDdl{{kPublicSchema, "r"}});
@@ -1791,7 +1794,7 @@ TEST_CASE("catalog: a procedure's record and name entry must agree at load, and 
     (void)live.apply(create_p());
     p_id = live.current()->procedure({kPublicSchema, "p"})->id;
     REQUIRE(db.snapshot().get({}, procedure_record_key(p_id), record));
-    REQUIRE(db.snapshot().get({}, procedure_name_key("p"), entry));
+    REQUIRE(db.snapshot().get({}, procedure_name_key({kPublicSchema, "p"}), entry));
     db.close();
   }
   auto put = [&](const Bytes& key, const Bytes& value) {
@@ -1808,7 +1811,7 @@ TEST_CASE("catalog: a procedure's record and name entry must agree at load, and 
       db.close();
     }
     put(procedure_record_key(p_id), record);
-    put(procedure_name_key("p"), entry);
+    put(procedure_name_key({kPublicSchema, "p"}), entry);
   };
   INFO("record size " << record.size());
   for (std::size_t n = 0; n < record.size(); ++n) {
@@ -1835,22 +1838,466 @@ TEST_CASE("catalog: a procedure's record and name entry must agree at load, and 
   // No name entry; an entry of another kind or id; an entry with no record.
   {
     auto db = DB::open(dir.path());
-    (void)db.del({}, procedure_name_key("p"));
+    (void)db.del({}, procedure_name_key({kPublicSchema, "p"}));
     CHECK_THROWS_AS(LiveCatalog{db}, std::runtime_error);
     db.close();
   }
-  put(procedure_name_key("p"), entry);
+  put(procedure_name_key({kPublicSchema, "p"}), entry);
   auto other_kind = entry;
   other_kind[0] = std::byte{3};
-  refused_with(procedure_name_key("p"), other_kind);
+  refused_with(procedure_name_key({kPublicSchema, "p"}), other_kind);
   auto other_id = entry;
   other_id[4] = std::byte{static_cast<unsigned char>(std::to_integer<int>(other_id[4]) + 1)};
-  refused_with(procedure_name_key("p"), other_id);
-  refused_with(procedure_name_key("q"), entry);
+  refused_with(procedure_name_key({kPublicSchema, "p"}), other_id);
+  refused_with(procedure_name_key({kPublicSchema, "q"}), entry);
   {
     auto db = DB::open(dir.path());
     LiveCatalog ok{db};  // consistent again
     CHECK(ok.current()->procedure({kPublicSchema, "p"}) != nullptr);
     db.close();
   }
+}
+
+// docs/catalog_design.md, *Schemas*, stage 1b: the schema record, its name
+// entry and ACL record, the name entries of a schema's objects, the next
+// record formats, and the load checks.
+namespace {
+
+auto refused_detail(LiveCatalog& live, const Ddl& ddl) -> std::pair<std::string, std::string> {
+  try {
+    (void)live.apply(ddl);
+  } catch (const DdlRefused& e) {
+    return {std::string{e.sqlstate()}, std::string{e.detail()}};
+  }
+  return {};
+}
+
+// The schema `s` holding a table t (with an index s_i), and public's t.
+auto schema_fixture(LiveCatalog& live) -> std::uint32_t {
+  (void)live.apply(CreateSchemaDdl{"s", std::nullopt, false});
+  auto s = live.current()->schema("s")->id;
+  (void)live.apply(CreateTableDdl{{s, "t"}, {col("id", SqlKind::BigInt), col("v", SqlKind::BigInt)}, {"id"}});
+  (void)live.apply(CreateIndexDdl{"s_i", {s, "t"}, {{"v"}}});
+  (void)live.apply(create_t());
+  return s;
+}
+
+}  // namespace
+
+TEST_CASE("schemas: a schema is a record, a name entry and an ACL record, and its objects are its own through a reopen",
+          "[sql][catalog][schemas]") {
+  sql_test::TempDir dir{"schemas_records"};
+  std::uint32_t s = 0;
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    s = schema_fixture(live);
+    (void)live.apply(CreateViewDdl{{s, "v"}, "CREATE VIEW s.v AS SELECT id FROM t", {live.current()->table({kPublicSchema, "t"})->id},
+                                   {"id"}, {{ViewName::Kind::Relation, "t", kPublicSchema}}});
+    (void)live.apply(CreateSequenceDdl{{s, "sq"}});
+    (void)live.apply(CreateDomainDdl{{s, "d"}, SqlType{SqlKind::Integer}});
+    (void)live.apply(CreateTypeDdl{{s, "sh"}});
+    (void)live.apply(CreateProcedureDdl{{s, "p"}, "CREATE PROCEDURE s.p(a INTEGER) LANGUAGE plpgsql AS $$BEGIN END$$", false,
+                                        {{ProcedureArg::Mode::In, "a", SqlType{SqlKind::Integer}}}});
+    CHECK(db.contains_key({}, schema_record_key(s)));
+    CHECK(db.contains_key({}, schema_name_key("s")));
+    CHECK(db.contains_key({}, acl_record_key(s)));
+    CHECK(db.contains_key({}, name_entry_key({s, "t"})));
+    CHECK(db.contains_key({}, name_entry_key({s, "s_i"})));
+    CHECK_FALSE(db.contains_key({}, name_entry_key({kPublicSchema, "s_i"})));
+    CHECK(db.contains_key({}, type_name_key({s, "d"})));
+    CHECK(db.contains_key({}, procedure_name_key({s, "p"})));
+    // Every record and ACL this build writes is of its new format.
+    for (auto [sub, format] : {std::pair{0x02, 8}, {0x04, 2}, {0x05, 2}, {0x0A, 2}, {0x0C, 2}, {0x09, 2}, {0x0D, 1}}) {
+      auto prefix = Bytes{std::byte{kNsCatalog}, std::byte(sub)};
+      for (const auto& e : db.iter_from({}, prefix)) {
+        if (e.key.size() < prefix.size() || !std::ranges::equal(e.key.first(prefix.size()), prefix)) break;
+        INFO(sub);
+        CHECK(e.value[0] == std::byte(format));
+        CHECK(e.value[1] == std::byte{0});
+      }
+    }
+    db.close();
+  }
+  auto db = DB::open(dir.path());
+  LiveCatalog live{db};
+  auto cat = live.current();
+  REQUIRE(cat->schema("s") != nullptr);
+  CHECK(cat->schema(s)->owner == kBootstrapRole);
+  const auto* st = cat->table({s, "t"});
+  const auto* pt = cat->table({kPublicSchema, "t"});
+  REQUIRE(st != nullptr);
+  REQUIRE(pt != nullptr);
+  CHECK(st != pt);
+  CHECK(st->schema == s);
+  CHECK(cat->index({s, "s_i"}).second != nullptr);
+  CHECK(cat->index({kPublicSchema, "s_i"}).second == nullptr);
+  CHECK(cat->view({s, "v"})->names == std::vector<ViewName>{{ViewName::Kind::Relation, "t", kPublicSchema}});
+  CHECK(cat->sequence({s, "sq"}) != nullptr);
+  CHECK(cat->type({s, "d"})->schema == s);
+  CHECK(cat->procedure({s, "p"})->schema == s);
+  CHECK(cat->procedure({kPublicSchema, "p"}) == nullptr);
+  // RESTRICT: every object of the schema, in creation order, and none dropped.
+  auto [state, detail] = refused_detail(live, DropSchemaDdl{{"s"}, false});
+  CHECK(state == "2BP01");
+  CHECK(detail ==
+        "table s.t depends on schema s\nview s.v depends on schema s\nsequence s.sq depends on schema s\n"
+        "type s.d depends on schema s\ntype s.sh depends on schema s\nfunction s.p(integer) depends on schema s");
+  (void)live.apply(DropProcedureDdl{{s, "p"}, std::nullopt, false});
+  (void)live.apply(DropTypeDdl{{s, "sh"}, false, false});
+  (void)live.apply(DropTypeDdl{{s, "d"}, true, false});
+  (void)live.apply(DropSequenceDdl{{s, "sq"}, false});
+  (void)live.apply(DropViewDdl{{s, "v"}, false});
+  (void)live.apply(DropTableDdl{{s, "t"}, false});
+  (void)live.apply(DropSchemaDdl{{"s"}, false});
+  CHECK(live.current()->schema("s") == nullptr);
+  CHECK(count_prefix(db, Bytes{std::byte{kNsCatalog}, std::byte{0x0D}}) == 0);
+  CHECK(count_prefix(db, Bytes{std::byte{kNsCatalog}, std::byte{0x0E}}) == 0);
+  CHECK_FALSE(db.contains_key({}, acl_record_key(s)));
+  CHECK(count_prefix(db, Bytes{std::byte{kNsCatalog}, std::byte{0x03}, std::byte{0x00}}) == 0);
+  db.close();
+}
+
+TEST_CASE("schemas: CREATE and DROP SCHEMA errors are PostgreSQL's", "[sql][catalog][schemas]") {
+  sql_test::TempDir dir{"schemas_errors"};
+  auto db = DB::open(dir.path());
+  LiveCatalog live{db};
+  (void)live.apply(CreateSchemaDdl{"s", std::nullopt, false});
+  auto version = live.current()->version();
+  CHECK(refused_detail(live, CreateSchemaDdl{"pg_x", std::nullopt, false}) ==
+        std::pair<std::string, std::string>{"42939", "The prefix \"pg_\" is reserved for system schemas."});
+  CHECK(refused_state(live, CreateSchemaDdl{"pg_catalog", std::nullopt, true}) == "42939");
+  CHECK(refused_state(live, CreateSchemaDdl{"s", std::nullopt, false}) == "42P06");
+  CHECK(refused_state(live, CreateSchemaDdl{"public", std::nullopt, false}) == "42P06");
+  CHECK(refused_state(live, CreateSchemaDdl{"information_schema", std::nullopt, false}) == "42P06");
+  CHECK(refused_state(live, CreateSchemaDdl{"o", std::string{"nobody"}, false}) == "42704");
+  CHECK(live.run(CreateSchemaDdl{"s", std::nullopt, true}).changed == false);
+  CHECK(live.run(CreateSchemaDdl{"public", std::nullopt, true}).changed == false);
+  CHECK(refused_state(live, DropSchemaDdl{{"nope"}, false}) == "3F000");
+  CHECK(refused_state(live, DropSchemaDdl{{"s", "nope"}, false}) == "3F000");
+  CHECK(refused_state(live, DropSchemaDdl{{"pg_catalog"}, true}) == "2BP01");
+  CHECK(refused_state(live, DropSchemaDdl{{"public"}, false}) == "0A000");
+  CHECK(refused_state(live, DropSchemaDdl{{"information_schema"}, false}) == "0A000");
+  CHECK(live.run(DropSchemaDdl{{"nope"}, true}).changed == false);
+  CHECK(live.current()->version() == version);
+  CHECK(live.current()->schema("s") != nullptr);
+  // A schema's owner is a role, which cannot be dropped while it owns one.
+  (void)live.apply(CreateRoleDdl{"r"});
+  (void)live.apply(CreateSchemaDdl{"o", std::string{"r"}, false});
+  CHECK(live.current()->schema("o")->owner == live.current()->role("r")->id);
+  CHECK(refused_detail(live, DropRoleDdl{{"r"}, false}) == std::pair<std::string, std::string>{"2BP01", "owner of schema o"});
+  // Two schemas named, one twice: all or none.
+  (void)live.apply(CreateTableDdl{{live.current()->schema("o")->id, "t"}, {col("id", SqlKind::BigInt)}, {"id"}});
+  auto [state, detail] = refused_detail(live, DropSchemaDdl{{"s", "o", "s"}, false});
+  CHECK(state == "2BP01");
+  CHECK(detail == "table o.t depends on schema o");
+  CHECK(live.current()->schema("s") != nullptr);
+  (void)live.apply(DropTableDdl{{live.current()->schema("o")->id, "t"}, false});
+  (void)live.apply(DropSchemaDdl{{"s", "o", "s"}, false});
+  CHECK(live.current()->schemas().empty());
+  (void)live.apply(DropRoleDdl{{"r"}, false});
+  // A DDL with an empty name, or a NUL in one, through the Catalog API: 42602.
+  CHECK(refused_state(live, CreateSchemaDdl{"", std::nullopt, false}) == "42602");
+  CHECK(refused_state(live, CreateSchemaDdl{std::string{"a\0b", 3}, std::nullopt, false}) == "42602");
+  CHECK(refused_state(live, CreateTableDdl{{kPublicSchema, ""}, {col("id", SqlKind::BigInt)}, {"id"}}) == "42602");
+  CHECK(refused_state(live, CreateTableDdl{{kPublicSchema, std::string{"a\0b", 3}}, {col("id", SqlKind::BigInt)}, {"id"}}) ==
+        "42602");
+  CHECK(refused_state(live, CreateSequenceDdl{{kPublicSchema, ""}}) == "42602");
+  CHECK(refused_state(live, CreateRoleDdl{""}) == "42602");
+  (void)live.apply(create_t());
+  CHECK(refused_state(live, CreateIndexDdl{std::string{"i\0", 2}, {kPublicSchema, "t"}, {{"qty"}}}) == "42602");
+  db.close();
+}
+
+TEST_CASE("schemas: a record of an earlier format reads as an object of public", "[sql][catalog][schemas]") {
+  // Each earlier format is the new one without what it appends.
+  auto earlier = [](Bytes rec, std::size_t appended, std::uint8_t format) {
+    rec.resize(rec.size() - appended);
+    rec[0] = std::byte{format};
+    return rec;
+  };
+  auto t = rich_table();
+  t.schema = 5;
+  auto t7 = parse_table(earlier(serialize_table(t), 4, 7));
+  CHECK(t7.schema == kPublicSchema);
+  CHECK(t7.name == t.name);
+  View v{3, "v", "CREATE VIEW v AS SELECT 1 AS a", {}, {"a"}, 5, 0, {}, false};
+  auto v1 = parse_view(earlier(serialize_view(v), 4 + 1 + 2, 1));
+  CHECK(v1.schema == kPublicSchema);
+  CHECK(v1.public_names);
+  CHECK_FALSE(parse_view(serialize_view(v)).public_names);
+  Procedure p{4, "p", "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$BEGIN END$$", {}, 5};
+  CHECK(parse_procedure(earlier(serialize_procedure(p), 4, 1)).schema == kPublicSchema);
+  CHECK(parse_procedure(serialize_procedure(p)).schema == 5);
+  TypeObject ty{6, "d", TypeObject::Kind::Domain, SqlType{SqlKind::Integer}, 5};
+  CHECK(parse_type(earlier(serialize_type(ty), 4, 1)).schema == kPublicSchema);
+  Sequence sq{7, "sq", 5};
+  CHECK(parse_sequence(earlier(serialize_sequence(sq), 4, 1)).schema == kPublicSchema);
+  // An ACL of format 1 has no default flag, after the object id.
+  std::vector<AclEntry> acl{{kPublic, kWholeObject, privilege::kSelect, 0, kBootstrapRole}};
+  auto a2 = serialize_acl(9, acl);
+  auto a1 = a2;
+  a1.erase(a1.begin() + 6);
+  a1[0] = std::byte{1};
+  auto parsed = parse_acl(a1);
+  CHECK(parsed.entries == acl);
+  CHECK_FALSE(parsed.schema_format);
+  CHECK(parse_acl(a2).schema_format);
+  // A default ACL holds no entry; one that holds entries is refused.
+  CHECK(parse_acl(serialize_acl(9, {}, true)).is_default);
+  auto both = a2;
+  both[6] = std::byte{1};
+  CHECK_THROWS_AS(parse_acl(both), std::runtime_error);
+  // The schema record: cut at every byte, a later format, trailing bytes.
+  auto rec = serialize_schema(Schema{8, "s", kBootstrapRole});
+  CHECK(parse_schema(rec).name == "s");
+  for (std::size_t n = 0; n < rec.size(); ++n) CHECK_THROWS_AS(parse_schema(BytesView{rec}.first(n)), std::runtime_error);
+  auto later = rec;
+  later[0] = std::byte{2};
+  CHECK_THROWS_AS(parse_schema(later), std::runtime_error);
+  auto trailing = rec;
+  trailing.push_back(std::byte{0});
+  CHECK_THROWS_AS(parse_schema(trailing), std::runtime_error);
+  CHECK_THROWS_AS(parse_schema(serialize_schema(Schema{8, "", kBootstrapRole})), std::runtime_error);
+  CHECK_THROWS_AS(parse_schema(serialize_schema(Schema{8, std::string{"a\0b", 3}, kBootstrapRole})), std::runtime_error);
+  // A view of a check option is stage 3's: refused at load until then.
+  auto checked = v;
+  checked.check_option = 1;
+  CHECK_THROWS_AS(parse_view(serialize_view(checked)), std::runtime_error);
+}
+
+TEST_CASE("schemas: a database of format-7 tables, format-1 views and format-1 ACLs still opens as public's",
+          "[sql][catalog][schemas]") {
+  sql_test::TempDir dir{"schemas_old_formats"};
+  std::uint32_t t_id = 0;
+  std::uint32_t v_id = 0;
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    (void)live.apply(create_t());
+    t_id = live.current()->table({kPublicSchema, "t"})->id;
+    (void)live.apply(CreateViewDdl{{kPublicSchema, "v"}, "CREATE VIEW v AS SELECT id FROM t", {t_id}, {"id"},
+                                   {{ViewName::Kind::Relation, "t", kPublicSchema}}});
+    v_id = live.current()->view({kPublicSchema, "v"})->id;
+    (void)live.apply(grant({"t"}, {""}, {{"select", {}}}));
+    // Rewritten as a build from before schemas wrote them.
+    auto rewrite = [&](const Bytes& key, std::size_t appended, std::size_t at = 0) {
+      Bytes v;
+      REQUIRE(db.snapshot().get({}, key, v));
+      if (at != 0) {
+        v.erase(v.begin() + static_cast<std::ptrdiff_t>(at));
+      } else {
+        v.resize(v.size() - appended);
+      }
+      v[0] = std::byte{static_cast<unsigned char>(key[1] == std::byte{0x02} ? 7 : 1)};
+      db.put({}, key, v);
+    };
+    rewrite(table_record_key(t_id), 4);
+    rewrite(view_record_key(v_id), 4 + 1 + 2 + (1 + 2 + 1 + 4));  // the map holds one name, "t"
+    rewrite(acl_record_key(t_id), 0, 6);
+    db.close();
+  }
+  auto db = DB::open(dir.path());
+  LiveCatalog live{db};
+  auto cat = live.current();
+  CHECK(cat->table({kPublicSchema, "t"})->id == t_id);
+  CHECK(cat->view({kPublicSchema, "v"})->public_names);
+  CHECK(cat->acl(t_id).size() == 1);
+  db.close();
+}
+
+TEST_CASE("schemas: a damaged schema, a name entry of the wrong schema, or a view's stored name is refused at load",
+          "[sql][catalog][schemas]") {
+  sql_test::TempDir dir{"schemas_damage"};
+  std::uint32_t s = 0;
+  std::uint32_t t_id = 0;
+  std::uint32_t pt_id = 0;
+  Bytes schema_rec, t_rec, t_entry, i_entry, acl;
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    s = schema_fixture(live);
+    t_id = live.current()->table({s, "t"})->id;
+    pt_id = live.current()->table({kPublicSchema, "t"})->id;
+    (void)live.apply(CreateTableDdl{{kPublicSchema, "u"}, {col("id", SqlKind::BigInt)}, {"id"}});
+    (void)live.apply(CreateViewDdl{{kPublicSchema, "pv"}, "CREATE VIEW pv AS SELECT id FROM t", {pt_id}, {"id"},
+                                   {{ViewName::Kind::Relation, "t", kPublicSchema}}});
+    auto snap = db.snapshot();
+    REQUIRE(snap.get({}, schema_record_key(s), schema_rec));
+    REQUIRE(snap.get({}, table_record_key(t_id), t_rec));
+    REQUIRE(snap.get({}, name_entry_key({s, "t"}), t_entry));
+    REQUIRE(snap.get({}, name_entry_key({s, "s_i"}), i_entry));
+    REQUIRE(snap.get({}, acl_record_key(s), acl));
+    db.close();
+  }
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog ok{db};  // undamaged, it opens
+    db.close();
+  }
+  // Each damage is applied, refused at load, and undone with `undo`.
+  auto refused = [&](auto&& damage, auto&& undo) {
+    {
+      auto db = DB::open(dir.path());
+      damage(db);
+      CHECK_THROWS_AS(LiveCatalog{db}, std::runtime_error);
+      undo(db);
+      db.close();
+    }
+    auto db = DB::open(dir.path());
+    LiveCatalog again{db};
+    db.close();
+  };
+  auto put = [](const Bytes& k, const Bytes& v) { return [=](DB& db) { db.put({}, k, v); }; };
+  auto del = [](const Bytes& k) { return [=](DB& db) { (void)db.del({}, k); }; };
+  auto both = [](auto f, auto g) { return [=](DB& db) { f(db); g(db); }; };
+  // The schema record: cut at every byte, a later format, trailing bytes,
+  // under another id's key.
+  for (std::size_t n = 0; n < schema_rec.size(); ++n) {
+    INFO(n);
+    refused(put(schema_record_key(s), Bytes(schema_rec.begin(), schema_rec.begin() + static_cast<std::ptrdiff_t>(n))),
+            put(schema_record_key(s), schema_rec));
+  }
+  auto later = schema_rec;
+  later[0] = std::byte{2};
+  refused(put(schema_record_key(s), later), put(schema_record_key(s), schema_rec));
+  auto longer = schema_rec;
+  longer.push_back(std::byte{0});
+  refused(put(schema_record_key(s), longer), put(schema_record_key(s), schema_rec));
+  refused(put(schema_record_key(s + 1000), schema_rec), del(schema_record_key(s + 1000)));
+  // A missing, extra or mistyped schema name entry; a schema without its
+  // ACL record, or with one of format 1.
+  Bytes entry;
+  {
+    auto db = DB::open(dir.path());
+    REQUIRE(db.snapshot().get({}, schema_name_key("s"), entry));
+    db.close();
+  }
+  refused(del(schema_name_key("s")), put(schema_name_key("s"), entry));
+  refused(put(schema_name_key("s2"), entry), del(schema_name_key("s2")));
+  auto mistyped = entry;
+  mistyped[0] = std::byte{1};
+  refused(put(schema_name_key("s"), mistyped), put(schema_name_key("s"), entry));
+  refused(del(acl_record_key(s)), put(acl_record_key(s), acl));
+  auto acl1 = acl;
+  acl1.erase(acl1.begin() + 6);
+  acl1[0] = std::byte{1};
+  refused(put(acl_record_key(s), acl1), put(acl_record_key(s), acl));
+  // A schema of a reserved name, or owned by no role.
+  refused(put(schema_record_key(s), serialize_schema(Schema{s, "pg_s", kBootstrapRole})), put(schema_record_key(s), schema_rec));
+  refused(put(schema_record_key(s), serialize_schema(Schema{s, "s", 4242})), put(schema_record_key(s), schema_rec));
+  // An entry of the 00 form too short, of schema 0, of a schema that does
+  // not exist.
+  auto marked = [](std::uint32_t schema, std::string_view name) {
+    Bytes k{std::byte{kNsCatalog}, std::byte{0x03}, std::byte{0x00}};
+    for (int shift = 24; shift >= 0; shift -= 8) k.push_back(std::byte(static_cast<unsigned char>(schema >> shift)));
+    for (auto c : name) k.push_back(static_cast<std::byte>(c));
+    return k;
+  };
+  auto short_key = Bytes{std::byte{kNsCatalog}, std::byte{0x03}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00}};
+  refused(put(short_key, t_entry), del(short_key));
+  refused(both(del(name_entry_key({s, "t"})), put(marked(0, "t"), t_entry)),
+          both(del(marked(0, "t")), put(name_entry_key({s, "t"}), t_entry)));
+  refused(both(del(name_entry_key({s, "t"})), put(marked(s + 77, "t"), t_entry)),
+          both(del(marked(s + 77, "t")), put(name_entry_key({s, "t"}), t_entry)));
+  // An empty name or a NUL in one, in an entry and in a record.
+  refused(put(name_entry_key({s, std::string{"a\0b", 3}}), t_entry), del(name_entry_key({s, std::string{"a\0b", 3}})));
+  {
+    auto t = parse_table(t_rec);
+    t.name = "";
+    refused(put(table_record_key(t_id), serialize_table(t)), put(table_record_key(t_id), t_rec));
+  }
+  // A record whose schema disagrees with its entry: s.t's entry in public's
+  // form; a format-7 record (public's) whose entry carries a schema; an
+  // index whose entry is outside its table's schema; a record of a schema
+  // that does not exist.
+  refused(both(del(name_entry_key({s, "t"})), put(name_entry_key({kPublicSchema, "t2"}), t_entry)),
+          both(del(name_entry_key({kPublicSchema, "t2"})), put(name_entry_key({s, "t"}), t_entry)));
+  {
+    auto t7 = t_rec;
+    t7.resize(t7.size() - 4);
+    t7[0] = std::byte{7};
+    refused(put(table_record_key(t_id), t7), put(table_record_key(t_id), t_rec));
+    auto t = parse_table(t_rec);
+    t.schema = s + 77;
+    refused(put(table_record_key(t_id), serialize_table(t)), put(table_record_key(t_id), t_rec));
+  }
+  refused(both(del(name_entry_key({s, "s_i"})), put(name_entry_key({kPublicSchema, "s_i"}), i_entry)),
+          both(del(name_entry_key({kPublicSchema, "s_i"})), put(name_entry_key({s, "s_i"}), i_entry)));
+  // A view whose stored name is of no relation it depends on, or names one
+  // name twice.
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    auto pv = *live.current()->view({kPublicSchema, "pv"});
+    db.close();
+    auto rec = serialize_view(pv);
+    auto other = pv;
+    other.names = {{ViewName::Kind::Relation, "u", kPublicSchema}};
+    refused(put(view_record_key(pv.id), serialize_view(other)), put(view_record_key(pv.id), rec));
+    other.names = {{ViewName::Kind::Relation, "t", s}};
+    refused(put(view_record_key(pv.id), serialize_view(other)), put(view_record_key(pv.id), rec));
+    other.names = {{ViewName::Kind::Relation, "t", s + 77}};
+    refused(put(view_record_key(pv.id), serialize_view(other)), put(view_record_key(pv.id), rec));
+    other.names = {{ViewName::Kind::Relation, "t", kPublicSchema}, {ViewName::Kind::Relation, "t", s}};
+    refused(put(view_record_key(pv.id), serialize_view(other)), put(view_record_key(pv.id), rec));
+  }
+  // A schema whose id another object has: an empty schema given the id of
+  // public's t, its record, name entry and ACL record all agreeing.
+  {
+    sql_test::TempDir other{"schemas_damage_id"};
+    std::uint32_t e = 0;
+    std::uint32_t taken = 0;
+    {
+      auto db = DB::open(other.path());
+      LiveCatalog live{db};
+      (void)live.apply(CreateSchemaDdl{"e", std::nullopt, false});
+      (void)live.apply(create_t());
+      e = live.current()->schema("e")->id;
+      taken = live.current()->table({kPublicSchema, "t"})->id;
+      db.close();
+    }
+    auto db = DB::open(other.path());
+    (void)db.del({}, schema_record_key(e));
+    (void)db.del({}, acl_record_key(e));
+    db.put({}, schema_record_key(taken), serialize_schema(Schema{taken, "e", kBootstrapRole}));
+    db.put({}, schema_name_key("e"), Bytes{std::byte{8}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte(static_cast<unsigned char>(taken))});
+    db.put({}, acl_record_key(taken), serialize_acl(taken, {}, true));
+    CHECK_THROWS_AS(LiveCatalog{db}, std::runtime_error);
+    db.close();
+  }
+}
+
+TEST_CASE("schemas: a schema DDL the engine refuses, or a crash at its commit hook, leaves nothing after reopen",
+          "[sql][catalog][schemas]") {
+  sql_test::TempDir dir{"schemas_crash"};
+  {
+    auto db = DB::open(dir.path());
+    LiveCatalog live{db};
+    db.set_mode(Mode::Follower);
+    CHECK_THROWS_AS(live.apply(CreateSchemaDdl{"s", std::nullopt, false}), DbFollowerMode);
+    db.set_mode(Mode::Leader);
+    CHECK(live.current()->schema("s") == nullptr);
+    live.set_commit_hook_for_testing([] { throw std::runtime_error{"crash"}; });
+    CHECK_THROWS(live.apply(CreateSchemaDdl{"s", std::nullopt, false}));
+    live.set_commit_hook_for_testing({});
+    (void)live.apply(CreateSchemaDdl{"s2", std::nullopt, false});
+    live.set_commit_hook_for_testing([] { throw std::runtime_error{"crash"}; });
+    CHECK_THROWS(live.apply(CreateTableDdl{{live.current()->schema("s2")->id, "t"}, {col("id", SqlKind::BigInt)}, {"id"}}));
+    live.set_commit_hook_for_testing([] {});  // a hook that returns: the commit goes on
+    (void)live.apply(CreateSchemaDdl{"s3", std::nullopt, false});
+    (void)live.apply(CreateTableDdl{{live.current()->schema("s3")->id, "t"}, {col("id", SqlKind::BigInt)}, {"id"}});
+    live.set_commit_hook_for_testing({});
+    db.close();
+  }
+  auto db = DB::open(dir.path());
+  LiveCatalog live{db};
+  auto cat = live.current();
+  CHECK(cat->schema("s") == nullptr);
+  REQUIRE(cat->schema("s2") != nullptr);
+  CHECK(cat->table({cat->schema("s2")->id, "t"}) == nullptr);
+  REQUIRE(cat->schema("s3") != nullptr);
+  CHECK(cat->table({cat->schema("s3")->id, "t"}) != nullptr);
+  CHECK(count_prefix(db, Bytes{std::byte{kNsCatalog}, std::byte{0x0D}}) == 2);
+  db.close();
 }
