@@ -1321,6 +1321,47 @@ TEST_CASE("embedded API: $n::T in a SELECT without FROM is of type T and range-c
   CHECK(state(2147483648) == "22003");  // $1 itself
 }
 
+TEST_CASE("embedded API: a DDL is bound at execute, against the catalog it runs in; a query at prepare",
+          "[sql][api]") {
+  sql_test::TempDir dir{"api_ddl_bind"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE t (k BIGINT PRIMARY KEY, a BIGINT)");
+  auto state = [&](auto&& run) -> std::string {
+    try {
+      run();
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  // A DDL's binder error: it prepares, describes itself, and throws at execute.
+  const auto& index = db->prepare("CREATE INDEX u_a ON u (a)");
+  CHECK(index.is_ddl());
+  CHECK(index.command() == Command::CreateIndex);
+  CHECK(db->refit("CREATE INDEX u_a ON u (a)", ResultCheck::none()).ddl);
+  CHECK(state([&] { (void)db->execute(index, {}); }) == "42P01");
+  CHECK(state([&] { (void)db->execute("CREATE INDEX u_a ON u (a)"); }) == "42P01");
+  const auto& add = db->prepare("ALTER TABLE t ADD COLUMN a BIGINT");
+  CHECK(state([&] { (void)db->execute(add, {}); }) == "42701");
+  CHECK(state([&] { (void)db->prepare("CREATE VIEW v AS SELECT nope FROM t"); }) == "ran");
+  CHECK(state([&] { (void)db->execute("CREATE VIEW v AS SELECT nope FROM t"); }) == "42703");
+  CHECK(state([&] { (void)db->prepare("GRANT SELECT ON t TO nobody"); }) == "ran");
+  CHECK(state([&] { (void)db->execute("GRANT SELECT ON t TO nobody"); }) == "42704");
+  CHECK(db->catalog()->view("v") == nullptr);
+  // Bound where it runs: the table it names, created after the prepare, is found.
+  (void)db->execute("CREATE TABLE u (k BIGINT PRIMARY KEY, a BIGINT)");
+  (void)db->execute(index, {});
+  CHECK(db->catalog()->index("u_a").second != nullptr);
+  // A query's binder error is still thrown at prepare, and nothing is cached.
+  const auto plans = db->cached_plans();
+  CHECK(state([&] { (void)db->prepare("SELECT a FROM w"); }) == "42P01");
+  CHECK(db->cached_plans() == plans);
+  CHECK(state([&] { (void)db->prepare("SELECT nope FROM t"); }) == "42703");
+  // A syntax error is the parse's, at prepare, DDL or not.
+  CHECK(state([&] { (void)db->prepare("CREATE INDEX ON"); }) == "42601");
+  db->close();
+}
+
 TEST_CASE("embedded API: sqlstate reports PostgreSQL's SQLSTATE for each error", "[sql][api][server]") {
   sql_test::TempDir dir{"api_sqlstate"};
   auto db = Database::open(dir.path());

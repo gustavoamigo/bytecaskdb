@@ -1401,6 +1401,17 @@ live catalog after any DDL (`catalog_design.md`, *Compatibility*), so `*`,
 again, and a name a new column makes ambiguous is 42702. A statement run by
 text returns those columns; a prepared one whose columns change is 0A000.
 
+**DDL is bound where it runs.** A query, `INSERT`, `UPDATE` or `DELETE` is
+bound when it is prepared, so its binder errors are thrown by `prepare` and
+at Parse. A DDL is not: `prepare` parses it and classifies it from its
+syntax tree, and it is bound at execute, against the catalog it runs in, as
+PostgreSQL analyses a utility statement only when it runs. Its binder errors
+(a table, column or role that does not exist, a column name taken) are
+thrown at execute, and a DDL prepared before the table it names is created
+runs once it exists. A syntax error is the parse's, at prepare, for every
+statement. `CREATE TABLE AS` and `SELECT … INTO` bind their query at
+prepare, as before (`catalog_design.md`, *CREATE TABLE AS*).
+
 **Errors.** A parse or bind error is an `ast::SqlError` with a message and a
 position, and the SQLSTATE PostgreSQL refuses the same statement with, or
 42601 for a form the layer does not support (`server_design.md`, *Errors*).

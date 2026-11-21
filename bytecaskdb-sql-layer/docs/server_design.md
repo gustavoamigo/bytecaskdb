@@ -549,7 +549,8 @@ the server adds:
     columns, command, version) is the named statement's. In a block it is
     bound against the block's catalog: with the pin behind the live catalog
     any binder error at Parse is 40001, and with the pin live a typo is
-    42P01, as before.
+    42P01, as before. A DDL is only parsed: its binder errors are its
+    Execute's, as PostgreSQL's are (`frontend_design.md`, *Binding*).
   - The OIDs the client gives are not used: each parameter's text is read
     as the type the layer inferred, so text that type does not accept is
     `22P02`. libpq sends 0s, and psycopg sends an OID per Python type

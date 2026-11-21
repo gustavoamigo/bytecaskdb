@@ -1073,7 +1073,10 @@ public:
   // prepare, execute, begin, catalog, table_rows and stats throw bytecask::DbClosed
   // once close() was called, as the engine's calls do.
 
-  // Parses, binds and (for DML) plans and compiles; cached by the exact text.
+  // Parses; a query, INSERT, UPDATE or DELETE is also bound, planned and
+  // compiled, so its binder errors are thrown here. A DDL is bound when it
+  // runs, against the catalog it runs in, so prepare throws only its syntax
+  // error and execute throws its binder errors. Cached by the exact text.
   // Throws ast::SqlError, or FeatureNotSupported ("no plan: ...") for a
   // statement the planner can't plan. The reference is valid until close(),
   // also once a rebind has replaced the statement in the cache: a DDL that
@@ -2071,9 +2074,11 @@ auto Database::prepare_locked(std::string_view sql, bool cursor_query) -> const 
       if (!q->compiled_) throw;
     }
     s->query_ = std::move(q);
-  } else {
+  } else if (is_dml(s->ast_)) {
     s->compiled_ = build(*s);
   }
+  // A DDL holds its parse and no plan: it is bound when it runs, against the
+  // catalog it runs in, so its binder errors are thrown at execute.
   s->ddl_ = s->compiled_ == nullptr;
   s->owner_ = this;
   std::unique_lock<std::shared_mutex> lock{cache_mu_};

@@ -594,6 +594,32 @@ using Ddl = std::variant<CreateTableDdl, CreateIndexDdl, DropTableDdl, DropIndex
                          DropViewDdl, CreateProcedureDdl, DropProcedureDdl, CreateRoleDdl, DropRoleDdl, GrantDdl,
                          CreateDomainDdl, CreateTypeDdl, CreateSequenceDdl, DropTypeDdl, DropSequenceDdl>;
 
+// An ordered scan of one key prefix: where a DDL's backfill reads a table's
+// rows. SnapshotRows reads an engine snapshot, for autocommit DDL; a
+// transaction's view of its snapshot and its own writes is another
+// (docs/transaction_design.md, *Mechanism: the transaction's private catalog*).
+class RowSource {
+public:
+  RowSource() = default;
+  RowSource(const RowSource&) = delete;
+  RowSource& operator=(const RowSource&) = delete;
+  virtual ~RowSource();  // out of line: anchors the vtable (-Wweak-vtables)
+  // visit(key, value) for each entry whose key starts with `prefix`, in key
+  // order. Throws what visit throws, and as the reads it makes throw.
+  virtual void scan(BytesView prefix, const std::function<void(BytesView, BytesView)>& visit) const = 0;
+};
+
+// The rows of an engine snapshot, which must outlive it.
+class SnapshotRows final : public RowSource {
+public:
+  explicit SnapshotRows(const Snapshot& snap) : snap_{snap} {}
+  ~SnapshotRows() override;
+  void scan(BytesView prefix, const std::function<void(BytesView, BytesView)>& visit) const override;
+
+private:
+  const Snapshot& snap_;
+};
+
 class Catalog {
 public:
   Catalog() = default;
@@ -663,16 +689,16 @@ public:
     Bytes a, b;
   };
 
-private:
-  friend class LiveCatalog;
-
   // The version after `ddl`, with its batch in `ops`; nullptr for a no-op.
   // Gathers at most `backfill_limit` bytes of backfill (std::length_error
-  // past it). Reads the rows a backfill needs from `snap`, which must agree with this
-  // version. Sets `backfill` if the batch rewrites or indexes rows. Throws as
-  // LiveCatalog::prepare does.
-  [[nodiscard]] auto next_version(const Ddl& ddl, const Snapshot& snap, std::vector<DdlOp>& ops,
-                                  bool& backfill, std::size_t backfill_limit) const -> std::shared_ptr<const Catalog>;
+  // past it). Reads the rows a backfill needs from `rows`, which must agree
+  // with this version. Sets `backfill` if the batch rewrites or indexes rows.
+  // Writes nothing; throws as LiveCatalog::prepare does.
+  [[nodiscard]] auto next_version(const Ddl& ddl, const RowSource& rows, std::vector<DdlOp>& ops, bool& backfill,
+                                  std::size_t backfill_limit) const -> std::shared_ptr<const Catalog>;
+
+private:
+  friend class LiveCatalog;
 
   // A copy of every table, with its own lookups.
   [[nodiscard]] auto clone() const -> Catalog;
@@ -813,15 +839,20 @@ private:
 [[nodiscard]] auto row_prefix(std::uint32_t table_id) -> Bytes;
 [[nodiscard]] auto has_prefix(BytesView key, BytesView prefix) -> bool;
 
-// The rows of a table in the snapshot, in primary key order: visit(key, row)
-// for each. The one scan of a table's row range.
+// The keys under `prefix` in the snapshot, in key order: visit(key, value)
+// for each. The one prefix scan of a snapshot.
 template <typename Visit>
-void for_each_row(const Snapshot& snap, std::uint32_t table_id, Visit&& visit) {
-  auto prefix = row_prefix(table_id);
+void for_each_in_prefix(const Snapshot& snap, BytesView prefix, Visit&& visit) {
   for (const auto& e : snap.iter_from({}, prefix)) {
     if (!has_prefix(e.key, prefix)) break;
     visit(e.key, e.value);
   }
+}
+// The rows of a table in the snapshot, in primary key order: visit(key, row)
+// for each.
+template <typename Visit>
+void for_each_row(const Snapshot& snap, std::uint32_t table_id, Visit&& visit) {
+  for_each_in_prefix(snap, row_prefix(table_id), std::forward<Visit>(visit));
 }
 // Serializes a table as kRecordFormat; parses one, throwing
 // std::runtime_error if it does not parse or breaks an invariant.
@@ -1175,6 +1206,13 @@ void check_column_spec(const ColumnSpec& c) {
 }  // namespace
 
 DdlRefused::~DdlRefused() = default;
+
+RowSource::~RowSource() = default;
+SnapshotRows::~SnapshotRows() = default;
+
+void SnapshotRows::scan(BytesView prefix, const std::function<void(BytesView, BytesView)>& visit) const {
+  for_each_in_prefix(snap_, prefix, visit);
+}
 DdlInProgress::~DdlInProgress() = default;
 CommitOutcomeUnknown::~CommitOutcomeUnknown() = default;
 auto CommitOutcomeUnknown::what() const noexcept -> const char* {
@@ -2420,7 +2458,7 @@ auto Catalog::constants(const Table& t) -> std::vector<PlanConstant> {
 
 // --------------------------------------------------------------------- DDL
 
-auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<DdlOp>& ops, bool& backfill,
+auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<DdlOp>& ops, bool& backfill,
                            std::size_t backfill_limit) const
     -> std::shared_ptr<const Catalog> {
   auto next = std::make_shared<Catalog>(clone());
@@ -2619,7 +2657,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     backfill = true;
     std::set<Bytes> prefixes;  // a unique index's non-null prefixes seen so far
     BackfillBudget budget{t.name, backfill_limit};
-    for_each_row(snap, t.id, [&](BytesView, BytesView row) {
+    rows.scan(row_prefix(t.id), [&](BytesView, BytesView row) {
       Bytes k;
       std::size_t prefix_len = 0;
       bool has_null = false;
@@ -3100,7 +3138,7 @@ auto Catalog::next_version(const Ddl& ddl, const Snapshot& snap, std::vector<Ddl
     backfill = true;
     BackfillBudget budget{t.name, backfill_limit};
     RowWriter w{t.layout};
-    for_each_row(snap, t.id, [&](BytesView key, BytesView row) {
+    rows.scan(row_prefix(t.id), [&](BytesView key, BytesView row) {
       if (!row_valid(row) || row_generation(row) != old_layout.generation) {
         throw std::runtime_error("malformed row in table " + t.name);
       }
@@ -3184,7 +3222,7 @@ auto LiveCatalog::prepare(const Ddl& ddl) -> Prepared {
   auto [base, snap] = pin();
   std::vector<Catalog::DdlOp> ops;
   Prepared p{base, nullptr, nullptr, false};
-  p.next = base->next_version(ddl, snap, ops, p.backfill, backfill_limit_);
+  p.next = base->next_version(ddl, SnapshotRows{snap}, ops, p.backfill, backfill_limit_);
   if (!p.next) return p;
   try {
     p.plan = std::make_unique<WritePlan>(std::move(snap));
