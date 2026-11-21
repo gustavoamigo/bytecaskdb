@@ -3489,6 +3489,25 @@ public:
     for (const auto& a : e.args) refuse_in_check(a);
   }
 
+  // A WHERE conjunct a view's check option checks, over the table's
+  // columns (ast::Insert::view_checks), as a BOOLEAN of the row written. A
+  // NULL conjunct is a BOOLEAN NULL, as a WHERE reads it.
+  auto view_check(const Table& t, const ast::Expr& e) -> logical::Expr {
+    const Table* rels[] = {&t};
+    auto out = value(e, [&](const ast::Expr& c) { return std::pair{&t, column(rels, c).second}; },
+                     Peer{SqlType{SqlKind::Boolean}, nullptr, nullptr, Use::Compared});
+    if (out.type.kind != SqlKind::Boolean) {
+      throw SqlError{"argument of WHERE must be type boolean, not type " + pg_type_name(out.type), e.pos, kDatatypeMismatch};
+    }
+    return out;
+  }
+
+  auto view_checks(const Table& t, const std::vector<ast::Insert::ViewCheck>& in) -> std::vector<logical::ViewCheck> {
+    std::vector<logical::ViewCheck> out;
+    for (const auto& c : in) out.push_back({c.view, view_check(t, c.where)});
+    return out;
+  }
+
   // The table's CHECK constraints, bound for a write to it.
   auto checks(const Table& t) -> std::vector<logical::Expr> {
     std::vector<logical::Expr> out;
@@ -5961,7 +5980,7 @@ public:
     if (const auto* i = std::get_if<ast::Insert>(&stmt)) {
       const auto* view = cat_.view(lookup_name(i->table, cat_));
       auto found = view != nullptr;
-      ast::Insert out{i->table, i->columns, {}, i->pos, cloned(i->returning), i->query, i->on_conflict};
+      ast::Insert out{i->table, i->columns, {}, i->pos, cloned(i->returning), i->query, i->on_conflict, {}};
       if (i->query && mentions(*i->query)) {
         out.query = std::make_shared<const ast::Select>(expand(*i->query));
         found = true;
@@ -6044,14 +6063,38 @@ public:
     return b;
   }
 
+  // CREATE VIEW … WITH CHECK OPTION: refused (0A000, PostgreSQL's message,
+  // the reason as its HINT) unless INSERT could write through the view
+  // and each view below it, and the view has a column of its relation's;
+  // then the WHERE conjuncts a write through it would check, over the
+  // table, which the caller binds to refuse one the plan could not
+  // evaluate.
+  auto creation_checks(const ast::Select& query, std::uint8_t option, std::int32_t pos)
+      -> std::pair<const Table*, std::vector<ast::Insert::ViewCheck>> {
+    refuse_not_updatable(query, pos);
+    auto plain = [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Column || e.kind == ast::Expr::Kind::Star; };
+    if (std::ranges::none_of(query.targets, plain)) {
+      throw SqlError{"WITH CHECK OPTION is supported only on automatically updatable views", pos, kFeatureNotSupported}.with_notes(
+          "", "Views that have no updatable columns are not automatically updatable.");
+    }
+    std::vector<Level> chain;
+    chain.push_back(level_of(nullptr, ast::clone(query)));
+    for (auto& l : levels_below(query.from[0].table, pos)) chain.push_back(std::move(l));
+    const auto* table = cat_.table(lookup_name(chain.back().query.from[0].table, cat_));
+    if (table == nullptr) throw std::logic_error{"an updatable view's chain ends at no table"};
+    return {table, checked_wheres(chain, option)};
+  }
+
 private:
   static constexpr int kMaxDepth = 16;
 
   // INSERT INTO view: written to the view's one base table, as PostgreSQL's
   // automatically updatable views are (docs/frontend_design.md, *Views*).
   // The view's columns the statement fills become the base columns they
-  // are, its RETURNING the view's columns over the row written. The view's
-  // WHERE does not apply: there is no WITH CHECK OPTION. Errors come in
+  // are, its RETURNING the view's columns over the row written. The WHERE
+  // of each view of the chain its check options check is mapped to the
+  // table's columns, into `view_checks` (docs/catalog_design.md, *WITH CHECK
+  // OPTION*); no other view's WHERE applies. Errors come in
   // PostgreSQL's order: the column list, the row's width, the view's shape
   // (55000), each column filled (0A000), two filling one base column (42601).
   void into_base_table(ast::Insert& s, const View& v) {
@@ -6077,43 +6120,32 @@ private:
     // written, as PostgreSQL rewrites them one at a time: its shape, then the
     // columns filled, each mapped to its relation's, which must differ.
     ast::ObjectName table{};
+    std::vector<Level> chain;
     for (const auto* at = &v; at != nullptr;) {
       auto def = view_definition(*at, cat_);
-      const auto& q = def.query;
-      if (auto why = not_updatable(q); !why.empty()) {
+      if (auto why = not_updatable(def.query); !why.empty()) {
         throw SqlError{"cannot insert into view \"" + at->name + "\"", s.pos, kObjectNotInPrerequisiteState}.with_notes(
             why, "To enable inserting into the view, provide an INSTEAD OF INSERT trigger or an unconditional ON INSERT DO INSTEAD rule.");
       }
-      const auto& item = q.from[0];
-      // The FROM item's columns as its relation names them, and as the query does.
-      auto inner = relation_columns(item.table);
-      auto named = inner;
-      for (std::size_t k = 0; k < item.column_aliases.size() && k < named.size(); ++k) named[k] = item.column_aliases[k];
-      std::vector<ast::Expr> items;
-      for (const auto& e : q.targets) {
-        if (e.kind != ast::Expr::Kind::Star) {
-          items.push_back(ast::clone(e));
-          continue;
-        }
-        for (const auto& name : named) items.push_back(column_named(e, "", name));
-      }
+      const auto& level = chain.emplace_back(level_of(at, std::move(def.query)));
       std::vector<std::string> next;
       for (const auto& name : filled) {
-        const auto& e = items.at(static_cast<std::size_t>(std::ranges::find(at->columns, name) - at->columns.begin()));
+        const auto& e = level.items.at(static_cast<std::size_t>(std::ranges::find(at->columns, name) - at->columns.begin()));
         if (e.kind != ast::Expr::Kind::Column) {
           throw SqlError{"cannot insert into column \"" + name + "\" of view \"" + at->name + "\"", s.pos, kFeatureNotSupported}
               .with_notes("View columns that are not columns of their base relation are not updatable.", "");
         }
-        auto k = std::ranges::find(named, e.column);
-        if (k == named.end()) not_yet("inserting into a view column that is no column of its relation", s.pos);
-        const auto& column = inner[static_cast<std::size_t>(k - named.begin())];
+        auto k = std::ranges::find(level.named, e.column);
+        if (k == level.named.end()) not_yet("inserting into a view column that is no column of its relation", s.pos);
+        const auto& column = level.inner[static_cast<std::size_t>(k - level.named.begin())];
         if (std::ranges::contains(next, column)) throw SqlError{"multiple assignments to same column \"" + column + "\"", -1};
         next.push_back(column);
       }
       filled = std::move(next);
-      table = item.table;
-      at = cat_.view(lookup_name(item.table, cat_));
+      table = level.query.from[0].table;
+      at = cat_.view(lookup_name(table, cat_));
     }
+    s.view_checks = checked_wheres(chain);
     // RETURNING reads the view's body, merged down to the table.
     const auto& item = b.select.from.at(0);
     const auto* base = cat_.table(lookup_name(item.table, cat_));
@@ -6159,6 +6191,155 @@ private:
       e.alias = name;
     }
     s.returning = std::move(returning);
+  }
+
+  // One view of the chain an INSERT writes through, from the view written
+  // down to the table: its query, whose one FROM item is the relation
+  // below; that relation's columns as it names them (`inner`) and as the
+  // query does, through the item's column aliases (`named`); and the
+  // query's select list, its stars written out, one item per view column.
+  struct Level {
+    const View* view{nullptr};  // null: a view being created
+    ast::Select query;
+    std::vector<std::string> inner, named;
+    std::vector<ast::Expr> items;
+  };
+
+  auto level_of(const View* view, ast::Select query) const -> Level {
+    Level l{view, std::move(query), {}, {}, {}};
+    const auto& item = l.query.from[0];
+    l.inner = relation_columns(item.table);
+    l.named = l.inner;
+    for (std::size_t k = 0; k < item.column_aliases.size() && k < l.named.size(); ++k) l.named[k] = item.column_aliases[k];
+    for (const auto& e : l.query.targets) {
+      if (e.kind != ast::Expr::Kind::Star) {
+        l.items.push_back(ast::clone(e));
+        continue;
+      }
+      for (const auto& name : l.named) l.items.push_back(column_named(e, "", name));
+    }
+    return l;
+  }
+
+  // The chain below a view's query, each view's own definition as written,
+  // to the table; refused (0A000) where a view of it is one INSERT could
+  // not write through, the check a check option makes at CREATE VIEW.
+  auto levels_below(const ast::ObjectName& relation, std::int32_t pos) -> std::vector<Level> {
+    std::vector<Level> out;
+    for (const auto* at = cat_.view(lookup_name(relation, cat_)); at != nullptr;) {
+      if (out.size() >= kMaxDepth) throw SqlError{"views are nested too deeply", -1, kFeatureNotSupported};
+      auto def = view_definition(*at, cat_);
+      refuse_not_updatable(def.query, pos);
+      const auto& level = out.emplace_back(level_of(at, std::move(def.query)));
+      at = cat_.view(lookup_name(level.query.from[0].table, cat_));
+    }
+    return out;
+  }
+
+  static void refuse_not_updatable(const ast::Select& q, std::int32_t pos) {
+    if (auto why = not_updatable(q); !why.empty()) {
+      throw SqlError{"WITH CHECK OPTION is supported only on automatically updatable views", pos, kFeatureNotSupported}.with_notes(
+          "", why);
+    }
+  }
+
+  // The WHERE conjuncts a write through `chain` checks, each over the
+  // table's columns, innermost view first. Walking down from the view
+  // written, a view's WHERE is checked if it has a check option or a view
+  // above it is CASCADED. A view being created (no View) has its option in
+  // `top`. A WHERE that reads a subquery or holds what the checked form
+  // cannot write is refused (0A000).
+  auto checked_wheres(const std::vector<Level>& chain, std::uint8_t top = kNoCheckOption) const
+      -> std::vector<ast::Insert::ViewCheck> {
+    // A column reference of level k's query, as an expression over the table.
+    std::function<ast::Expr(std::size_t, const ast::Expr&)> down = [&](std::size_t k, const ast::Expr& ref) -> ast::Expr {
+      const auto& l = chain[k];
+      auto at = std::ranges::find(l.named, ref.column);
+      if (at == l.named.end()) throw SqlError{"column \"" + ref.column + "\" does not exist", ref.pos, kUndefinedColumn};
+      const auto& column = l.inner[static_cast<std::size_t>(at - l.named.begin())];
+      if (k + 1 == chain.size()) return column_named(ref, "", column);
+      const auto& below = chain[k + 1];
+      auto i = static_cast<std::size_t>(std::ranges::find(below.view->columns, column) - below.view->columns.begin());
+      auto e = ast::clone(below.items.at(i));
+      swap_columns(e, [&](ast::Expr& r) -> std::optional<ast::Expr> { return down(k + 1, r); });
+      return e;
+    };
+    std::vector<ast::Insert::ViewCheck> out;
+    auto cascaded = false;
+    for (std::size_t k = 0; k < chain.size(); ++k) {
+      const auto& l = chain[k];
+      auto option = l.view != nullptr ? l.view->check_option : top;
+      auto checked = cascaded || option != kNoCheckOption;
+      if (option == kCascadedCheckOption) cascaded = true;
+      if (!checked) continue;
+      std::vector<ast::Insert::ViewCheck> own;
+      for (const auto& w : l.query.where) {
+        auto e = checked_expr(w);
+        swap_columns(e, [&](ast::Expr& r) -> std::optional<ast::Expr> { return down(k, r); });
+        own.push_back({l.view != nullptr ? l.view->id : 0, std::move(e)});
+      }
+      out.insert(out.begin(), std::make_move_iterator(own.begin()), std::make_move_iterator(own.end()));
+    }
+    return out;
+  }
+
+  // A WHERE conjunct as a value, the form a CHECK constraint takes, which
+  // the plan evaluates over the row written. A subquery, LIKE, EXISTS or
+  // IN of a subquery is refused (0A000).
+  static auto checked_expr(const ast::Compare& w) -> ast::Expr {
+    using K = ast::Compare::Kind;
+    auto node = [&](ast::Expr::Kind kind) { return ast::Expr{kind, {}, 0, nullptr, nullptr, w.pos}; };
+    switch (w.kind) {
+      case K::Compare: {
+        auto e = node(ast::Expr::Kind::Compare);
+        e.lhs = std::make_unique<ast::Expr>(ast::clone(w.lhs));
+        e.rhs = std::make_unique<ast::Expr>(ast::clone(w.rhs));
+        e.cmp = w.op == ast::Compare::Op::Eq ? ast::ValueCompare::Eq
+                : w.op == ast::Compare::Op::Lt ? ast::ValueCompare::Lt
+                : w.op == ast::Compare::Op::Le ? ast::ValueCompare::Le
+                : w.op == ast::Compare::Op::Gt ? ast::ValueCompare::Gt
+                                               : ast::ValueCompare::Ge;
+        if (has_subquery(*e.lhs) || has_subquery(*e.rhs)) refuse_checked_subquery();
+        return e;
+      }
+      case K::IsNull: {
+        auto e = node(ast::Expr::Kind::IsNull);
+        e.rhs = std::make_unique<ast::Expr>(ast::clone(w.lhs));
+        if (has_subquery(*e.rhs)) refuse_checked_subquery();
+        return e;
+      }
+      case K::Not: {
+        auto e = node(ast::Expr::Kind::Not);
+        e.args.push_back(checked_expr(w.args.at(0)));
+        return e;
+      }
+      case K::And:
+      case K::Or: {
+        auto e = node(w.kind == K::And ? ast::Expr::Kind::And : ast::Expr::Kind::Or);
+        for (const auto& a : w.args) e.args.push_back(checked_expr(a));
+        return e;
+      }
+      case K::Const: {
+        auto e = node(ast::Expr::Kind::Literal);
+        e.literal = w.truth ? ast::Literal{ast::Literal::Kind::Bool, {}, *w.truth, w.pos} : ast::Literal{ast::Literal::Kind::Null, {}, false, w.pos};
+        return e;
+      }
+      case K::Exists:
+      case K::Quantified: refuse_checked_subquery();
+      case K::Like: not_supported("LIKE in a WHERE that WITH CHECK OPTION checks", -1);
+    }
+    std::unreachable();
+  }
+
+  // As a CHECK constraint's (docs/catalog_design.md, *WITH CHECK OPTION*).
+  [[noreturn]] static void refuse_checked_subquery() {
+    not_supported("a subquery in a WHERE that WITH CHECK OPTION checks", -1);
+  }
+
+  static auto has_subquery(const ast::Expr& e) -> bool {
+    if (e.kind == ast::Expr::Kind::Subquery) return true;
+    return (e.lhs && has_subquery(*e.lhs)) || (e.rhs && has_subquery(*e.rhs)) ||
+           std::ranges::any_of(e.args, [](const ast::Expr& a) { return has_subquery(a); });
   }
 
   // A table's or view's columns, in order; a table's hidden row id is none.
@@ -6664,8 +6845,17 @@ auto bind_create_view(const ast::CreateView& cv, const Catalog& cat) -> Bound {
   if (select_param_count(cv.query) != 0) throw SqlError{"there is no parameter $1", cv.pos, kUndefinedParameter};
   ViewExpander views{cat};
   auto body = views.describe(cv.query, cv.columns);
+  auto option = cv.check_option == ast::CheckOption::Local      ? kLocalCheckOption
+                : cv.check_option == ast::CheckOption::Cascaded ? kCascadedCheckOption
+                                                                : kNoCheckOption;
+  if (option != kNoCheckOption) {
+    // Bound as an INSERT through the view will bind them, and dropped.
+    auto [table, checks] = views.creation_checks(cv.query, option, cv.pos);
+    Binder scratch{cat, 0};
+    for (const auto& c : checks) (void)scratch.view_check(*table, c.where);
+  }
   auto name = created_name(cv.view, true, cat, cv.pos);
-  CreateViewDdl ddl{std::move(name), cv.definition, std::move(body.reads), std::move(body.names), std::move(body.resolved)};
+  CreateViewDdl ddl{std::move(name), cv.definition, std::move(body.reads), std::move(body.names), std::move(body.resolved), option};
   return Bound{Ddl{std::move(ddl)}, {}, {}, {}, {}, {}, {}, {}, {}};
 }
 
@@ -7072,7 +7262,7 @@ auto insert_query(Binder& b, const Table& t, const ast::Insert& s) -> logical::N
     not_supported("INSERT … SELECT of an aggregated, grouped or DISTINCT query", s.query->pos);
   }
   if (s.on_conflict && s.on_conflict->update) not_yet("INSERT … SELECT … ON CONFLICT DO UPDATE", s.on_conflict->pos);
-  logical::InsertFrom out{std::move(rows), &t, {}, {}, b.checks(t), b.returning(t, s.returning), {}};
+  logical::InsertFrom out{std::move(rows), &t, {}, {}, b.checks(t), b.returning(t, s.returning), {}, b.view_checks(t, s.view_checks)};
   if (s.on_conflict) out.arbiter = arbiter(t, *s.on_conflict);
   const auto filled = b.take_assigned();
   for (const auto* c : filled) out.columns.push_back(logical::column_of(t.id, *c).col);
@@ -7317,6 +7507,7 @@ auto bind_statement(const ast::Statement& stmt, const Catalog& cat, std::span<co
           // default, a primary key column among them, is refused when the
           // row is built (BC_C_NOT_NULL), as a NULL given for it is.
           out.checks = b.checks(*t);
+          out.view_checks = b.view_checks(*t, s.view_checks);
           out.returning = b.returning(*t, s.returning);
           if (s.on_conflict) out.arbiter = arbiter(*t, *s.on_conflict);
           if (s.on_conflict && s.on_conflict->update) out.update = conflict_update(b, *t, *s.on_conflict->update, out.rows);

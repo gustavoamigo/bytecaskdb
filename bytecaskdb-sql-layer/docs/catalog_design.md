@@ -681,8 +681,8 @@ both fixes before stage 1 (qualified type names; a view's dependencies
 from the binder's resolution), stage 1a (lookups keyed by (schema, name))
 and stage 1b (the schema record, `CREATE SCHEMA` and `DROP SCHEMA` without
 elements or `CASCADE`, qualified names; *Stages of schemas* says what was
-adapted) and stage 2 (`CREATE SCHEMA` with elements); stages 3 to 5 are
-not built. This section covers what
+adapted), stage 2 (`CREATE SCHEMA` with elements) and stage 3 (`WITH
+CHECK OPTION`); stages 4 and 5 are not built. This section covers what
 `CREATE SCHEMA` and `DROP SCHEMA` do, how a schema-qualified name resolves,
 the schema record and the change to the name entries' keys, what an older
 build does with a database that holds a schema, `WITH CHECK OPTION` (which
@@ -1064,8 +1064,8 @@ A record changes format only when a DDL writes it (an `ALTER TABLE`
 rewrites its table's record); nothing is rewritten at open. A later format
 of any of these kinds extends the one above: the schema is always there,
 so no kind needs two variants again. View format 2 is defined once, in
-stage 1b, with every field: `check_option` other than 0 is refused at load
-until stage 3 builds it.
+stage 1b, with every field: `check_option` other than 0 was refused at load
+until stage 3 built it; from stage 3 a value above 2 is.
 
 So the name entry and the record each name the schema, as each names the
 object's name today, and load checks that they agree. The in-memory
@@ -1274,6 +1274,46 @@ minimally: `INSERT` is the only write through a view the layer has
 - #678 must apply the same checks when it builds `UPDATE` of a view (PG 17
   checks an `UPDATE` that moves a row out).
 
+As built (stage 3), with what the code made different:
+- **The chain is walked once, by `ViewExpander`.** `into_base_table`
+  keeps each view's definition as a `Level` (its query, the relation's
+  columns as named and as aliased, its select list), and
+  `checked_wheres` maps each checked conjunct to the table's columns
+  through the levels below, into `ast::Insert::view_checks`, innermost
+  view first. `CREATE VIEW` runs the same walk (`creation_checks`) over
+  the new view and binds the result (`Binder::view_check`) and drops it,
+  so a `WHERE` an `INSERT` could not check is refused when the view is
+  created. Refusals at `CREATE VIEW` come after the query binds, as PG
+  17's: its shape (`not_updatable`, top first), then its columns, then
+  each view below, then the checked `WHERE`s.
+- **A checked conjunct is a value, as a `CHECK` constraint's.** A
+  `WHERE` conjunct is turned into an expression (`checked_expr`) and
+  bound as one, which the plan evaluates over the row with the
+  expression evaluator. `LIKE` has no such form yet: a checked `WHERE`
+  holding one is 0A000 at `CREATE VIEW`, where PG 17 accepts it
+  (*Differences*), as is a subquery (`EXISTS`, `IN (SELECT …)` or a
+  scalar one). So is anything else a value cannot evaluate yet: a
+  comparison of a `REAL` or `DOUBLE PRECISION` is 42601 at `CREATE VIEW`
+  (*Differences*), though the same `WHERE` without a check option reads.
+  A `NOT` (and so `<>`, `IS NOT NULL`, `NOT IN` and `NOT BETWEEN`, which
+  the parser writes with one) keeps its operand in `args`, as the
+  parser's does; a `NULL` conjunct (`WHERE NULL`, `WHERE b > 0 AND NULL`)
+  is bound as a `BOOLEAN` NULL, so every row fails it with 44000, as in
+  PG 17.
+- **The DETAIL travels with the error.** The plan raises
+  `bc_raise_row(cx, BC_C_CHECK_OPTION, view, table, row)` (plan API
+  revision 19): the runtime writes PG 17's message and the failing row
+  as the error's note (`bc_error_note`), and the API carries it as
+  `ExecError::note`, which `error_detail` returns and the server sends
+  as DETAIL. The row's values are their text output (`to_text`), NULL
+  `null`, each cut to at most 64 bytes before a UTF-8 sequence the cut
+  would split and followed by `...` where cut, and the DETAIL ends with a
+  period, as PG 17's `ExecBuildSlotValueDescription` writes it (65 `x`
+  gave 64 and `...`; 33 `é` gave 32 and `...`).
+- **The view below a check option must itself take `INSERT`**, as the
+  design says; PG 17 creates such a view (a check option over a
+  `DISTINCT` view) and refuses only the `INSERT`. Listed in *Differences*.
+
 ### Differences from PostgreSQL 17
 
 Each was observed on PG 17.12 unless it says otherwise.
@@ -1292,6 +1332,9 @@ Each was observed on PG 17.12 unless it says otherwise.
 | `pg_namespace`, `pg_class`, `information_schema.schemata` answer | 42P01 (`information_schema.x`, `pg_catalog.x`) | No catalog views (`pg_session.cppm:449`); an error, not a wrong answer. psql's `\dn` fails as `\dt` does today. |
 | `DROP SCHEMA … CASCADE` lists dropped objects in its order | The same objects; the DETAIL lines may be in another order | A notice, not a result. |
 | `WITH CHECK OPTION` with a subquery in a checked `WHERE` is accepted and enforced | 0A000 at `CREATE VIEW` | As for a `CHECK` constraint's subquery. |
+| `WITH CHECK OPTION` with `LIKE` in a checked `WHERE` is accepted and enforced | 0A000 at `CREATE VIEW` | A checked `WHERE` is evaluated as a value, which has no `LIKE` yet. |
+| `WITH CHECK OPTION` with a comparison of a `REAL` or `DOUBLE PRECISION` in a checked `WHERE` is accepted and enforced | 42601 at `CREATE VIEW` | A checked `WHERE` is evaluated as a value, which compares no floating-point value yet; the same view without the option is created. |
+| `WITH CHECK OPTION` over a view `INSERT` cannot write through (`DISTINCT`, `GROUP BY`, …) is created; an `INSERT` through it is 55000 | 0A000 at `CREATE VIEW`, the reason as HINT | A view is never created that `INSERT` then refuses. |
 | `WITH (check_option=…)`, `ALTER VIEW … SET (check_option=…)`, `CREATE OR REPLACE VIEW` | 42601, as view options and `OR REPLACE` are today | Not built; the reloption form would set the same record field. |
 | `WITH CHECK OPTION` also checks `UPDATE` through the view | `UPDATE` of a view is 0A000 (#678) | Not built. |
 
@@ -1312,7 +1355,7 @@ makes it. Rows are named by their first words.
 | New, stage 1b | **Added**: qualified names resolve to that schema's object or fail with PG 17's SQLSTATE (3F000, 42P01, 42704, 42883, 42501, 0A000, 42601); an unqualified name resolves in `public`; `CREATE SCHEMA`/`DROP SCHEMA` errors (42P06, 42939, 3F000, 2BP01). Tests (as built): "schemas: CREATE and DROP SCHEMA errors are PostgreSQL's", "schemas: messages name a missing object as s.x, and DROP SCHEMA and DROP ROLE list as PostgreSQL 17 does", "schemas: a schema is a record, a name entry and an ACL record, and its objects are its own through a reopen", "catalog: lookups are keyed by (schema, name), and a DDL creating in a schema that does not exist is refused", `tests/functional/cases/postgresql/schemas.yaml`, sqltest f311_01_01_01; the row in `CONTRACT.md` names the rest. |
 | New, before stage 1 | **Narrowed**: a type name qualified by anything but `pg_catalog.` is refused (3F000, or 42704 for `public.`), where its last part was read alone. Test: "parser: a qualified type name other than pg_catalog's is refused". |
 | New, stage 2 | **Added**: a view resolves each unqualified name to the object it was created against, whatever is created later. Tests: stage 2's shadowing test, through a reopen. |
-| New, stage 3 | **Added**: a row written through a view with a check option that its checked `WHERE`s do not hold true is 44000 and writes nothing. Tests: stage 3's cases. |
+| New, stage 3 | **Added** (built): a row written through a view with a check option that its checked `WHERE`s do not hold true is 44000 and writes nothing. Tests: "embedded API: a view WITH CHECK OPTION refuses a row its checked WHEREs do not hold true of", the view record's round trip in "schemas: a record of an earlier format reads as an object of public", `tests/functional/cases/postgresql/views.yaml`, sqltest f311_04_01_01..03. |
 | New, stage 4 (if built, Q9) | **Added**: schema privileges are stored and survive a reopen; not enforced (#653). Tests: stage 4's reopen and refusal tests. |
 
 The layer's `README.md` drops "schemas" from what is not built
@@ -1594,7 +1637,8 @@ As built, with what the code made different:
   The allocation-fault sweep is written; it runs where allocation faults
   are built in.
 
-**Stage 3: `WITH [LOCAL | CASCADED] CHECK OPTION`.** f311_04_01_01..03.
+**Stage 3: `WITH [LOCAL | CASCADED] CHECK OPTION`. Built** (*WITH CHECK
+OPTION* says what was adapted). f311_04_01_01..03.
 - The view record's `check_option` (values 1 and 2 accepted at load from
   here), the creation check, the plan's checks after `bc_insert` and before
   `RETURNING`, `BC_C_CHECK_OPTION` in the plan API

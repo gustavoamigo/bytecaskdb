@@ -126,8 +126,8 @@ class ExecError : public std::runtime_error {
 public:
   // A failure: a bc_error_code, so a bc_commit_result such as BC_CONFLICT
   // does not compile here. A conflict is made only by conflicted().
-  ExecError(const std::string& what, bc_error_code code, std::uint32_t detail = 0)
-      : std::runtime_error{what}, code_{code}, detail_{detail} {}
+  ExecError(const std::string& what, bc_error_code code, std::uint32_t detail = 0, std::string note = {})
+      : std::runtime_error{what}, code_{code}, detail_{detail}, note_{std::move(note)} {}
   // Every attempt conflicted; code() is BC_CONFLICT.
   [[nodiscard]] static auto conflicted(const std::string& what) -> ExecError { return {what, Conflict{}}; }
   ExecError(const ExecError&) = default;
@@ -144,6 +144,10 @@ public:
     if (code_ != BC_E_CONSTRAINT) return std::nullopt;
     return ConstraintDetail::decode(detail_);
   }
+  // The error's DETAIL line (bc_error_note), as PostgreSQL's: a row written
+  // through a view that its check option refuses, "Failing row contains (…)".
+  // Empty for most errors.
+  [[nodiscard]] auto note() const noexcept -> std::string_view { return note_; }
 
 private:
   ExecError(const std::string& what, Conflict)
@@ -151,6 +155,7 @@ private:
 
   int code_;
   std::uint32_t detail_;
+  std::string note_;
   bool conflict_{false};
 };
 
@@ -215,7 +220,8 @@ public:
 // ast::SqlError's own, and the one PostgreSQL gives a runtime error.
 [[nodiscard]] auto error_hint(const std::exception& e) noexcept -> std::string_view;
 // PostgreSQL's DETAIL for the error, empty where it has none or the layer
-// gives none: a DDL's refusal (DdlRefused::detail) or ast::SqlError's.
+// gives none: a DDL's refusal (DdlRefused::detail), ast::SqlError's, or a
+// runtime error's note (ExecError::note).
 [[nodiscard]] auto error_detail(const std::exception& e) noexcept -> std::string_view;
 
 class Database;
@@ -1688,9 +1694,12 @@ template <class Make>
 }
 
 // A failure the runtime reported, as the API's exception for it.
-[[noreturn]] void throw_error(bc_error_code code, std::uint32_t detail, std::string_view message) {
+// Its note is dropped with its message when they cannot be allocated.
+[[noreturn]] void throw_error(bc_error_code code, std::uint32_t detail, std::string_view message, std::string_view note = {}) {
   if (code == BC_E_UNKNOWN) throw TransactionResolutionUnknown{};
-  throw_keeping_outcome(message, [&](const std::string& m) { return ExecError{m, code, detail}; });
+  throw_keeping_outcome(message, [&](const std::string& m) {
+    return ExecError{m, code, detail, m.empty() ? std::string{} : std::string{note}};
+  });
 }
 
 // The context's error, thrown once the context is reset.
@@ -1698,14 +1707,16 @@ template <class Make>
   auto code = bc_error(cx);
   auto detail = bc_error_detail(cx);
   std::string message;
+  std::string note;
   if (code != BC_E_UNKNOWN) {  // its exception's message is static
     try {
       message = bc_error_message(cx);
+      note = bc_error_note(cx);
     } catch (const std::bad_alloc&) {  // NOLINT(bugprone-empty-catch): the message is dropped, not the outcome
     }
   }
   bc_ctx_reset(cx);  // the context keeps no snapshot or catalog version while idle
-  throw_error(code, detail, message);
+  throw_error(code, detail, message, note);
 }
 
 constexpr std::string_view kConflict = "could not serialize access due to concurrent update";
@@ -1751,6 +1762,7 @@ auto constraint_sqlstate(const ExecError& e) noexcept -> std::string_view {
     case BC_C_NOT_NULL: return "23502";
     case BC_C_CHECK: return "23514";
     case BC_C_FOREIGN_KEY: return "23503";
+    case BC_C_CHECK_OPTION: return kWithCheckOptionViolation.view();
     case BC_C_RANGE: {
       auto state = range_sqlstate(e.what());
       return state.empty() ? "22000" : state;  // data_exception: a range message out_of_range did not write
@@ -1805,6 +1817,7 @@ auto sqlstate(const std::exception& e) noexcept -> std::string_view {
 auto error_detail(const std::exception& e) noexcept -> std::string_view {
   if (const auto* x = dynamic_cast<const ast::SqlError*>(&e)) return x->detail();
   if (const auto* x = dynamic_cast<const DdlRefused*>(&e)) return x->detail();
+  if (const auto* x = dynamic_cast<const ExecError*>(&e)) return x->note();
   return {};
 }
 

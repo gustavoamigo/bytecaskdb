@@ -79,6 +79,7 @@ inline constexpr SqlState kDuplicateSchema{"42P06"};
 inline constexpr SqlState kInvalidName{"42602"};
 inline constexpr SqlState kInsufficientPrivilege{"42501"};
 inline constexpr SqlState kInvalidSchemaDefinition{"42P15"};
+inline constexpr SqlState kWithCheckOptionViolation{"44000"};
 inline constexpr SqlState kInternalError{"XX000"};
 
 // The constant above whose code is `code`, or nullopt.
@@ -90,7 +91,7 @@ inline constexpr SqlState kInternalError{"XX000"};
                  kDatetimeFieldOverflow, kInvalidTimeZoneDisplacement, kCharacterNotInRepertoire, kInvalidParameterValue, kInvalidEscapeSequence, kSubstringError, kCannotCoerce,
                  kInvalidRowCountInLimit, kInvalidRowCountInOffset, kReservedName, kInvalidGrantOperation,
                  kInvalidSavepointSpecification, kReadOnlySqlTransaction, kActiveSqlTransaction, kObjectInUse, kInvalidSchemaName,
-                 kDuplicateSchema, kInvalidName, kInsufficientPrivilege, kInvalidSchemaDefinition, kInternalError}) {
+                 kDuplicateSchema, kInvalidName, kInsufficientPrivilege, kInvalidSchemaDefinition, kWithCheckOptionViolation, kInternalError}) {
     if (s.view() == code) return s;
   }
   return std::nullopt;

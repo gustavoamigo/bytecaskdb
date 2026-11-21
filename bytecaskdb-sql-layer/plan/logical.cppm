@@ -285,6 +285,15 @@ struct Limit {
 // (bc_insert_or_existing); EXCLUDED.col is that row's value for col.
 inline constexpr std::uint32_t kAnyArbiter = 0xFFFFFFFF;  // BC_ARBITER_ANY
 
+// A WHERE conjunct of a view WITH CHECK OPTION the row is written through,
+// a BOOLEAN over the table's columns and constants: the row is refused
+// (44000, BC_C_CHECK_OPTION with the view's id) where it is false or NULL,
+// once it is written and before its RETURNING row. Innermost view first.
+struct ViewCheck {
+  std::uint32_t view{0};
+  Expr where;
+};
+
 struct Insert {
   const Table* table{nullptr};
   std::vector<std::vector<std::optional<Expr>>> rows;  // VALUES' rows, written in order
@@ -292,6 +301,7 @@ struct Insert {
   std::vector<Output> returning;  // RETURNING's: a row of these per row written, over the row as written
   std::optional<std::uint32_t> arbiter;
   std::vector<std::vector<std::pair<ColumnRef, Expr>>> update;  // empty but for DO UPDATE
+  std::vector<ViewCheck> view_checks;
 };
 
 // INSERT … SELECT: each row the input gives, a SELECT's rows (a Project
@@ -308,6 +318,7 @@ struct InsertFrom {
   std::vector<Expr> checks;
   std::vector<Output> returning;
   std::optional<std::uint32_t> arbiter;
+  std::vector<ViewCheck> view_checks;
 };
 
 // Each row the input gives, written: its set columns from expressions of

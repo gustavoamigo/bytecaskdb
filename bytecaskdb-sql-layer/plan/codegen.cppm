@@ -2836,11 +2836,28 @@ private:
   // the row that holds the key is read (bc_insert_or_existing) and updated
   // in its place as an UPDATE updates it, its CHECK tested again, and its
   // RETURNING row is the row as updated; each row proposed is counted.
-  void insert_row(std::uint32_t table, const std::vector<Expr>& checks, const std::vector<Expr>& returning,
-                  std::optional<std::uint32_t> arbiter, const std::string& count,
+  //
+  // A check option's conjuncts (`view_checks`, never with an arbiter) are
+  // evaluated over the row once bc_insert has written it, so its unique
+  // keys are checked first, as PostgreSQL checks them, and before its
+  // RETURNING row is emitted: one false or NULL raises BC_C_CHECK_OPTION
+  // with its view's id and the row.
+  void insert_row(std::uint32_t table, const std::vector<Expr>& checks, const std::vector<logical::ViewCheck>& view_checks,
+                  const std::vector<Expr>& returning, std::optional<std::uint32_t> arbiter, const std::string& count,
                   const std::vector<std::pair<ColumnRef, Expr>>* update = nullptr) {
+    if (arbiter && !view_checks.empty()) throw std::logic_error{"physical plan: a check option on an insert with an arbiter"};
     if (!arbiter) {
-      write_checked(table, checks, "bc_insert(cx, " + w_.tbl(table) + ", ", !returning.empty());
+      write_checked(table, checks, "bc_insert(cx, " + w_.tbl(table) + ", ", !returning.empty() || !view_checks.empty());
+      if (!view_checks.empty()) {
+        auto outer = std::exchange(rows_, std::vector<Binding>{{table, "nr"}});
+        for (const auto& c : view_checks) {
+          auto v = eval(c.where);
+          auto fails = v.null.empty() ? "!(" + v.value + ")" : "(" + v.null + ") || !(" + v.value + ")";
+          w_.line("if (" + fails + ") bc_raise_row(cx, BC_C_CHECK_OPTION, " + std::to_string(c.view) + ", " + w_.tbl(table) +
+                  ", nr);");
+        }
+        rows_ = std::move(outer);
+      }
       returned(table, "nr", returning);
       if (!count.empty()) w_.line("++" + count + ";");
       return;
@@ -2886,7 +2903,7 @@ private:
       for (const auto& [col, e] : s.rows[i]) {
         w_.line("bc_row_set_param(cx, r, " + w_.col(col) + ", " + std::to_string(e.param) + ");");
       }
-      insert_row(s.table, s.checks, s.returning, s.arbiter, count, s.update.empty() ? nullptr : &s.update[i]);
+      insert_row(s.table, s.checks, s.view_checks, s.returning, s.arbiter, count, s.update.empty() ? nullptr : &s.update[i]);
       if (blocks) w_.close();
     }
     w_.line("bc_emit_count(cx, " + (s.arbiter ? count : std::to_string(s.rows.size())) + ");");
@@ -2916,7 +2933,7 @@ private:
       for (const auto& [col, e] : s.fixed) {
         w.line("bc_row_set_param(cx, r, " + w.col(col) + ", " + std::to_string(e.param) + ");");
       }
-      insert_row(s.table, s.checks, s.returning, s.arbiter, count);
+      insert_row(s.table, s.checks, s.view_checks, s.returning, s.arbiter, count);
       w.close();
     };
     sink_ = &sink;

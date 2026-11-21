@@ -2060,10 +2060,18 @@ TEST_CASE("schemas: a record of an earlier format reads as an object of public",
   CHECK_THROWS_AS(parse_schema(trailing), std::runtime_error);
   CHECK_THROWS_AS(parse_schema(serialize_schema(Schema{8, "", kBootstrapRole})), std::runtime_error);
   CHECK_THROWS_AS(parse_schema(serialize_schema(Schema{8, std::string{"a\0b", 3}, kBootstrapRole})), std::runtime_error);
-  // A view of a check option is stage 3's: refused at load until then.
-  auto checked = v;
-  checked.check_option = 1;
-  CHECK_THROWS_AS(parse_view(serialize_view(checked)), std::runtime_error);
+  // A view's check option: LOCAL and CASCADED round-trip, cut at every byte
+  // they are refused, and an option this build does not know is refused.
+  for (auto option : {kLocalCheckOption, kCascadedCheckOption}) {
+    auto checked = v;
+    checked.check_option = option;
+    auto bytes = serialize_view(checked);
+    CHECK(parse_view(bytes).check_option == option);
+    for (std::size_t n = 0; n < bytes.size(); ++n) CHECK_THROWS_AS(parse_view(BytesView{bytes}.first(n)), std::runtime_error);
+  }
+  auto unknown = v;
+  unknown.check_option = 3;
+  CHECK_THROWS_AS(parse_view(serialize_view(unknown)), std::runtime_error);
 }
 
 TEST_CASE("schemas: a database of format-7 tables, format-1 views and format-1 ACLs still opens as public's",

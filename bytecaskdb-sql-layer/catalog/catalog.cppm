@@ -80,7 +80,7 @@ struct ConstraintDetail {
     if (!valid()) throw std::out_of_range("constraint kind unknown or object id past 2^24");
     return (constraint << 24) | object_id;
   }
-  // "unique", "not_null", "check", "foreign_key" or "range"; empty for a
+  // "unique", "not_null", "check", "foreign_key", "range" or "check_option"; empty for a
   // code bc_plan.h does not define. The one list of known kinds.
   [[nodiscard]] auto name() const -> std::string_view;
   // A kind bc_plan.h defines, and an id that fits its 24 bits: what
@@ -448,6 +448,10 @@ struct ViewName {
   friend auto operator==(const ViewName&, const ViewName&) -> bool = default;
 };
 
+inline constexpr std::uint8_t kNoCheckOption = 0;
+inline constexpr std::uint8_t kLocalCheckOption = 1;
+inline constexpr std::uint8_t kCascadedCheckOption = 2;
+
 struct View {
   std::uint32_t id{0};
   std::string name;
@@ -455,7 +459,7 @@ struct View {
   std::vector<std::uint32_t> depends_on;  // table and view ids, each once
   std::vector<std::string> columns;
   std::uint32_t schema{kPublicSchema};
-  // WITH CHECK OPTION: 0 none, 1 local, 2 cascaded. Only 0 until stage 3.
+  // WITH CHECK OPTION: kNoCheckOption, kLocalCheckOption or kCascadedCheckOption.
   std::uint8_t check_option{0};
   // Each unqualified relation name of the query, once.
   std::vector<ViewName> names;
@@ -645,6 +649,7 @@ struct CreateViewDdl {
   std::vector<std::uint32_t> depends_on;
   std::vector<std::string> columns;
   std::vector<ViewName> names;  // each unqualified relation name and where it resolved
+  std::uint8_t check_option{kNoCheckOption};  // View::check_option
 };
 struct DropViewDdl {
   QualifiedName name;
@@ -1460,6 +1465,7 @@ auto ConstraintDetail::name() const -> std::string_view {
     case BC_C_CHECK: return "check";
     case BC_C_FOREIGN_KEY: return "foreign_key";
     case BC_C_RANGE: return "range";
+    case BC_C_CHECK_OPTION: return "check_option";
     default: return {};
   }
 }
@@ -1472,6 +1478,7 @@ auto ConstraintDetail::message() const -> std::string {
     case BC_C_CHECK: return "check constraint " + object + " violated";
     case BC_C_FOREIGN_KEY: return "foreign key constraint " + object + " violated";
     case BC_C_RANGE: return "value out of range for a column of table " + object;
+    case BC_C_CHECK_OPTION: return "new row violates check option for view " + object;
     default: return "constraint violated on object " + object;
   }
 }
@@ -2034,8 +2041,7 @@ auto parse_view(BytesView in) -> View {
       if (std::ranges::contains(v.names, n.name, &ViewName::name)) corrupt("view " + v.name + " stores a name twice");
       v.names.push_back(std::move(n));
     }
-    // WITH CHECK OPTION is stage 3's: no build reads a view of one yet.
-    if (v.check_option != 0) corrupt("view " + v.name + " has a check option, which this build does not read");
+    if (v.check_option > kCascadedCheckOption) corrupt("view " + v.name + " has a check option this build does not know");
   }
   r.expect_end("record of view " + v.name);
   if (!valid_name(v.name)) corrupt("a view's name is empty or holds a NUL byte");
@@ -3212,7 +3218,8 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
   if (const auto* cv = std::get_if<CreateViewDdl>(&ddl)) {
     name_free(cv->name);
     type_free(cv->name);
-    View v{0, cv->name.name, cv->definition, cv->depends_on, cv->columns, cv->name.schema, 0, cv->names, false};
+    if (cv->check_option > kCascadedCheckOption) throw std::logic_error("view " + cv->name.name + " of an unknown check option");
+    View v{0, cv->name.name, cv->definition, cv->depends_on, cv->columns, cv->name.schema, cv->check_option, cv->names, false};
     std::ranges::sort(v.depends_on);
     v.depends_on.erase(std::unique(v.depends_on.begin(), v.depends_on.end()), v.depends_on.end());
     for (auto dep : v.depends_on) {

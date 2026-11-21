@@ -2990,7 +2990,7 @@ TEST_CASE("embedded API: a view is read as a table, expanded at each use, and ke
     CHECK(state(*db, "CREATE VIEW bad AS SELECT id FROM nope") == "42P01");
     CHECK(state(*db, "CREATE VIEW bad AS SELECT nope FROM vt") == "42703");
     CHECK(state(*db, "CREATE VIEW bad AS SELECT * FROM v, vu, vt") == "42601");
-    CHECK(state(*db, "CREATE VIEW bad AS SELECT id FROM vt WITH CHECK OPTION") == "42601");
+    CHECK(state(*db, "CREATE VIEW bad AS SELECT id FROM nope WITH CHECK OPTION") == "42P01");
     CHECK(state(*db, "DROP VIEW vt") == "42809");
     CHECK(state(*db, "DROP TABLE v") == "42809");
     CHECK(state(*db, "DROP INDEX v") == "42809");
@@ -3028,6 +3028,151 @@ TEST_CASE("embedded API: a view is read as a table, expanded at each use, and ke
   for (auto name : {"vv", "v", "w", "plain", "k", "one", "g", "ga", "d", "everything"}) (void)run(std::string{"DROP VIEW "} + name);
   (void)run("DROP TABLE vt");
   (void)run("DROP TABLE vu");
+}
+
+// Each expectation is PostgreSQL 17's (docs/catalog_design.md, *WITH CHECK
+// OPTION*), but where the design names a difference.
+TEST_CASE("embedded API: a view WITH CHECK OPTION refuses a row its checked WHEREs do not hold true of", "[sql][api][view]") {
+  sql_test::TempDir dir{"api_check_option"};
+  struct Error {
+    std::string state, message, detail, hint;
+  };
+  auto error = [](Database& db, std::string_view sql, const std::vector<Value>& params = {}) -> Error {
+    try {
+      (void)db.execute(sql, params);
+    } catch (const std::exception& e) {
+      return {std::string{sqlstate(e)}, e.what(), std::string{error_detail(e)}, std::string{error_hint(e)}};
+    }
+    return {"ran", "", "", ""};
+  };
+  auto violation = [&](Database& db, std::string_view sql, std::string_view view, std::string_view row,
+                       const std::vector<Value>& params = {}) {
+    auto e = error(db, sql, params);
+    CHECK(e.state == "44000");
+    CHECK(e.message == "new row violates check option for view \"" + std::string{view} + "\"");
+    CHECK(e.detail == "Failing row contains " + std::string{row} + ".");
+  };
+  {
+    auto db = Database::open(dir.path());
+    auto run = [&](std::string_view sql) { return db->execute(sql).rows; };
+    (void)run("CREATE TABLE co (a INTEGER PRIMARY KEY, b INTEGER DEFAULT 0, c TEXT CHECK (c <> 'x'), d INTEGER NOT NULL DEFAULT 1)");
+    // A row outside the view, its defaults filled and NULL written null; a NULL is outside too.
+    (void)run("CREATE VIEW v3 AS SELECT a, b + 1 AS y FROM co WHERE a > 0 WITH LOCAL CHECK OPTION");
+    violation(*db, "INSERT INTO v3 (a) VALUES (-1)", "v3", "(-1, 0, null, 1)");
+    (void)run("CREATE VIEW n AS SELECT a, b FROM co WHERE b > 0 WITH CHECK OPTION");
+    violation(*db, "INSERT INTO n (a, b) VALUES (400, NULL)", "n", "(400, null, null, 1)");
+    CHECK(error(*db, "INSERT INTO v3 (a) VALUES (1)").state == "ran");
+    // LOCAL checks its own WHERE and an option's below; CASCADED every WHERE below it.
+    (void)run("CREATE VIEW v4 AS SELECT a, b FROM co WHERE b > 10");
+    (void)run("CREATE VIEW v5 AS SELECT a FROM v4 WHERE a > 0 WITH LOCAL CHECK OPTION");
+    CHECK(error(*db, "INSERT INTO v5 VALUES (5)").state == "ran");
+    violation(*db, "INSERT INTO v5 VALUES (-5)", "v5", "(-5, 0, null, 1)");
+    (void)run("CREATE VIEW v6 AS SELECT a FROM v4 WHERE a > 0 WITH CASCADED CHECK OPTION");
+    violation(*db, "INSERT INTO v6 VALUES (6)", "v4", "(6, 0, null, 1)");  // the innermost failing view
+    // A view with no option over one that has one enforces that one, and not its own WHERE.
+    (void)run("CREATE VIEW v7 AS SELECT a, b FROM co WHERE a > 100 WITH CHECK OPTION");
+    (void)run("CREATE VIEW v8 AS SELECT a, b FROM v7 WHERE b > 0");
+    violation(*db, "INSERT INTO v8 VALUES (2, 5)", "v7", "(2, 5, null, 1)");
+    CHECK(error(*db, "INSERT INTO v8 VALUES (101, 0)").state == "ran");
+    // A WHERE over the renamed columns of the view below, and a FROM alias's names over a table.
+    (void)run("CREATE VIEW comp AS SELECT a AS aa, b AS bb FROM co");
+    (void)run("CREATE VIEW top AS SELECT aa AS p, bb AS q FROM comp WHERE bb > 5 WITH CHECK OPTION");
+    violation(*db, "INSERT INTO top (p) VALUES (300)", "top", "(300, 0, null, 1)");
+    (void)run("CREATE VIEW al AS SELECT x.p, x.q FROM co AS x (p, q) WHERE x.q > 5 WITH CHECK OPTION");
+    violation(*db, "INSERT INTO al (p) VALUES (301)", "al", "(301, 0, null, 1)");
+    CHECK(error(*db, "INSERT INTO top VALUES (300, 6)").state == "ran");
+    // A duplicate, a CHECK and a NOT NULL are reported before the check option.
+    CHECK(error(*db, "INSERT INTO v7 VALUES (5, 1)").state == "23505");
+    (void)run("CREATE VIEW v9 AS SELECT a, b, c FROM co WHERE a > 100 WITH CHECK OPTION");
+    CHECK(error(*db, "INSERT INTO v9 VALUES (2, 1, 'x')").state == "23514");
+    (void)run("CREATE VIEW v10 AS SELECT a, b, d FROM co WHERE a > 100 WITH CHECK OPTION");
+    CHECK(error(*db, "INSERT INTO v10 VALUES (200, 1, NULL)").state == "23502");
+    // RETURNING emits nothing before the error, which undoes the statement's rows.
+    violation(*db, "INSERT INTO v7 VALUES (150, 1), (3, 1) RETURNING *", "v7", "(3, 1, null, 1)");
+    CHECK(run("SELECT COUNT(*) FROM co WHERE a = 150") == Grid{{i(0)}});
+    CHECK(run("INSERT INTO v7 VALUES (151, 1) RETURNING a") == Grid{{i(151)}});
+    // INSERT … SELECT, and a parameter.
+    violation(*db, "INSERT INTO v7 SELECT -a, b FROM co WHERE a = 5", "v7", "(-5, 0, null, 1)");
+    violation(*db, "INSERT INTO v7 VALUES ($1, 1)", "v7", "(2, 1, null, 1)", {i(2)});
+    CHECK(error(*db, "INSERT INTO v7 VALUES ($1, 1)", {i(102)}).state == "ran");
+    // ON CONFLICT into a view stays refused.
+    CHECK(error(*db, "INSERT INTO v7 VALUES (1, 1) ON CONFLICT DO NOTHING").state == "0A000");
+    // A table without a primary key: its hidden row id is no column of the row.
+    (void)run("CREATE TABLE nk (x INTEGER, y INTEGER, z INTEGER DEFAULT 0)");
+    (void)run("CREATE VIEW nkv AS SELECT x, y FROM nk WHERE x > 0 WITH CHECK OPTION");
+    violation(*db, "INSERT INTO nkv VALUES (-7, NULL)", "nkv", "(-7, null, 0)");
+    // NOT in a checked WHERE, as the parser writes <>, IS NOT NULL, NOT IN and NOT BETWEEN,
+    // and under a CASCADED view over a view with no option.
+    for (auto [view, where] : {std::pair{"nne", "b <> 7"}, {"nnn", "b IS NOT NULL"}, {"nni", "b NOT IN (7, 8)"},
+                               {"nnb", "b NOT BETWEEN 7 AND 9"}, {"nnp", "NOT (b = 7)"}}) {
+      (void)run(std::string{"CREATE VIEW "} + view + " AS SELECT a, b FROM co WHERE " + where + " WITH CHECK OPTION");
+      violation(*db, std::string{"INSERT INTO "} + view + " VALUES (500, " + (std::string_view{view} == "nnn" ? "NULL" : "7") + ")",
+                view, std::string_view{view} == "nnn" ? "(500, null, null, 1)" : "(500, 7, null, 1)");
+    }
+    CHECK(error(*db, "INSERT INTO nne VALUES (501, 6)").state == "ran");
+    CHECK(error(*db, "INSERT INTO nnn VALUES (502, 6)").state == "ran");
+    CHECK(error(*db, "INSERT INTO nni VALUES (503, 6)").state == "ran");
+    CHECK(error(*db, "INSERT INTO nnb VALUES (504, 10)").state == "ran");
+    CHECK(error(*db, "INSERT INTO nnp VALUES (505, 6)").state == "ran");
+    (void)run("CREATE VIEW nplain AS SELECT a, b FROM co WHERE NOT (b = 2)");
+    (void)run("CREATE VIEW ncasc AS SELECT a, b FROM nplain WITH CASCADED CHECK OPTION");
+    violation(*db, "INSERT INTO ncasc VALUES (510, 2)", "nplain", "(510, 2, null, 1)");
+    CHECK(error(*db, "INSERT INTO ncasc VALUES (511, 3)").state == "ran");
+    // A NULL conjunct is a BOOLEAN NULL: never true, so every row is refused.
+    (void)run("CREATE VIEW nul AS SELECT a, b FROM co WHERE b > 0 AND NULL WITH CHECK OPTION");
+    violation(*db, "INSERT INTO nul VALUES (520, 1)", "nul", "(520, 1, null, 1)");
+    (void)run("CREATE VIEW nul0 AS SELECT a FROM co WHERE NULL");
+    (void)run("CREATE VIEW nul1 AS SELECT a FROM nul0 WITH CHECK OPTION");
+    violation(*db, "INSERT INTO nul1 VALUES (521)", "nul0", "(521, 0, null, 1)");
+    // Each value in the DETAIL is cut to 64 bytes, before a UTF-8 sequence it would split, then "...".
+    (void)run("CREATE VIEW longs AS SELECT a, c FROM co WHERE a > 1000 WITH CHECK OPTION");
+    violation(*db, "INSERT INTO longs VALUES (530, $1)", "longs", "(530, 0, " + std::string(64, 'x') + ", 1)",
+              {Value{sql_test::bytes(std::string(64, 'x'))}});
+    violation(*db, "INSERT INTO longs VALUES (531, $1)", "longs", "(531, 0, " + std::string(64, 'x') + "..., 1)",
+              {Value{sql_test::bytes(std::string(65, 'x'))}});
+    std::string e_acute = "\xc3\xa9";
+    auto repeat = [](const std::string& unit, std::size_t n) {
+      std::string out;
+      for (std::size_t k = 0; k < n; ++k) out += unit;
+      return out;
+    };
+    violation(*db, "INSERT INTO longs VALUES (532, $1)", "longs", "(532, 0, " + repeat(e_acute, 32) + "..., 1)",
+              {Value{sql_test::bytes(repeat(e_acute, 33))}});
+    violation(*db, "INSERT INTO longs VALUES (533, $1)", "longs", "(533, 0, a" + repeat(e_acute, 31) + "..., 1)",
+              {Value{sql_test::bytes("a" + repeat(e_acute, 32))}});
+    // Refused at CREATE VIEW: a view INSERT could not write through, PostgreSQL's reason as the
+    // HINT; a view of only computed columns; a subquery or LIKE in a checked WHERE.
+    auto refused = [&](std::string_view sql, std::string_view hint) {
+      auto e = error(*db, sql);
+      CHECK(e.state == "0A000");
+      CHECK(e.message == "WITH CHECK OPTION is supported only on automatically updatable views");
+      CHECK(e.hint == hint);
+    };
+    refused("CREATE VIEW bad AS SELECT DISTINCT a FROM co WITH CHECK OPTION", "Views containing DISTINCT are not automatically updatable.");
+    refused("CREATE VIEW bad AS SELECT a + 1 AS x FROM co WITH CHECK OPTION",
+            "Views that have no updatable columns are not automatically updatable.");
+    refused("CREATE VIEW bad AS SELECT COUNT(*) AS k FROM co WITH CHECK OPTION",
+            "Views that return aggregate functions are not automatically updatable.");
+    (void)run("CREATE VIEW grp AS SELECT a FROM co GROUP BY a");
+    refused("CREATE VIEW bad AS SELECT a FROM grp WITH LOCAL CHECK OPTION",
+            "Views containing GROUP BY are not automatically updatable.");  // PostgreSQL creates it
+    CHECK(error(*db, "CREATE VIEW bad AS SELECT a, b + 1 AS x FROM co WITH CHECK OPTION").state == "ran");
+    (void)run("DROP VIEW bad");
+    CHECK(error(*db, "CREATE VIEW bad AS SELECT a FROM co WHERE a IN (SELECT 1) WITH CHECK OPTION").state == "0A000");
+    CHECK(error(*db, "CREATE VIEW bad AS SELECT a FROM co WHERE a = (SELECT 1) WITH CHECK OPTION").state == "0A000");
+    CHECK(error(*db, "CREATE VIEW bad AS SELECT a, c FROM co WHERE c LIKE 'a%' WITH CHECK OPTION").state == "0A000");
+    (void)run("CREATE VIEW sub AS SELECT a FROM co WHERE a IN (SELECT 1)");
+    CHECK(error(*db, "CREATE VIEW bad AS SELECT a FROM sub WITH CHECK OPTION").state == "0A000");
+    CHECK(error(*db, "CREATE VIEW bad AS SELECT a FROM sub WITH LOCAL CHECK OPTION").state == "ran");  // sub is not checked
+    CHECK(error(*db, "CREATE VIEW bad2 AS SELECT a FROM nope WITH CHECK OPTION").state == "42P01");
+    db->close();
+  }
+  // The option survives a reopen.
+  auto db = Database::open(dir.path());
+  violation(*db, "INSERT INTO v6 VALUES (6)", "v4", "(6, 0, null, 1)");
+  violation(*db, "INSERT INTO v3 (a) VALUES (-1)", "v3", "(-1, 0, null, 1)");
+  CHECK(error(*db, "INSERT INTO bad VALUES (-3)").state == "ran");  // LOCAL over sub, which has no option
+  db->close();
 }
 
 // A view's dependencies are what the binder resolved while it bound the

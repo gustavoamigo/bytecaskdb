@@ -922,11 +922,13 @@ struct ErrorSink {
   bc_error_code& error;
   std::uint32_t& detail;
   std::string& message;
+  std::string& note;  // the error's DETAIL line (bc_error_note): only a constraint with a row sets it
 
   void clear() noexcept {
     error = BC_OK;
     detail = 0;
     message.clear();
+    note.clear();
   }
 
   void fail(ErrorCode code, std::string msg, std::uint32_t with_detail = 0) {
@@ -963,6 +965,7 @@ struct ErrorSink {
   void unknown(const char* what) noexcept {
     error = BC_E_UNKNOWN;
     detail = 0;
+    note.clear();
     try {
       message = what;
     } catch (...) {
@@ -1102,6 +1105,7 @@ struct bc_ctx {
   bc_error_code error{BC_OK};
   std::uint32_t detail{0};
   std::string message;
+  std::string note;
 
   // The handle tables a step's storage is marked in: each grows as the plan
   // makes handles and is cut back to its mark when the step ends.
@@ -1283,7 +1287,7 @@ struct bc_ctx {
   // call after the stop returns a neutral value. It is not an error.
   auto ok() const -> bool { return error == BC_OK && !unwinding; }
 
-  [[nodiscard]] auto sink() -> ErrorSink { return {error, detail, message}; }
+  [[nodiscard]] auto sink() -> ErrorSink { return {error, detail, message, note}; }
 
   void fail(ErrorCode code, std::string msg) { sink().fail(code, std::move(msg)); }
 
@@ -1865,7 +1869,8 @@ struct bc_txn {
   bc_error_code error{BC_OK};
   std::uint32_t detail{0};
   std::string message;
-  [[nodiscard]] auto sink() -> ErrorSink { return {error, detail, message}; }
+  std::string note;
+  [[nodiscard]] auto sink() -> ErrorSink { return {error, detail, message, note}; }
   void fail_current_exception() noexcept { sink().fail_current_exception(); }
   // The one context begun on it and not yet reset, which points into its
   // snapshot and overlay; null when none is. A second is refused, and so
@@ -3781,6 +3786,8 @@ bool bc_ctx_stopped(const bc_ctx* cx) { return cx->stopped; }
 enum bc_error_code bc_error(const bc_ctx* cx) { return cx->error; }
 
 const char* bc_error_message(const bc_ctx* cx) { return cx->message.c_str(); }
+
+const char* bc_error_note(const bc_ctx* cx) { return cx->note.c_str(); }
 
 uint32_t bc_error_detail(const bc_ctx* cx) { return cx->detail; }
 
@@ -7273,6 +7280,86 @@ void bc_raise(bc_ctx* cx, uint32_t constraint, uint32_t object_id) {
     return;
   }
   cx->raise(constraint, object_id);
+  BC_GUARD_END(cx)
+}
+
+}  // extern "C"
+
+namespace {
+
+// A value's text as the DETAIL writes it: at most 64 bytes, cut before a
+// UTF-8 sequence it would split, then "..." where it was cut (PostgreSQL's
+// ExecBuildSlotValueDescription).
+auto clipped(std::string text) -> std::string {
+  constexpr std::size_t kMaxFieldLen = 64;
+  if (text.size() <= kMaxFieldLen) return text;
+  auto end = kMaxFieldLen;
+  // A continuation byte (10xxxxxx) at the cut means a sequence is split:
+  // cut before its lead byte.
+  while (end > 0 && (static_cast<unsigned char>(text[end]) & 0xC0U) == 0x80U) --end;
+  text.resize(end);
+  return text + "...";
+}
+
+// The row's values as PostgreSQL's DETAIL writes a failing row: each column
+// a statement can name, in the table's order, as its text output clipped,
+// NULL as null.
+auto failing_row(const Table& t, BytesView row) -> std::optional<std::string> {
+  std::string out = "Failing row contains (";
+  auto first = true;
+  for (const auto& c : t.columns) {
+    if (c.hidden) continue;
+    if (!std::exchange(first, false)) out += ", ";
+    const auto* slot = t.layout.find(c.id);
+    if (slot == nullptr) return std::nullopt;
+    auto v = bytecask::sql::row_column(row, *slot);
+    switch (v.state) {
+      case bytecask::sql::ColumnState::Malformed: return std::nullopt;
+      case bytecask::sql::ColumnState::Absent: out += "null"; continue;
+      case bytecask::sql::ColumnState::Value: break;
+    }
+    Datum d;
+    switch (slot->type) {
+      case PhysType::I64: d = v.i64(); break;
+      case PhysType::F64: d = v.f64(); break;
+      case PhysType::Bool: d = v.boolean(); break;
+      case PhysType::Bytes:
+      case PhysType::Num: d = Bytes(v.bytes.begin(), v.bytes.end()); break;
+    }
+    out += clipped(bytecask::sql::to_text(d, c.sql));
+  }
+  return out + ").";
+}
+
+}  // namespace
+
+extern "C" {
+
+void bc_raise_row(bc_ctx* cx, uint32_t constraint, uint32_t object_id, uint32_t table, bc_view row) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return;
+  if (!ConstraintDetail{constraint, object_id}.valid()) {
+    cx->fail(BC_E_HANDLE, "bc_raise_row with an unknown constraint kind or an object id past 2^24");
+    return;
+  }
+  const auto* t = cx->table(table);
+  if (t == nullptr) return;
+  auto bytes = write_row(cx, *t, row, false);
+  if (!bytes) return;
+  auto note = failing_row(*t, *bytes);
+  if (!note) {
+    cx->fail(BC_E_CORRUPT, "malformed row in table " + t->name);
+    return;
+  }
+  std::string msg;
+  if (constraint == BC_C_CHECK_OPTION) {
+    const auto* v = cx->cat->view(object_id);
+    msg = "new row violates check option for view \"" + (v == nullptr ? std::to_string(object_id) : v->name) + "\"";
+  } else {
+    msg = ConstraintDetail{constraint, object_id}.message();
+  }
+  cx->raise(constraint, object_id, std::move(msg));
+  if (cx->error == BC_E_CONSTRAINT) cx->note = std::move(*note);
   BC_GUARD_END(cx)
 }
 

@@ -1,7 +1,7 @@
 # Views: CREATE VIEW and DROP VIEW, read like a table in FROM. A view is its
 # query, read again at each use. INSERT writes through a simple view; a query
 # that aggregates over a grouped view reads its groups as rows. UPDATE and
-# DELETE through a view, and WITH CHECK OPTION, are not built.
+# DELETE through a view are not built; WITH CHECK OPTION checks an INSERT.
 
 - name: a view reads its table's rows as they are when it is read
   features: [F031-02]
@@ -492,3 +492,124 @@
   teardown:
     - DROP VIEW vw9_g
     - DROP TABLE vw9
+
+- name: an INSERT through a view WITH CHECK OPTION refuses a row its checked WHEREs do not hold true of
+  features: [F311-04]
+  setup:
+    - CREATE TABLE vwc (a INTEGER PRIMARY KEY, b INTEGER DEFAULT 0, c TEXT CHECK (c <> 'x'))
+    - CREATE VIEW vwc_l AS SELECT a, b FROM vwc WHERE a > 0 WITH LOCAL CHECK OPTION
+    - CREATE VIEW vwc_n AS SELECT a, b FROM vwc WHERE b < 10
+    - CREATE VIEW vwc_ln AS SELECT a FROM vwc_n WHERE a > 0 WITH LOCAL CHECK OPTION
+    - CREATE VIEW vwc_cn AS SELECT a FROM vwc_n WHERE a > 0 WITH CASCADED CHECK OPTION
+    - CREATE VIEW vwc_top AS SELECT a, b FROM vwc_l WHERE b > 5
+  steps:
+    - sql: INSERT INTO vwc_l VALUES ($1, $2)
+      params: [1, 1]
+      rowcount: 1
+    - sql: INSERT INTO vwc_l VALUES ($1, $2)
+      params: [-1, 1]
+      error: "44000"
+    # NOT NULL comes before the check option
+    - sql: INSERT INTO vwc_l VALUES (NULL, 1)
+      error: "23502"
+    # LOCAL leaves the WHERE of a view below with no option unchecked; CASCADED checks it
+    - sql: INSERT INTO vwc (a, b) VALUES (2, 20)
+      rowcount: 1
+    - sql: UPDATE vwc SET b = 30 WHERE a = 2
+      rowcount: 1
+    - sql: INSERT INTO vwc_ln VALUES (3)
+      rowcount: 1
+    - sql: UPDATE vwc SET b = 40 WHERE a = 3
+      rowcount: 1
+    - sql: INSERT INTO vwc_cn VALUES (4)
+      rowcount: 1
+    - sql: INSERT INTO vwc_cn VALUES (-4)
+      error: "44000"
+    # a view with no option over one that has one: that one is checked, its own WHERE is not
+    - sql: INSERT INTO vwc_top VALUES (5, 1)
+      rowcount: 1
+    - sql: INSERT INTO vwc_top VALUES (-5, 9)
+      error: "44000"
+    # a duplicate comes before the check option, and RETURNING gives nothing
+    - sql: INSERT INTO vwc_l VALUES (1, 1)
+      error: "23505"
+    - sql: INSERT INTO vwc_l VALUES (-1, 1) RETURNING a
+      error: "44000"
+    - sql: SELECT a, b FROM vwc ORDER BY a
+      expected: [[1, 1], [2, 30], [3, 40], [4, 0], [5, 1]]
+  teardown:
+    - DROP VIEW vwc_top
+    - DROP VIEW vwc_cn
+    - DROP VIEW vwc_ln
+    - DROP VIEW vwc_n
+    - DROP VIEW vwc_l
+    - DROP TABLE vwc
+
+- name: WITH CHECK OPTION is refused on a view INSERT could not write through
+  features: [F311-04]
+  setup:
+    - CREATE TABLE vwd (a INTEGER PRIMARY KEY, b INTEGER)
+  steps:
+    - sql: CREATE VIEW vwd_d AS SELECT DISTINCT a FROM vwd WITH CHECK OPTION
+      error: "0A000"
+    - sql: CREATE VIEW vwd_e AS SELECT a + 1 AS x FROM vwd WITH CHECK OPTION
+      error: "0A000"
+    - sql: CREATE VIEW vwd_g AS SELECT a, COUNT(*) AS n FROM vwd GROUP BY a WITH CHECK OPTION
+      error: "0A000"
+    - sql: CREATE VIEW vwd_j AS SELECT vwd.a FROM vwd, vwd AS y WITH CHECK OPTION
+      error: "0A000"
+    # some computed columns are allowed; a NULL is not true
+    - sql: CREATE VIEW vwd_c AS SELECT a, b + 1 AS x FROM vwd WHERE b > 0 WITH CHECK OPTION
+    - sql: INSERT INTO vwd_c (a) VALUES (1)
+      error: "44000"
+  teardown:
+    - DROP VIEW vwd_c
+    - DROP TABLE vwd
+
+- name: a checked WHERE with NOT, <>, IS NOT NULL, NOT IN, NOT BETWEEN or a NULL conjunct
+  features: [F311-04]
+  setup:
+    - CREATE TABLE vwn (a INTEGER PRIMARY KEY, b INTEGER)
+    - CREATE VIEW vwn_ne AS SELECT a, b FROM vwn WHERE b <> 7 WITH CHECK OPTION
+    - CREATE VIEW vwn_nn AS SELECT a, b FROM vwn WHERE b IS NOT NULL WITH LOCAL CHECK OPTION
+    - CREATE VIEW vwn_ni AS SELECT a, b FROM vwn WHERE b NOT IN (1, 2) WITH CHECK OPTION
+    - CREATE VIEW vwn_nb AS SELECT a, b FROM vwn WHERE b NOT BETWEEN 1 AND 5 WITH CHECK OPTION
+    - CREATE VIEW vwn_np AS SELECT a, b FROM vwn WHERE NOT (b = 2)
+    - CREATE VIEW vwn_nc AS SELECT a, b FROM vwn_np WITH CASCADED CHECK OPTION
+    - CREATE VIEW vwn_null AS SELECT a, b FROM vwn WHERE b > 0 AND NULL WITH CHECK OPTION
+  steps:
+    - sql: INSERT INTO vwn_ne VALUES (1, 7)
+      error: "44000"
+    - sql: INSERT INTO vwn_ne VALUES (1, 8)
+      rowcount: 1
+    - sql: INSERT INTO vwn_nn VALUES (2, NULL)
+      error: "44000"
+    - sql: INSERT INTO vwn_nn VALUES (2, 1)
+      rowcount: 1
+    - sql: INSERT INTO vwn_ni VALUES (3, 2)
+      error: "44000"
+    - sql: INSERT INTO vwn_ni VALUES (3, 3)
+      rowcount: 1
+    - sql: INSERT INTO vwn_nb VALUES (4, 3)
+      error: "44000"
+    - sql: INSERT INTO vwn_nb VALUES (4, 9)
+      rowcount: 1
+    # CASCADED checks the WHERE of the view below, which has no option
+    - sql: INSERT INTO vwn_nc VALUES (10, 2)
+      error: "44000"
+    - sql: INSERT INTO vwn_nc VALUES (10, 3)
+      rowcount: 1
+    # a NULL conjunct is never true
+    - sql: INSERT INTO vwn_null VALUES (20, 1)
+      error: "44000"
+    - sql: SELECT a, b FROM vwn ORDER BY a
+      expected: [[1, 8], [2, 1], [3, 3], [4, 9], [10, 3]]
+  teardown:
+    - DROP VIEW vwn_null
+    - DROP VIEW vwn_nc
+    - DROP VIEW vwn_np
+    - DROP VIEW vwn_nb
+    - DROP VIEW vwn_ni
+    - DROP VIEW vwn_nn
+    - DROP VIEW vwn_ne
+    - DROP TABLE vwn

@@ -124,7 +124,7 @@ struct Expr {
   Kind kind;
   std::string column;       // Column
   std::uint32_t param{0};   // Param: zero-based ($1 is 0)
-  std::unique_ptr<Expr> lhs, rhs;  // Add, Sub, Mul, Div, Compare; Plus, Neg, IsNull, Not and Cast: rhs
+  std::unique_ptr<Expr> lhs, rhs;  // Add, Sub, Mul, Div, Compare; Plus, Neg, IsNull and Cast: rhs
   std::int32_t pos{-1};
   std::string table;          // Column, Star: the table it is qualified by, "" for none
   // Column, Star: the schema `table` is qualified by (s.t.c), "" for none.
@@ -142,7 +142,7 @@ struct Expr {
   std::vector<std::int32_t> cast_typmods;
   std::shared_ptr<const Select> subquery;  // Subquery
   std::string alias;  // a select-list item's AS name, "" for none
-  // And, Or: two or more operands. Case: WHEN, THEN, WHEN, THEN … in order, `lhs` the simple form's operand
+  // And, Or: two or more operands; Not: one. Case: WHEN, THEN, WHEN, THEN … in order, `lhs` the simple form's operand
   // and `rhs` its ELSE, each none where absent. Coalesce: its arguments.
   // NullIf: `lhs` and `rhs`. Aggregate: its argument, none for COUNT(*).
   std::vector<Expr> args;
@@ -394,6 +394,15 @@ struct Insert {
     std::shared_ptr<const std::vector<Assignment>> update;
   };
   std::optional<OnConflict> on_conflict;
+  // Written through a view WITH CHECK OPTION: each WHERE conjunct a view of
+  // the chain checks, over the base table's columns, innermost view first
+  // (the binder's ViewExpander sets it; docs/catalog_design.md, *WITH CHECK
+  // OPTION*).
+  struct ViewCheck {
+    std::uint32_t view{0};
+    Expr where;
+  };
+  std::vector<ViewCheck> view_checks;
 };
 
 
@@ -542,12 +551,16 @@ struct Delete {
 
 // CREATE VIEW name [(columns)] AS query. `query` is the SELECT as written;
 // the catalog stores the statement's text and parses it again at each use.
+// WITH [LOCAL | CASCADED] CHECK OPTION; WITH CHECK OPTION alone is CASCADED.
+enum class CheckOption : std::uint8_t { None, Local, Cascaded };
+
 struct CreateView {
   ObjectName view;
   std::vector<std::string> columns;  // the view's column names, empty: the query's own
   Select query;
   std::int32_t pos{-1};
   std::string definition;  // the statement's text, set by parse()
+  CheckOption check_option{CheckOption::None};
 };
 
 // CREATE TABLE name [(columns)] AS query [WITH [NO] DATA], or SELECT … INTO
