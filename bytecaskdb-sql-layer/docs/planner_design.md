@@ -114,7 +114,9 @@ errors it raises.
   query's `SELECT` (*INSERT … SELECT*).
 - A `Sort` key takes `NULLS FIRST` or `NULLS LAST` as written, else
   PostgreSQL's default for its direction: `ASC NULLS LAST`, `DESC NULLS
-  FIRST`.
+  FIRST`. A key is a column, or in a query that is not aggregated an
+  expression over the rows' columns (`ORDER BY a + 5`), which the binder
+  binds as a select item; a constant key orders nothing and is dropped.
 - `FOR UPDATE` is a flag on the `Get` it locks, carried to the physical
   access path, which guards each row it returns.
 
@@ -500,7 +502,7 @@ refuses:
   rows, or whose sorters hold other rows than its loops' (a sorter per loop
   of its input read above it, outer first, each over a row read); a column
   read above it from a loop no sorter holds; a sort key or NULL test
-  outside its input's tables;
+  outside its input's tables, an expression key's columns among them;
 - an `Aggregate` of other than `COUNT` or `SUM`;
 - `KeyAggregates` whose outputs are other than `COUNT(*)`, or `MIN` or
   `MAX` of its one argument; whose argument is not held as `I64`; whose
@@ -512,7 +514,8 @@ refuses:
   type no local holds; a key or argument outside its input's tables; a
   dependent column that is a key, or of a group of no key; a `HAVING`, a
   sort of the groups or an output that names other than the groups' columns
-  and aggregates; a sort of groups not over a structure of them.
+  and aggregates (an expression key among them); a sort of groups not over a
+  structure of them.
 
 **Codegen is produce/consume** (Neumann, "Efficiently Compiling Efficient
 Query Plans for Modern Hardware", VLDB 2011; HyPer, then Umbra), each
@@ -616,6 +619,15 @@ over `bc_sorter_*`, and compared with the plans in the order.
   covering scan's entry is `bc_sort_key_<type>` of `bc_key_part_<type>`,
   `bc_sort_key_null` where the entry's part is NULL; never a `DOUBLE`,
   which the key does not hold exactly.
+- An expression key (`physical::SortPart` holds a column or an
+  `ExprTarget`) is evaluated over the rows in hand as each row is added, as
+  an expression result column is (*Expressions over columns*), into
+  `bc_sort_key_<type>` of its value, or `bc_sort_key_null`; an error it
+  raises (22003, 22012) fails the statement. Its columns are read below the
+  sort, from rows or a covering scan's entry, like a column key's. No access
+  path gives an expression's order, nor the order of the keys after one, so
+  such an `ORDER BY` is always sorted, and a hash join never sorts its probe
+  side for it. A `GROUP BY`'s sort of groups keys on columns alone.
 - `ORDER BY … LIMIT n` opens the sorter with `keep = n` (`OFFSET`'s rows
   included), and its loop keeps the `LIMIT`'s counter. `LIMIT 0` needs no order and sorts nothing.
 - A sorter holds one view per row, so there is a sorter per loop of the

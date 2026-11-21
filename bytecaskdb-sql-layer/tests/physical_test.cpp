@@ -354,7 +354,16 @@ TEST_CASE("physical: a sort holds the row of each of its input's loops read abov
   };
   CHECK(refusal(plan(by_budget(false))).empty());
   refused(plan(by_budget(true)), "a sort over a covering scan");
-  refused(plan(sort(node(scan({p(0)}, {})), {{{2, 0, PhysType::I64, false}, false, false}}, 0, {1})),
+  refused(plan(sort(node(scan({p(0)}, {})), {{logical::ColumnRef{2, 0, PhysType::I64, false}, false, false}}, 0, {1})),
+          "a sort key outside its input's tables");
+  // An expression key (ORDER BY id + id) reads its columns as a column key
+  // does: of its input's tables.
+  auto plus = [](logical::ColumnRef c) {
+    const auto big = SqlType{SqlKind::BigInt};
+    return physical::ExprTarget{logical::binary(logical::Expr::Kind::Add, logical::column(c, big), logical::column(c, big), big)};
+  };
+  CHECK(refusal(plan(sort(node(scan({p(0)}, {})), {{plus(kId), true, false}}, 0, {1}))).empty());
+  refused(plan(sort(node(scan({p(0)}, {})), {{plus({2, 0, PhysType::I64, false}), false, false}}, 0, {1})),
           "a sort key outside its input's tables");
   // Two loops, one inside the other: a sorter per loop read above the sort,
   // outer first.
@@ -588,6 +597,14 @@ TEST_CASE("physical: check refuses a grouped aggregate codegen can't print", "[s
   CHECK(refusal(sorted(false, kId)).empty());
   refused(sorted(true, kId), "a sort of groups not over a structure of them");
   refused(sorted(false, name), "a sort of groups by a column not of them");
+  // A sort of groups keys on columns alone, never an expression.
+  {
+    const auto big = SqlType{SqlKind::BigInt};
+    auto g = node(physical::GroupAggregate{rows(), {kId}, {count}, false, {}});
+    auto key = physical::ExprTarget{logical::binary(logical::Expr::Kind::Add, logical::column(kId, big), logical::column(kId, big), big)};
+    auto s = node(physical::Sort{std::move(g), {{std::move(key), false, false}}, 0, {}, {}, true});
+    refused(plan(node(physical::GroupEmit{std::move(s), {count}}), {0}), "a sort of groups by a column not of them");
+  }
   // A stream holds no row: its BOOLEAN key read from a covering scan's
   // entry, as an I64's is. A structure reads it from the row it holds.
   const logical::ColumnRef flag{1, 3, PhysType::Bool, true};

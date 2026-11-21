@@ -1,6 +1,7 @@
-# ORDER BY a select-list position, in a plain SELECT. The position names the
-# select-list item, which must be a column; a set operation's is in
-# set_operations.yaml.
+# ORDER BY a select-list position or output name, and ORDER BY an
+# expression of the FROM columns, in a plain SELECT. A position or output
+# name orders by its select-list item, a column or an expression; a set
+# operation's is in set_operations.yaml.
 
 - name: ORDER BY takes select-list positions
   features: [F850]
@@ -60,8 +61,6 @@
 
 - name: ORDER BY an output name of an expression
   features: [F850]
-  # ORDER BY an output name of an expression is not supported yet
-  unimplemented: true
   ordered: true
   setup:
     - CREATE TABLE oe (id INTEGER PRIMARY KEY, a INTEGER)
@@ -71,5 +70,44 @@
   steps:
     - sql: SELECT -a AS a FROM oe ORDER BY a
       expected: [[-30], [-20], [-10]]
+    - sql: SELECT a + 1 FROM oe ORDER BY 1 DESC
+      expected: [[31], [21], [11]]
+    - sql: SELECT a + 1 AS x, a + 1 AS x FROM oe ORDER BY x
+      expected: [[11, 11], [21, 21], [31, 31]]
+    - sql: SELECT a + 1 AS x, a + 2 AS x FROM oe ORDER BY x
+      error: "42702"
   teardown:
     - DROP TABLE oe
+
+- name: ORDER BY an expression of the FROM columns
+  features: [E121-03]
+  ordered: true
+  setup:
+    - CREATE TABLE ox (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, s SMALLINT)
+    - CREATE TABLE oy (id INTEGER PRIMARY KEY, a INTEGER)
+    - INSERT INTO ox VALUES (1, 30, 'x', 200), (2, 10, 'z', 300), (3, NULL, 'y', 1), (4, 20, 'y', -5)
+    - INSERT INTO oy VALUES (1, 5), (2, 6)
+  steps:
+    - sql: SELECT id FROM ox ORDER BY a + 5
+      expected: [[2], [4], [1], [3]]
+    - sql: SELECT id FROM ox ORDER BY -a DESC NULLS LAST
+      expected: [[2], [4], [1], [3]]
+    - sql: SELECT id, a FROM ox ORDER BY a % 7 NULLS FIRST, id
+      expected: [[3, null], [1, 30], [2, 10], [4, 20]]
+    - sql: SELECT id FROM ox ORDER BY b || 'a' DESC, id
+      expected: [[2], [3], [4], [1]]
+    - sql: SELECT id FROM ox ORDER BY abs(a - 15), id LIMIT 2
+      expected: [[2], [4]]
+    - sql: SELECT ox.id FROM ox JOIN oy ON ox.id = oy.id ORDER BY ox.a + oy.a
+      expected: [[2], [1]]
+    - sql: SELECT id FROM ox ORDER BY 1 + 1, id DESC
+      expected: [[4], [3], [2], [1]]
+    - sql: SELECT id FROM ox ORDER BY s * s
+      error: "22003"
+    - sql: SELECT DISTINCT a FROM ox ORDER BY a + 1
+      error: "42P10"
+    - sql: SELECT a FROM ox UNION SELECT a FROM oy ORDER BY a + 1
+      error: "0A000"
+  teardown:
+    - DROP TABLE ox
+    - DROP TABLE oy

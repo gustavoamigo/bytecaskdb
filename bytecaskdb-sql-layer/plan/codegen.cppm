@@ -1358,21 +1358,32 @@ private:
   }
 
   // One part of sort key `sk`: a row's column, NULL included, or a covering
-  // scan's entry's, never a DOUBLE (physical::check).
+  // scan's entry's, never a DOUBLE (physical::check); or an expression,
+  // evaluated over the rows in hand into bc_sort_key_<type>, an error it
+  // raises (22003, 22012) the statement's.
   void sort_part(const physical::SortPart& part) {
     const auto placed = std::string{part.desc ? "BC_SORT_DESC" : "BC_SORT_ASC"} + ", " +
                         (part.nulls_first ? "BC_SORT_NULLS_FIRST" : "BC_SORT_NULLS_LAST") + ");";
-    const auto& c = part.col;
-    if (!binding(c.table).covering) {
-      w_.line("bc_sort_key_col(cx, sk, " + row_of(c) + ", " + w_.col(c) + ", " + placed);
-      return;
+    std::string is_null;
+    std::string value;
+    if (const auto* x = std::get_if<physical::ExprTarget>(&part.key)) {
+      auto v = eval(x->expr);
+      is_null = v.null;
+      value = "bc_sort_key_" + suffix(v.type) + "(cx, sk, " + v.value + ", " + placed;
+    } else {
+      const auto& c = std::get<ColumnRef>(part.key);
+      if (!binding(c.table).covering) {
+        w_.line("bc_sort_key_col(cx, sk, " + row_of(c) + ", " + w_.col(c) + ", " + placed);
+        return;
+      }
+      is_null = c.nullable ? col_null(c) : "";
+      value = "bc_sort_key_" + suffix(c.type) + "(cx, sk, " + read_col(c) + ", " + placed;
     }
-    const auto value = "bc_sort_key_" + suffix(c.type) + "(cx, sk, " + read_col(c) + ", " + placed;
-    if (!c.nullable) {
+    if (is_null.empty()) {
       w_.line(value);
       return;
     }
-    w_.open("if (" + col_null(c) + ")");
+    w_.open("if (" + is_null + ")");
     w_.line("bc_sort_key_null(cx, sk, " + placed);
     w_.otherwise();
     w_.line(value);
@@ -2147,12 +2158,13 @@ private:
   void group_sort_part(const physical::SortPart& part) {
     auto dir = std::string{part.desc ? "BC_SORT_DESC" : "BC_SORT_ASC"} + ", " +
                (part.nulls_first ? "BC_SORT_NULLS_FIRST" : "BC_SORT_NULLS_LAST");
-    if (auto row = held_row(*group_, part.col)) {
-      w_.line("bc_sort_key_col(cx, sk, " + *row + ", " + w_.col(part.col) + ", " + dir + ");");
+    const auto& col = std::get<ColumnRef>(part.key);  // a group's keys are columns (physical::check)
+    if (auto row = held_row(*group_, col)) {
+      w_.line("bc_sort_key_col(cx, sk, " + *row + ", " + w_.col(col) + ", " + dir + ");");
       return;
     }
-    auto [is_null, value] = group_value(Expr{logical::column(part.col, {})});
-    auto put = "bc_sort_key_" + suffix(part.col.type) + "(cx, sk, " + value + ", " + dir + ");";
+    auto [is_null, value] = group_value(Expr{logical::column(col, {})});
+    auto put = "bc_sort_key_" + suffix(col.type) + "(cx, sk, " + value + ", " + dir + ");";
     if (is_null.empty()) {
       w_.line(put);
       return;

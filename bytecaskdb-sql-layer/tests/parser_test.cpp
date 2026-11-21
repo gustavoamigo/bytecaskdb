@@ -195,7 +195,12 @@ TEST_CASE("parser: forms outside the scope are rejected with a position", "[sql]
   CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 OFFSET $2"), SqlError);
   CHECK(rejected_at("SELECT id FROM t WHERE id = $1 OFFSET -1") == 38);
   CHECK_THROWS_AS(parse("SELECT id FROM t UNION SELECT id FROM t OFFSET 1"), SqlError);
-  CHECK_THROWS_AS(parse("SELECT id FROM t WHERE id = $1 ORDER BY qty + $2"), SqlError);
+  // ORDER BY an expression is parsed whole; the binder binds it.
+  auto key = std::get<Select>(parse("SELECT id FROM t WHERE id = $1 ORDER BY qty + $2"));
+  REQUIRE(key.order_by.size() == 1);
+  CHECK(key.order_by[0].expr.kind == Expr::Kind::Add);
+  CHECK(key.order_by[0].expr.rhs->kind == Expr::Kind::Param);
+  CHECK(rejected_at("SELECT id FROM t ORDER BY t.*") == 26);  // a whole row: not yet
 }
 
 TEST_CASE("parser: ORDER BY takes NULLS FIRST and NULLS LAST; an index does not", "[sql][parser]") {
@@ -208,17 +213,17 @@ TEST_CASE("parser: ORDER BY takes NULLS FIRST and NULLS LAST; an index does not"
   CHECK_THROWS_AS(parse("CREATE INDEX u ON t (name NULLS FIRST)"), SqlError);
 }
 
-TEST_CASE("parser: ORDER BY a position names the select-list column; a set operation's stays a position", "[sql][parser]") {
+TEST_CASE("parser: ORDER BY a position names the select-list item; a set operation's stays a position", "[sql][parser]") {
   auto s = std::get<Select>(parse("SELECT qty, id AS k FROM t ORDER BY 2 DESC, 1"));
   REQUIRE(s.order_by.size() == 2);
-  CHECK(s.order_by[0].column == "id");
+  CHECK(s.order_by[0].expr.column == "id");
   CHECK(s.order_by[0].position == 0);
   CHECK(s.order_by[0].desc);
-  CHECK(s.order_by[1].column == "qty");
+  CHECK(s.order_by[1].expr.column == "qty");
   auto u = std::get<Select>(parse("SELECT a FROM t UNION SELECT b FROM u ORDER BY 1 DESC"));
   REQUIRE(u.order_by.size() == 1);
   CHECK(u.order_by[0].position == 1);
-  CHECK(u.order_by[0].column.empty());
+  CHECK(u.order_by[0].expr.column.empty());
   auto sqlstate_of = [](const char* sql) {
     try {
       (void)parse(sql);
@@ -232,7 +237,10 @@ TEST_CASE("parser: ORDER BY a position names the select-list column; a set opera
   CHECK(sqlstate_of("SELECT qty FROM t ORDER BY -1") == "42P10");
   CHECK(sqlstate_of("SELECT qty FROM t ORDER BY 'a'") == "42601");
   CHECK(sqlstate_of("SELECT qty FROM t ORDER BY 1.5") == "42601");
-  CHECK(sqlstate_of("SELECT qty + 1 FROM t ORDER BY 1") == "42601");  // not a column: not yet
+  // An expression's position orders by the expression.
+  auto e = std::get<Select>(parse("SELECT qty + 1 FROM t ORDER BY 1"));
+  CHECK(e.order_by[0].expr.kind == Expr::Kind::Add);
+  CHECK(e.order_by[0].position == 0);
   CHECK(sqlstate_of("SELECT * FROM t ORDER BY 1") == "42601");        // a position after *: not yet
 }
 
@@ -240,29 +248,25 @@ TEST_CASE("parser: ORDER BY an output name orders by its item, never the input c
   // The output name qty is the input column id, as PostgreSQL resolves it.
   auto s = std::get<Select>(parse("SELECT qty + 1 AS id, id AS qty FROM t ORDER BY qty DESC"));
   REQUIRE(s.order_by.size() == 1);
-  CHECK(s.order_by[0].column == "id");
-  // An output name of an expression is refused, not read as the input column of its name.
+  CHECK(s.order_by[0].expr.column == "id");
+  // An output name of an expression orders by the expression, never the input column of its name.
   for (const auto* sql : {"SELECT qty + 1 AS qty FROM t ORDER BY qty", "SELECT -qty AS qty FROM t ORDER BY qty DESC",
                           "SELECT count(*) AS id FROM t ORDER BY id"}) {
-    try {
-      (void)parse(sql);
-      FAIL(sql);
-    } catch (const SqlError& e) {
-      CHECK(std::string{e.sqlstate()} == "42601");
-      CHECK(std::string{e.what()}.find("ORDER BY an output name of an expression") != std::string::npos);
-    }
+    auto x = std::get<Select>(parse(sql));
+    CHECK(x.order_by[0].expr.kind != Expr::Kind::Column);
   }
   // A qualified name is the input column, as in PostgreSQL.
   auto q = std::get<Select>(parse("SELECT qty + 1 AS qty FROM t ORDER BY t.qty"));
-  CHECK(q.order_by[0].column == "qty");
+  CHECK(q.order_by[0].expr.kind == Expr::Kind::Column);
+  CHECK(q.order_by[0].expr.column == "qty");
   // A position names its item, whatever another item's output name is.
   for (const auto* sql : {"SELECT qty, -id AS qty FROM t ORDER BY 1", "SELECT qty AS id, id AS qty FROM t ORDER BY 1"}) {
     auto p = std::get<Select>(parse(sql));
-    CHECK(p.order_by[0].column == "qty");
+    CHECK(p.order_by[0].expr.column == "qty");
   }
-  CHECK(std::get<Select>(parse("SELECT qty AS id, id AS qty FROM t ORDER BY 2")).order_by[0].column == "id");
+  CHECK(std::get<Select>(parse("SELECT qty AS id, id AS qty FROM t ORDER BY 2")).order_by[0].expr.column == "id");
   // An unaliased column's name is an output name too; two different items of
-  // one name are ambiguous (42702), one column twice is not.
+  // one name are ambiguous (42702), one column or one expression twice is not.
   auto sqlstate_of = [](const char* sql) {
     try {
       (void)parse(sql);
@@ -274,10 +278,11 @@ TEST_CASE("parser: ORDER BY an output name orders by its item, never the input c
   CHECK(sqlstate_of("SELECT id AS qty, qty FROM t ORDER BY qty") == "42702");
   CHECK(sqlstate_of("SELECT qty AS x, id AS x FROM t ORDER BY x") == "42702");
   CHECK(sqlstate_of("SELECT id, count(*) AS id FROM t GROUP BY id ORDER BY id") == "42702");
-  CHECK(sqlstate_of("SELECT -qty AS x, -qty AS x FROM t ORDER BY x") == "42601");  // expressions: not yet
+  CHECK(sqlstate_of("SELECT -qty AS x, qty + 1 AS x FROM t ORDER BY x") == "42702");
+  CHECK(sqlstate_of("SELECT -qty AS x, -qty AS x FROM t ORDER BY x") == "parsed");
   auto twice = std::get<Select>(parse("SELECT qty AS x, t.qty AS x FROM t ORDER BY x"));
-  CHECK(twice.order_by[0].column == "qty");
-  CHECK(twice.order_by[0].table == "t");
+  CHECK(twice.order_by[0].expr.column == "qty");
+  CHECK(twice.order_by[0].expr.table == "t");
 }
 
 TEST_CASE("parser: COUNT, ORDER BY, LIMIT and column + parameter", "[sql][parser]") {
@@ -298,7 +303,7 @@ TEST_CASE("parser: COUNT, ORDER BY, LIMIT and column + parameter", "[sql][parser
   CHECK(distinct.targets[0].distinct);
   CHECK_FALSE(sum_min.targets[0].distinct);
   REQUIRE(s.order_by.size() == 2);
-  CHECK(s.order_by[0].column == "name");
+  CHECK(s.order_by[0].expr.column == "name");
   CHECK(s.order_by[0].desc);
   CHECK_FALSE(s.order_by[1].desc);
   CHECK(s.limit == 3);

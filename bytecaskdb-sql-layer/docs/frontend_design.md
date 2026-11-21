@@ -150,15 +150,13 @@ kind the transformer doesn't take is refused with its position.
   its own; an unqualified `ORDER BY name` that is such a name orders by that
   item (PostgreSQL looks at output names first there, at input columns first
   in `GROUP BY`, which takes no output name here). The parser resolves the
-  name to the item's column (`resolve_output_names`, before positions are
-  resolved, so `ORDER BY 1` names item 1 whatever another item is called);
-  where the item is an expression it refuses the `ORDER BY` (42601), since
-  the output name hides any input column of that name and ordering by that
-  column would order by the wrong values (`SELECT -a AS a ... ORDER BY a`).
-  Two items of the name that differ are 42702, as in PostgreSQL; one column
-  named twice is one item. Two expressions of one name are refused (42601)
-  without deciding whether they are the same (PostgreSQL orders by an
-  expression written twice, and raises 42702 for two different ones). A
+  name to a copy of the item's expression, a column or any other
+  (`resolve_output_names`, before positions are resolved, so `ORDER BY 1`
+  names item 1 whatever another item is called): the output name hides any
+  input column of that name, so `SELECT -a AS a ... ORDER BY a` orders by
+  `-a`. Two items of the name are 42702 unless they are one, as in
+  PostgreSQL: one column named twice, qualified or not, or one expression
+  written twice alike (`ast::same_expr`, PostgreSQL's `equal()`). A
   subquery resolves its own aliases; it cannot name the outer query's
   (correlation is refused). `t AS x (c1, c2)` renames the table's first
   columns (the binder renames them in the alias's table instance, which is
@@ -391,10 +389,29 @@ in any order, on any columns, and of predicates over them.
   an `ON`, a `WHERE`, `USING` or `NATURAL`.
 
 **`ORDER BY`, `LIMIT` and `OFFSET`.**
-- `ORDER BY` takes a list of columns, each `ASC` or `DESC`, and `NULLS
+- `ORDER BY` takes a list of keys, each `ASC` or `DESC`, and `NULLS
   FIRST` or `NULLS LAST`; without them NULLs sort as PostgreSQL's
   defaults put them, last under `ASC` and first under `DESC`. Ties come
   back in any order, as PostgreSQL allows. `CREATE INDEX` takes neither.
+- A key is a column, an output name or select-list position (above and
+  below), or an expression of the `FROM` columns (`ORDER BY a + 5`,
+  `ORDER BY coalesce(a, 0)`, `ORDER BY t.a + u.b` over a join): anything
+  the select list takes, bound as a select item is (`plain_output`), and
+  evaluated per row as the row is added to the sorter, so an error it
+  raises is the statement's (`ORDER BY s * s` of a `SMALLINT` is 22003,
+  `ORDER BY id / 0` 22012). A key with no column that folds to a constant
+  or is a parameter orders nothing and is dropped (`ORDER BY 1 + 1`,
+  `ORDER BY (SELECT 1)`); a bare `ORDER BY $n` that nothing before typed is
+  text, as PostgreSQL types it there. No index gives an expression's order:
+  the plan sorts (`docs/planner_design.md`, *Sorts*).
+- Under `DISTINCT` a key must be a selected item: a column the list
+  selects, or an expression written alike; any other is 42P10, as in
+  PostgreSQL. On a set operation a key that is not an output column is
+  0A000 (*Set operations*).
+- *Refused (42601).* An expression key in a grouped or aggregated query
+  (an aggregate in `ORDER BY`, `ORDER BY a + 1` under `GROUP BY a`),
+  `ORDER BY random()`, which PostgreSQL draws once per row, and `ORDER BY
+  t.*`, which PostgreSQL orders by the whole row.
 - `LIMIT` takes an integer literal or a parameter. `LIMIT NULL` is no
   limit, and a negative limit is refused (2201W), as in PostgreSQL.
 - `OFFSET` takes an integer literal: that many rows are skipped before
@@ -506,10 +523,10 @@ are syntax errors as in PostgreSQL, and `WHERE CURRENT OF name` is the whole
 condition it is a syntax error, as in PostgreSQL.
 
 **Select-list positions in `ORDER BY`.** `ORDER BY 2` orders a plain `SELECT`
-by its second select-list item. The parser resolves it to that item's
-column, so every later stage sees the column's name; the item must be a
-column (an expression is refused as `ORDER BY` of one is, 42601), a position
-outside the list is 42P10 and any other constant 42601, as in PostgreSQL. A
+by its second select-list item. The parser resolves it to a copy of that
+item's expression, a column or any other, so every later stage sees the key
+itself; a position outside the list is 42P10 and any other constant 42601,
+as in PostgreSQL. A
 position after `*` is refused (42601): the binder expands stars, the parser
 does not.
 
@@ -544,7 +561,8 @@ does not.
   and a `LIMIT` after it applies to the sorted rows. The names are the
   output's alone, as in PostgreSQL: a name that is only an arm's column is
   42703, a name two columns share 42702, a qualified name 42P01 ("missing
-  FROM-clause entry"), a position outside the columns 42P10, and an expression 42601 (PostgreSQL's 0A000).
+  FROM-clause entry"), a position outside the columns 42P10, and an expression 0A000 ("invalid
+  UNION/INTERSECT/EXCEPT ORDER BY clause", without PostgreSQL's detail and hint).
   The parser keeps a position (`ast::OrderItem::position`) for the binder
   to resolve against the outputs (`logical::SetOp::order`). `ORDER BY` inside
   a parenthesised set operation within another is refused (42601, "not
@@ -727,8 +745,7 @@ That includes:
 - `FULL JOIN`, an outer join's `ON` comparing an expression of columns,
   more than eight tables, a `RIGHT JOIN` after the first join, `USING` or
   `NATURAL` after the first join, a join in parentheses or among commas,
-  `FOR UPDATE` of a join (#697), an alias of a join, an output name in `GROUP BY` or in `ORDER BY` of
-  other than a column;
+  `FOR UPDATE` of a join (#697), an alias of a join, an output name in `GROUP BY`;
 - `RETURNING` in a procedure; `VALUES` outside `INSERT`; `OFFSET` on a set operation, in one of
   its arms or in a view;
 - `INSERT … SELECT` of an aggregated, grouped or `DISTINCT` query or a set
@@ -742,7 +759,9 @@ That includes:
   list (#685);
 - the quotient of a numeric other than constants, arithmetic and
   comparison of `REAL` and `DOUBLE PRECISION` as values, an expression in
-  `ORDER BY`, `GROUP BY`, `SET` or an aggregated select list (#685, #686);
+  `GROUP BY`, `SET`, an aggregated select list or the `ORDER BY` of a
+  grouped or aggregated query (#685, #686), `ORDER BY random()` and
+  `ORDER BY t.*`;
 - `OVERLAY` of columns and parameters, a string function in a `WHERE`,
   `||` of a boolean, float or date value, `LENGTH`, `CONCAT`,
   `REPLACE`, the regular-expression `SUBSTRING`, `bytea` string functions
@@ -1001,8 +1020,8 @@ until then.
   arithmetic and comparison as a value (unary `-` and `abs` of one are
   taken). A cast, an
   aggregate inside an expression, an expression in the select list of an
-  aggregated query or under `DISTINCT`, an expression in `ORDER BY`, `GROUP
-  BY`, `SET` or a `WHERE`.
+  aggregated query or under `DISTINCT`, an expression in the `ORDER BY` of
+  a grouped or aggregated query, in `GROUP BY`, `SET` or a `WHERE`.
 
 ## Binding
 
