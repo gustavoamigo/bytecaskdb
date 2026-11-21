@@ -2275,6 +2275,13 @@ public:
   // its largest $n, each of which must get a type.
   Binder(const Catalog& cat, std::uint32_t own_params) : cat_{cat}, own_params_{own_params} { params_.resize(own_params); }
 
+  // Each table this binder resolved by name in a FROM, in any position of
+  // the query (a subquery's in a select list, WHERE, GROUP BY, HAVING or
+  // ORDER BY, an arm of a set operation), in order and repeated as met; a
+  // table a view's body brought in (ast::FromItem::of_view) is the view's,
+  // not recorded. CREATE VIEW's dependencies come from it.
+  [[nodiscard]] auto resolved_relations() const -> const std::vector<std::uint32_t>& { return resolved_; }
+
   // $1 .. $n start typed (bind's fixed_params): each as a column of its type,
   // which its first use is then checked against.
   void fix_params(std::span<const SqlType> types) {
@@ -4416,7 +4423,9 @@ public:
       }
       auto seen = read;
       seen.insert(seen.end(), rels.begin(), rels.end());
-      rels.push_back(instance(*table(item.table, pos), item.name(), seen));
+      const auto* t = table(item.table, pos);
+      if (!item.of_view) resolved_.push_back(t->id);
+      rels.push_back(instance(*t, item.name(), seen));
       if (!item.column_aliases.empty()) rename_columns(*rels.back(), item, pos);
       // Two views of one table are merged into the query under one name.
       if (std::ranges::count_if(rels, [&](const Table* r) { return r->name == rels.back()->name; }) > 1) {
@@ -5550,6 +5559,7 @@ private:
     std::uint32_t source{0};
   };
   std::vector<DerivedRelation> derived_;
+  std::vector<std::uint32_t> resolved_;
   std::vector<ParamUse> params_;
   std::size_t fixed_params_{0};      // $1 .. $fixed_params_ were typed by fix_params
   std::deque<Column> typed_params_;  // what a $n typed by its place (function_value) is used as; never moves
@@ -5601,6 +5611,7 @@ void each_subquery(S& s, F&& f) {
   for (auto& e : s.group_by) subqueries_in(e, f);
   for (auto& c : s.where) subqueries_in_compare(c, f);
   for (auto& c : s.having) subqueries_in_compare(c, f);
+  for (auto& o : s.order_by) subqueries_in(o.expr, f);
 }
 
 // A view's column in a reference: the select-list item it names, to take its
@@ -5711,6 +5722,44 @@ auto over_group(const ast::Compare& c, const std::vector<ast::Expr>& group) -> b
 struct ViewBody {
   ast::Select select;
   std::vector<std::string> names;
+  // What the view's query reads itself, not what the views it reads read:
+  // the tables the binder resolved and, for the view being created (depth
+  // 0), the views the expander expanded. CREATE VIEW's dependencies.
+  std::vector<std::uint32_t> reads;
+};
+
+// A view's body, expanded, marked as the view's own: each FROM item of it,
+// its subqueries' and a derived relation's among them, is of_view. A
+// subquery shared by two places (an ORDER BY key written as a select item)
+// stays one, so the binder still finds them alike.
+class ViewMarker {
+public:
+  void select(ast::Select& s) {
+    if (s.set) {
+      ast::SetOperation set{s.set->kind, s.set->all, ast::clone(s.set->left), ast::clone(s.set->right)};
+      select(set.left);
+      select(set.right);
+      s.set = std::make_shared<const ast::SetOperation>(std::move(set));
+      return;
+    }
+    for (auto& item : s.from) {
+      item.of_view = true;
+      if (item.derived) item.derived = marked(item.derived);
+    }
+    each_subquery(s, [&](std::shared_ptr<const ast::Select>& q) { q = marked(q); });
+  }
+
+private:
+  auto marked(const std::shared_ptr<const ast::Select>& q) -> std::shared_ptr<const ast::Select> {
+    if (auto it = done_.find(q.get()); it != done_.end()) return it->second;
+    auto copy = ast::clone(*q);
+    select(copy);
+    auto out = std::make_shared<const ast::Select>(std::move(copy));
+    done_.emplace(q.get(), out);
+    return out;
+  }
+
+  std::map<const ast::Select*, std::shared_ptr<const ast::Select>> done_;
 };
 
 // Expands the views a statement reads before it is bound, so the binder,
@@ -5784,7 +5833,9 @@ public:
   // A view's body from its defining SELECT and column list: expanded, its
   // stars written out, its columns named and checked.
   auto describe(const ast::Select& query, const std::vector<std::string>& columns) -> ViewBody {
-    ViewBody b{expand(query), {}};
+    auto top = depth_ == 0;
+    if (top) views_read_.clear();
+    ViewBody b{expand(query), {}, {}};
     Binder scratch{cat_, 0};
     if (!b.select.set &&
         std::ranges::any_of(b.select.targets, [](const ast::Expr& e) { return e.kind == ast::Expr::Kind::Star; })) {
@@ -5799,26 +5850,14 @@ public:
       throw SqlError{"CREATE VIEW specifies more column names than columns", b.select.pos};
     }
     std::ranges::copy(columns, b.names.begin());
+    b.reads = scratch.resolved_relations();
+    if (top) b.reads.insert(b.reads.end(), views_read_.begin(), views_read_.end());
     for (std::size_t i = 0; i < b.names.size(); ++i) {
       if (std::ranges::find(b.names, b.names[i]) != b.names.begin() + static_cast<std::ptrdiff_t>(i)) {
         throw SqlError{"column \"" + b.names[i] + "\" specified more than once", b.select.pos, kDuplicateColumn};
       }
     }
     return b;
-  }
-
-  // The tables and views a SELECT names directly, subqueries included.
-  void relations(const ast::Select& s, std::vector<std::uint32_t>& out) const {
-    if (s.set) {
-      relations(s.set->left, out);
-      relations(s.set->right, out);
-      return;
-    }
-    for (const auto& item : s.from) {
-      if (const auto* t = cat_.table(item.table)) out.push_back(t->id);
-      if (const auto* v = cat_.view(item.table)) out.push_back(v->id);
-    }
-    each_subquery(s, [&](const std::shared_ptr<const ast::Select>& q) { relations(*q, out); });
   }
 
 private:
@@ -6070,6 +6109,7 @@ private:
                      -1, kFeatureNotSupported};
     }
     if (std::ranges::find(used_, v.id) == used_.end()) used_.push_back(v.id);
+    ViewMarker{}.select(described.select);
     return bodies_.emplace(v.id, std::move(described)).first->second;
   }
 
@@ -6094,6 +6134,11 @@ private:
       return s;
     }
     auto views = std::ranges::count_if(s.from, [&](const ast::FromItem& item) { return names_view(item); });
+    if (depth_ == 0) {
+      for (const auto& item : s.from) {
+        if (names_view(item) && !item.of_view) views_read_.push_back(cat_.view(item.table)->id);
+      }
+    }
     auto expand_slot = [&](std::shared_ptr<const ast::Select>& q) {
       auto inner = mentions(*q);
       if (views > 0 || inner) refuse_correlated(s.from, *q);
@@ -6395,8 +6440,11 @@ private:
         qualify(s.where.back(), side.view->select.from[0].table);
       }
     }
-    s.from[0].table = sides[0].view != nullptr ? sides[0].view->select.from[0].table : sides[0].name;
-    s.from[1].table = sides[1].view != nullptr ? sides[1].view->select.from[0].table : sides[1].name;
+    for (std::size_t i = 0; i < 2; ++i) {
+      if (sides[i].view == nullptr) continue;
+      s.from[i].table = sides[i].view->select.from[0].table;
+      s.from[i].of_view = true;
+    }
   }
 
   // A FROM item that names a grouped view, read as a derived relation of
@@ -6416,6 +6464,9 @@ private:
   const Catalog& cat_;
   std::map<std::uint32_t, ViewBody> bodies_;
   std::vector<std::uint32_t> used_;
+  // The views the query being described reads itself (depth 0), as expand
+  // resolves them: ViewBody::reads.
+  std::vector<std::uint32_t> views_read_;
   int depth_{0};
 };
 
@@ -6424,8 +6475,8 @@ private:
 auto bind_create_view(const ast::CreateView& cv, const Catalog& cat) -> Bound {
   if (select_param_count(cv.query) != 0) throw SqlError{"there is no parameter $1", cv.pos, kUndefinedParameter};
   ViewExpander views{cat};
-  CreateViewDdl ddl{cv.view, cv.definition, {}, views.describe(cv.query, cv.columns).names};
-  views.relations(cv.query, ddl.depends_on);
+  auto body = views.describe(cv.query, cv.columns);
+  CreateViewDdl ddl{cv.view, cv.definition, std::move(body.reads), std::move(body.names)};
   return Bound{Ddl{std::move(ddl)}, {}, {}, {}, {}, {}, {}, {}, {}};
 }
 

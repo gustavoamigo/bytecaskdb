@@ -3030,6 +3030,79 @@ TEST_CASE("embedded API: a view is read as a table, expanded at each use, and ke
   (void)run("DROP TABLE vu");
 }
 
+// A view's dependencies are what the binder resolved while it bound the
+// view's query, in every position a subquery may take (#870): a table read
+// only by a subquery in ORDER BY was missed, so DROP TABLE of it succeeded
+// and the view then failed. Each is RESTRICT, as PostgreSQL 17's 2BP01, and
+// names the view that reads the relation itself, not one reading it through
+// another view.
+TEST_CASE("embedded API: a view's dependencies are every relation its query reads, a subquery's in any position", "[sql][api][view]") {
+  sql_test::TempDir dir{"api_view_deps"};
+  auto refusal = [](Database& db, std::string_view sql) -> std::string {
+    try {
+      (void)db.execute(sql);
+    } catch (const DdlRefused& e) {
+      return std::string{e.sqlstate()} + " " + e.what();
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    } catch (const FeatureNotSupported&) {
+      return std::string{"0A000"};
+    }
+    return std::string{"ran"};
+  };
+  auto dependent = [](std::string_view kind, std::string_view name, std::string_view view) {
+    return "2BP01 cannot drop " + std::string{kind} + " " + std::string{name} + " because other objects depend on it: view " +
+           std::string{view} + " depends on " + std::string{kind} + " " + std::string{name};
+  };
+  {
+    auto db = Database::open(dir.path());
+    auto run = [&](std::string_view sql) { return db->execute(sql).rows; };
+    (void)run("CREATE TABLE t (a INTEGER, b INTEGER)");
+    (void)run("INSERT INTO t VALUES (1, 2)");
+    (void)run("INSERT INTO t VALUES (3, 4)");
+    for (auto name : {"u_target", "u_where", "u_in", "u_exists", "u_order", "u_arm", "u_q"}) {
+      (void)run(std::string{"CREATE TABLE "} + name + " (a INTEGER, b INTEGER)");
+      (void)run(std::string{"INSERT INTO "} + name + " VALUES (5, 6)");
+    }
+    (void)run("CREATE VIEW v_target AS SELECT a, (SELECT max(b) FROM u_target) AS m FROM t");
+    (void)run("CREATE VIEW v_where AS SELECT a FROM t WHERE a < (SELECT max(b) FROM u_where)");
+    (void)run("CREATE VIEW v_in AS SELECT a FROM t WHERE a IN (SELECT a FROM u_in)");
+    (void)run("CREATE VIEW v_exists AS SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u_exists)");
+    (void)run("CREATE VIEW v_order AS SELECT a FROM t ORDER BY (SELECT max(b) FROM u_order)");
+    (void)run("CREATE VIEW v_arm AS SELECT a FROM t UNION SELECT b FROM u_arm");
+    // A view read only by a subquery in ORDER BY, itself over a table.
+    (void)run("CREATE VIEW q AS SELECT a, b FROM u_q WHERE a > 0");
+    (void)run("CREATE VIEW v_order_view AS SELECT a FROM t ORDER BY (SELECT max(a) FROM q)");
+    CHECK(run("SELECT a FROM v_order_view") == Grid{{i(1)}, {i(3)}});
+    // GROUP BY and HAVING take no subquery yet, nor a view a WITH query
+    // (frontend_design.md): refused, so no view is created without what it reads.
+    CHECK(refusal(*db, "CREATE VIEW v_group AS SELECT a FROM t GROUP BY a, (SELECT max(b) FROM u_where)") == "42601");
+    CHECK(refusal(*db, "CREATE VIEW v_having AS SELECT a FROM t GROUP BY a HAVING count(*) > (SELECT max(b) FROM u_where)") == "42601");
+    CHECK(refusal(*db, "CREATE VIEW v_cte AS WITH c AS (SELECT a FROM u_where) SELECT a FROM c") == "42601");
+    db->close();
+  }
+  // Stored with the view: a reopen keeps them.
+  auto db = Database::open(dir.path());
+  auto run = [&](std::string_view sql) { return db->execute(sql).rows; };
+  CHECK(refusal(*db, "DROP TABLE t") == dependent("table", "t", "v_target"));
+  CHECK(refusal(*db, "DROP TABLE u_target") == dependent("table", "u_target", "v_target"));
+  CHECK(refusal(*db, "DROP TABLE u_where") == dependent("table", "u_where", "v_where"));
+  CHECK(refusal(*db, "DROP TABLE u_in") == dependent("table", "u_in", "v_in"));
+  CHECK(refusal(*db, "DROP TABLE u_exists") == dependent("table", "u_exists", "v_exists"));
+  CHECK(refusal(*db, "DROP TABLE u_order") == dependent("table", "u_order", "v_order"));
+  CHECK(refusal(*db, "DROP TABLE u_arm") == dependent("table", "u_arm", "v_arm"));
+  CHECK(refusal(*db, "DROP VIEW q") == dependent("view", "q", "v_order_view"));
+  // u_q is q's, not v_order_view's: the view that reads it itself is named.
+  CHECK(refusal(*db, "DROP TABLE u_q") == dependent("table", "u_q", "q"));
+  // Once a view is gone, what only it read drops.
+  for (auto name : {"v_target", "v_where", "v_in", "v_exists", "v_order", "v_arm", "v_order_view", "q"}) {
+    (void)run(std::string{"DROP VIEW "} + name);
+  }
+  for (auto name : {"u_target", "u_where", "u_in", "u_exists", "u_order", "u_arm", "u_q", "t"}) {
+    CHECK(refusal(*db, std::string{"DROP TABLE "} + name) == "ran");
+  }
+}
+
 TEST_CASE("embedded API: a choice point's plan text shows both plans, and each returns the same rows",
           "[sql][api][search][choice]") {
   sql_test::TempDir dir{"api_choice"};

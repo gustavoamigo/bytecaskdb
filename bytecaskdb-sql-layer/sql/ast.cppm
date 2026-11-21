@@ -385,6 +385,11 @@ struct FromItem {
   // `column_aliases` its column names. Null for a table or a view merged into
   // the query.
   std::shared_ptr<const Select> derived;
+  // Of a view's body, merged into the query that reads the view: a relation
+  // the view reads, not the query. The binder does not record it as one the
+  // query resolved (a view's dependencies, docs/catalog_design.md, *Views
+  // resolve against what they were created against*).
+  bool of_view{false};
 
   // What a column of the item is qualified by.
   [[nodiscard]] auto name() const -> const std::string&;

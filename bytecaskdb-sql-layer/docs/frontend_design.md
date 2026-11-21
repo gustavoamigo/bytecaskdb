@@ -576,6 +576,10 @@ in any order, on any columns, and of predicates over them.
   subquery but the slice above, one inside another, in `FROM`, `FOR UPDATE`
   in one, one of `AVG`, assigned by `SET` or `VALUES`, beside an aggregate,
   or compared with other than a column.
+- **Refused (42601): a `WITH` query** (a common table expression, `WITH
+  RECURSIVE` too), in any statement and in a view's body: the parser takes
+  no `WITH` clause yet ("SELECT clause not supported"), where PostgreSQL
+  runs it.
 - Comparing two columns of different SQL types in a join is refused
   (42601, *Known differences*), but for a pair PostgreSQL has no operator
   for, which is its 42883 as for two columns of one table (see above), in
@@ -797,8 +801,9 @@ EXISTS] name`:
   select-list item it is. Planner, plans and runtime see base tables
   only. A view of views is expanded through, to a depth of 16.
 - **Where it is read:** alone, as the table of a `FROM`; inner, `LEFT` and
-  `RIGHT` joined with a table or another view; in a subquery, and in the
-  subquery of an `UPDATE`'s or `DELETE`'s `WHERE`. A joined view merged
+  `RIGHT` joined with a table or another view; in a subquery (in the
+  select list, `WHERE` or `ORDER BY`), and in the subquery of an
+  `UPDATE`'s or `DELETE`'s `WHERE`. A joined view merged
   into the query must be a plain `SELECT` of one table. Its columns are
   qualified by that table, so one the other side lacks never changes
   meaning, and one both have is 42702. A grouped view joined with a table
@@ -882,7 +887,13 @@ EXISTS] name`:
 - **`UPDATE` and `DELETE` of a view are refused** (0A000, #678), as is any
   DDL written against it as a table.
 - **Dropped with `RESTRICT`**, the default and only form: a table or view
-  another view reads cannot be dropped (2BP01). `DROP VIEW` of a table is
+  another view reads cannot be dropped (2BP01), whether the view reads it
+  in `FROM` or in a subquery in any position, `ORDER BY` included (#870).
+  What a view reads is what binding its query resolved, a view's own reads
+  and not those of the views it reads (`catalog_design.md`, *Views resolve
+  against what they were created against*). The error names one view that
+  reads the object itself, in the message: PostgreSQL's names each
+  dependent in a DETAIL, with a HINT. `DROP VIEW` of a table is
   42809, as `DROP TABLE` of a view.
 - **A plan through a view is rebuilt after any DDL**, since the runtime
   checks the tables a plan reads and not the views it came through
