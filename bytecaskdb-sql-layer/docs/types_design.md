@@ -15,7 +15,9 @@ check, a collation. Those rules live here.
 ## Types
 
 The binder accepts these types and rejects every other. A rejected type is a
-bind error with the position of the type name.
+bind error with the position of the type name. A type name is unqualified or
+qualified by `pg_catalog.`; the parser refuses any other qualifier
+(`frontend_design.md`, *Type names*).
 
 | SQL type | Physical | Stored as |
 |---|---|---|

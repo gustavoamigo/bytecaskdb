@@ -175,8 +175,9 @@ struct ProcedureStatement {
 // a value outside its type as an INSERT's would.
 [[nodiscard]] auto call_arguments(const ast::Call& call, const Procedure& proc) -> std::vector<Datum>;
 
-// A declared variable's type as PL/pgSQL gives its text (int, numeric(12,2),
-// pg_catalog."integer"), read as a column of that type is.
+// A declared variable's type as PL/pgSQL gives its text (int, numeric(12,2)),
+// read as a cast's type is: a qualifier other than pg_catalog, or
+// pg_catalog with a grammar spelling (pg_catalog.integer), is refused.
 [[nodiscard]] auto declared_type(const std::string& text) -> SqlType;
 
 }  // namespace bytecask::sql::bound
@@ -6639,11 +6640,6 @@ auto declared_type(const std::string& text) -> SqlType {
   ast::ColumnDefAst c;
   c.type = q->targets[0].cast_type;
   c.typmods = q->targets[0].cast_typmods;
-  // A quoted name keeps the SQL spelling the grammar otherwise canonicalises.
-  if (c.type == "integer") c.type = "int4";
-  if (c.type == "smallint") c.type = "int2";
-  if (c.type == "bigint") c.type = "int8";
-  if (c.type == "boolean") c.type = "bool";
   return sql_type(c);
 }
 
@@ -6883,6 +6879,7 @@ auto bind(const ast::Statement& stmt, const Catalog& cat, std::span<const SqlTyp
                                   cat.index(s.table).first != nullptr)) {
             return {Ddl{CreateTableDdl{s.table, {}, {}, {}, {}, true}}, s.pos};
           }
+          if (s.refusal) throw *s.refusal;
           CreateTableDdl out{s.table, {}, s.pk, {}, {}, s.if_not_exists};
           for (const auto& c : s.columns) {
             out.columns.push_back(column_spec(c));

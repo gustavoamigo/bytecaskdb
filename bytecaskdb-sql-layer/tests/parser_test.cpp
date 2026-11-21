@@ -8,6 +8,7 @@
 #include <string_view>
 #include <variant>
 #include <optional>
+#include <utility>
 #include <vector>
 
 import bytecask.sql.parser;
@@ -966,4 +967,64 @@ TEST_CASE("parser: ON CONFLICT DO NOTHING keeps its target's columns; the other 
   CHECK(state("INSERT INTO t VALUES (1) ON CONFLICT (a DESC) DO NOTHING") == "42P10");
   CHECK(state("INSERT INTO t VALUES (1) ON CONFLICT (a ASC) DO NOTHING") == "42P10");
   CHECK(state("INSERT INTO t VALUES (1) ON CONFLICT (a NULLS FIRST) DO NOTHING") == "42P10");
+}
+
+// docs/catalog_design.md, *Stages of schemas*, before stage 1: a type's
+// qualifier was dropped, so foo.int4 read as int4. PostgreSQL 17's errors.
+TEST_CASE("parser: a qualified type name other than pg_catalog's is refused", "[sql][parser]") {
+  auto refusal = [](std::string_view sql) -> std::pair<std::string, std::string> {
+    try {
+      (void)parse(sql);
+    } catch (const SqlError& e) {
+      return {std::string{e.sqlstate()}, e.what()};
+    }
+    return {"parsed", ""};
+  };
+  auto missing_schema = refusal("CREATE TABLE t (a foo.int4)");
+  CHECK(missing_schema.first == "3F000");
+  CHECK(missing_schema.second == "schema \"foo\" does not exist");
+  auto in_public = refusal("CREATE TABLE t (a public.int4)");
+  CHECK(in_public.first == "42704");
+  CHECK(in_public.second == "type \"public.int4\" does not exist");
+  CHECK(refusal("SELECT 1::foo.int4").first == "3F000");
+  CHECK(refusal("SELECT CAST(1 AS foo.bar)").first == "3F000");
+  CHECK(refusal("SELECT 1::\"PG_CATALOG\".int4").second == "schema \"PG_CATALOG\" does not exist");
+  CHECK(refusal("SELECT 1::public.int4").first == "42704");
+  CHECK(refusal("SELECT 1::information_schema.int4").first == "42704");
+  CHECK(refusal("CREATE TABLE t (a foo.int4[])").first == "3F000");  // the schema before the array
+  CHECK(refusal("CREATE DOMAIN d AS foo.int4").first == "3F000");
+  CHECK(refusal("CREATE PROCEDURE p(a foo.int4) LANGUAGE plpgsql AS 'BEGIN END'").first == "3F000");
+  auto three = refusal("SELECT 1::a.b.int4");
+  CHECK(three.first == "0A000");
+  CHECK(three.second == "cross-database references are not implemented: a.b.int4");
+  auto four = refusal("SELECT 1::a.b.c.int4");
+  CHECK(four.first == "42601");
+  CHECK(four.second == "improper qualified name (too many dotted names): a.b.c.int4");
+  // pg_catalog holds no type under the grammar's SQL spellings.
+  auto alias = refusal("SELECT 1::pg_catalog.integer");
+  CHECK(alias.first == "42704");
+  CHECK(alias.second == "type \"pg_catalog.integer\" does not exist");
+  CHECK(refusal("CREATE TABLE t (a pg_catalog.\"boolean\")").first == "42704");
+  // A procedure argument's type is named unquoted, as PostgreSQL 17 does.
+  auto arg = refusal("CREATE PROCEDURE p(a public.int4) LANGUAGE plpgsql AS 'BEGIN END'");
+  CHECK(arg.first == "42704");
+  CHECK(arg.second == "type public.int4 does not exist");
+  CHECK(refusal("CREATE PROCEDURE p(a pg_catalog.integer) LANGUAGE plpgsql AS 'BEGIN END'").second ==
+        "type pg_catalog.integer does not exist");
+  CHECK(refusal("DROP PROCEDURE p(public.int4)").second == "type \"public.int4\" does not exist");
+  // CREATE TABLE IF NOT EXISTS keeps the refusal for the binder, which
+  // raises it only if the name is free.
+  CHECK(refusal("CREATE TABLE IF NOT EXISTS t (a foo.int4)") == std::pair<std::string, std::string>{"parsed", ""});
+  auto ine = std::get<CreateTable>(parse("CREATE TABLE IF NOT EXISTS t (a int, b public.int4)"));
+  REQUIRE(ine.refusal.has_value());
+  CHECK(ine.refusal->sqlstate() == "42704");
+  CHECK(ine.columns.empty());
+  // pg_catalog's types stay, as does the qualifier libpg_query gives INT.
+  auto t = std::get<CreateTable>(parse("CREATE TABLE t (a pg_catalog.int4, b int, c pg_catalog.varchar(3))"));
+  REQUIRE(t.columns.size() == 3);
+  CHECK(t.columns[0].type == "int4");
+  CHECK(t.columns[1].type == "int4");
+  CHECK(t.columns[2].type == "varchar");
+  auto s = std::get<Select>(parse("SELECT 1::pg_catalog.int8"));
+  CHECK(s.targets[0].cast_type == "int8");
 }

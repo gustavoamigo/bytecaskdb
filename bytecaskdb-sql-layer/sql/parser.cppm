@@ -108,13 +108,53 @@ auto table_column_aliases(const PgQuery__RangeVar* rv) -> std::vector<std::strin
   return out;
 }
 
-// A type as a column, a cast or an argument names it: libpg_query's last
-// name (int4, varchar, numeric, …) and integer modifiers. Arrays, SETOF and
-// %TYPE are refused.
-auto type_ast(const PgQuery__TypeName* tn, std::string name, std::int32_t pos) -> ColumnDefAst {
-  if (tn == nullptr || tn->n_names == 0 || tn->n_array_bounds != 0 || tn->setof || tn->pct_type) {
-    reject("type not supported", pos);
+// How PostgreSQL 17 words a type name it cannot find: quoted, except for a
+// CREATE PROCEDURE argument (its FunctionParameter path).
+enum class TypeNameUse { Quoted, ProcedureArgument };
+
+// The SQL spellings PostgreSQL's grammar turns into pg_catalog's types:
+// none of them is a type of pg_catalog itself (pg_catalog.integer is 42704).
+auto is_grammar_alias(std::string_view name) -> bool {
+  for (std::string_view a : {"integer", "int", "smallint", "bigint", "boolean", "real", "float", "double", "decimal",
+                             "dec", "character"}) {
+    if (name == a) return true;
   }
+  return false;
+}
+
+// A type name's schema, refused as PostgreSQL 17 refuses it while the layer
+// has no schemas (docs/catalog_design.md, *Stages of schemas*): only
+// pg_catalog holds types, and not under the grammar's SQL spellings. A
+// schema PostgreSQL always has holds none of them (42704); any other does
+// not exist (3F000). Three parts name a database (0A000), four or more are
+// malformed (42601).
+void check_type_schema(const PgQuery__TypeName* tn, TypeNameUse use) {
+  if (tn->n_names == 1) return;
+  std::string dotted;
+  for (std::size_t i = 0; i < tn->n_names; ++i) dotted += (i == 0 ? "" : ".") + str(tn->names[i]);
+  if (tn->n_names > 3) reject("improper qualified name (too many dotted names): " + dotted, tn->location);
+  if (tn->n_names == 3) reject("cross-database references are not implemented: " + dotted, tn->location, kFeatureNotSupported);
+  auto missing_type = [&] [[noreturn]] {
+    auto named = use == TypeNameUse::Quoted ? "\"" + dotted + "\"" : dotted;
+    reject("type " + named + " does not exist", tn->location, kUndefinedObject);
+  };
+  auto schema = str(tn->names[0]);
+  if (schema == "pg_catalog") {
+    if (is_grammar_alias(str(tn->names[1]))) missing_type();
+    return;
+  }
+  if (schema == "public" || schema == "information_schema" || schema == "pg_toast") missing_type();
+  reject("schema \"" + schema + "\" does not exist", tn->location, kInvalidSchemaName);
+}
+
+// A type as a column, a cast or an argument names it: libpg_query's last
+// name (int4, varchar, numeric, …), qualified by nothing or pg_catalog, and
+// integer modifiers. Arrays, SETOF and %TYPE are refused.
+auto type_ast(const PgQuery__TypeName* tn, std::string name, std::int32_t pos, TypeNameUse use = TypeNameUse::Quoted)
+    -> ColumnDefAst {
+  if (tn == nullptr || tn->n_names == 0 || tn->setof || tn->pct_type) reject("type not supported", pos);
+  check_type_schema(tn, use);
+  if (tn->n_array_bounds != 0) reject("type not supported", pos);
   ColumnDefAst out;
   out.name = std::move(name);
   out.type = str(tn->names[tn->n_names - 1]);
@@ -779,39 +819,55 @@ auto create_table(const PgQuery__CreateStmt* s, std::int32_t pos, std::string_vi
     if (primary_keys > 1) reject("multiple primary keys for table \"" + t.table + "\" are not allowed", location,
                                   kInvalidTableDefinition);
   };
-  for (std::size_t i = 0; i < s->n_table_elts; ++i) {
-    const auto* el = s->table_elts[i];
-    if (el->node_case == PG_QUERY__NODE__NODE_CONSTRAINT) {
-      const auto* c = el->constraint;
-      if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_UNIQUE) {
-        plain_unique(c);
-        UniqueAst u{c->conname, {}, c->location};
-        for (std::size_t k = 0; k < c->n_keys; ++k) u.columns.push_back(str(c->keys[k]));
-        t.unique.push_back(std::move(u));
+  auto elements = [&] {
+    for (std::size_t i = 0; i < s->n_table_elts; ++i) {
+      const auto* el = s->table_elts[i];
+      if (el->node_case == PG_QUERY__NODE__NODE_CONSTRAINT) {
+        const auto* c = el->constraint;
+        if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_UNIQUE) {
+          plain_unique(c);
+          UniqueAst u{c->conname, {}, c->location};
+          for (std::size_t k = 0; k < c->n_keys; ++k) u.columns.push_back(str(c->keys[k]));
+          t.unique.push_back(std::move(u));
+          continue;
+        }
+        if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_FOREIGN) {
+          t.foreign_keys.push_back(foreign_key(c));
+          continue;
+        }
+        if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_CHECK) {
+          t.checks.push_back(check_constraint(c, sql));
+          continue;
+        }
+        if (c->contype != PG_QUERY__CONSTR_TYPE__CONSTR_PRIMARY) reject("table constraint not supported", c->location);
+        ++primary_keys;
+        at_most_one(c->location);
+        for (std::size_t k = 0; k < c->n_keys; ++k) t.pk.push_back(str(c->keys[k]));
         continue;
       }
-      if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_FOREIGN) {
-        t.foreign_keys.push_back(foreign_key(c));
-        continue;
-      }
-      if (c->contype == PG_QUERY__CONSTR_TYPE__CONSTR_CHECK) {
-        t.checks.push_back(check_constraint(c, sql));
-        continue;
-      }
-      if (c->contype != PG_QUERY__CONSTR_TYPE__CONSTR_PRIMARY) reject("table constraint not supported", c->location);
-      ++primary_keys;
-      at_most_one(c->location);
-      for (std::size_t k = 0; k < c->n_keys; ++k) t.pk.push_back(str(c->keys[k]));
-      continue;
+      if (el->node_case != PG_QUERY__NODE__NODE_COLUMN_DEF) reject("table element not supported", -1);
+      t.columns.push_back(column_def(el->column_def, primary_keys, sql));
+      at_most_one(t.columns.back().pos);
+      for (const auto& name : t.columns.back().unique) t.unique.push_back({name, {t.columns.back().name}, t.columns.back().pos});
+      for (auto& f : t.columns.back().references) t.foreign_keys.push_back(std::move(f));
+      t.columns.back().references.clear();
+      for (auto& k : t.columns.back().checks) t.checks.push_back(std::move(k));
+      t.columns.back().checks.clear();
     }
-    if (el->node_case != PG_QUERY__NODE__NODE_COLUMN_DEF) reject("table element not supported", -1);
-    t.columns.push_back(column_def(el->column_def, primary_keys, sql));
-    at_most_one(t.columns.back().pos);
-    for (const auto& name : t.columns.back().unique) t.unique.push_back({name, {t.columns.back().name}, t.columns.back().pos});
-    for (auto& f : t.columns.back().references) t.foreign_keys.push_back(std::move(f));
-    t.columns.back().references.clear();
-    for (auto& k : t.columns.back().checks) t.checks.push_back(std::move(k));
-    t.columns.back().checks.clear();
+  };
+  if (!t.if_not_exists) {
+    elements();
+    return t;
+  }
+  // PostgreSQL looks for the name before it reads the definition: what the
+  // definition would be refused for is raised only if the name is free.
+  try {
+    elements();
+  } catch (const SqlError& e) {
+    CreateTable skipped{t.table, {}, {}, pos};
+    skipped.if_not_exists = true;
+    skipped.refusal = e;
+    return skipped;
   }
   return t;
 }
@@ -1030,7 +1086,7 @@ auto create_procedure(const PgQuery__CreateFunctionStmt* s, std::int32_t pos, co
       }
       reject("VARIADIC arguments are not supported", at, kFeatureNotSupported);
     }();
-    out.args.push_back({mode, type_ast(p->arg_type, p->name, at)});
+    out.args.push_back({mode, type_ast(p->arg_type, p->name, at, TypeNameUse::ProcedureArgument)});
   }
   if (s->sql_body != nullptr) reject("BEGIN ATOMIC bodies are not supported: use LANGUAGE plpgsql", pos, kFeatureNotSupported);
   auto has_body = false;

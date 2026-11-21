@@ -267,6 +267,9 @@ private:
         if (vars_[i].name == name) target = i;
       }
       if (!target) refuse("a FOR variable it cannot find", at);
+      // The loop's own variable, which PostgreSQL builds as int4: libpg_query
+      // writes its type pg_catalog."integer", a name that is no type.
+      vars_[*target].type = "int4";
       return ForRange{*target, expr_text(st.get("lower")), expr_text(st.get("upper")), st.flag("reverse"),
                       body(st.list("body"))};
     }

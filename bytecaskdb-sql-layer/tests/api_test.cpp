@@ -17,6 +17,7 @@
 #include <utility>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <variant>
 #include <thread>
@@ -4146,6 +4147,41 @@ TEST_CASE("embedded API: a procedure's errors are PostgreSQL's, found at CREATE 
   CHECK(db->call("one", {i(1), Value{}}).rows == Grid{{i(10)}});
   (void)db->execute("DROP TABLE t");
   CHECK(call("one", {i(1), Value{}}) == "42P01");
+}
+
+// docs/catalog_design.md, *Stages of schemas*, before stage 1: a variable's
+// type is read at the call (PostgreSQL reads it at CREATE PROCEDURE), with
+// PostgreSQL 17's SQLSTATE and message.
+TEST_CASE("embedded API: a procedure variable's qualified type is refused at the call as PostgreSQL refuses it",
+          "[sql][api][procedure]") {
+  sql_test::TempDir dir{"api_procedure_qualified_type"};
+  auto db = Database::open(dir.path());
+  auto declare = [&](std::string_view name, std::string_view decl, std::string_view body) {
+    (void)db->execute("CREATE PROCEDURE " + std::string{name} + "(INOUT r BIGINT) LANGUAGE plpgsql AS $$ DECLARE " +
+                      std::string{decl} + "; BEGIN " + std::string{body} + " END $$");
+  };
+  auto refusal = [&](std::string_view name) -> std::pair<std::string, std::string> {
+    try {
+      (void)db->call(name, {Value{}});
+    } catch (const std::exception& e) {
+      return {std::string{sqlstate(e)}, e.what()};
+    }
+    return {"ran", ""};
+  };
+  declare("in_foo", "x foo.int4", "x := 1;");
+  CHECK(refusal("in_foo") == std::pair<std::string, std::string>{"3F000", "schema \"foo\" does not exist"});
+  declare("in_public", "x public.int4", "x := 1;");
+  CHECK(refusal("in_public") == std::pair<std::string, std::string>{"42704", "type \"public.int4\" does not exist"});
+  // pg_catalog holds no type under the grammar's SQL spellings, quoted or not.
+  declare("alias", "x pg_catalog.integer", "x := 1;");
+  CHECK(refusal("alias") == std::pair<std::string, std::string>{"42704", "type \"pg_catalog.integer\" does not exist"});
+  declare("quoted", "x pg_catalog.\"boolean\"", "x := true;");
+  CHECK(refusal("quoted").first == "42704");
+  declare("bare", "x \"integer\"", "x := 1;");
+  CHECK(refusal("bare").first != "ran");
+  // pg_catalog's own names stay, as does a FOR loop's own integer variable.
+  declare("sum", "x pg_catalog.int8 := 0", "FOR i IN 1..3 LOOP x := x + i; END LOOP; r := x;");
+  CHECK(db->call("sum", {Value{}}).rows == Grid{{i(6)}});
 }
 
 TEST_CASE("embedded API: a CALL that conflicts is run again from its arguments, as an autocommit statement is",

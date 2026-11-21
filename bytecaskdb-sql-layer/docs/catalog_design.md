@@ -674,8 +674,8 @@ not built. Four choices made here keep it open:
 
 Status: **design, approved by the owner on 2026-11-20** (#713, option 1),
 with every recommendation under *Open questions for the owner*: Q1 (a),
-Q2 (a), Q3 (a), Q4 (a), Q5 (a), Q6 (a), Q7 (a), Q8 (a), Q9 (b). Nothing here
-is built yet. This section covers what
+Q2 (a), Q3 (a), Q4 (a), Q5 (a), Q6 (a), Q7 (a), Q8 (a), Q9 (b). Built:
+the first fix before stage 1 (qualified type names); no stage is built yet. This section covers what
 `CREATE SCHEMA` and `DROP SCHEMA` do, how a schema-qualified name resolves,
 the schema record and the change to the name entries' keys, what an older
 build does with a database that holds a schema, `WITH CHECK OPTION` (which
@@ -859,11 +859,11 @@ PG 17. A function name keeps today's rule: `pg_catalog.` only. A name of
 four parts or more is 42601 "improper qualified name (too many dotted
 names): a.b.c.d" (PG 17).
 
-**A type name is resolved whole.** Today the parser keeps a type name's
-last part (`parser.cppm:120`), so `CREATE TABLE t (a foo.int4)` is
-accepted as `int4` where PG 17 gives 3F000. That is a bug today, fixed on
-its own before stage 1 (*Stages*): a qualifier other than `pg_catalog.` is
-refused. Stage 1b then widens it: `s.d` names the domain or shell type `d`
+**A type name is resolved whole.** The parser kept a type name's last
+part, so `CREATE TABLE t (a foo.int4)` was accepted as `int4` where PG 17
+gives 3F000. That bug is fixed on its own before stage 1 (*Stages*, built):
+a qualifier other than `pg_catalog.` is refused (`check_type_schema` in
+`sql/parser.cppm`; `frontend_design.md`, *Type names*). Stage 1b then widens it: `s.d` names the domain or shell type `d`
 of `s` (which is not a column's type yet, *Domains, shell types and
 sequences*). `pg_catalog.int4` and the other built-in types stay accepted;
 `public.int4` is 42704 `type "public.int4" does not exist` (PG 17).
@@ -1307,10 +1307,17 @@ tests and a reopen test, as views, roles and types did
 crash).
 
 **Before stage 1: two fixes of today's bugs, each its own PR.**
-- **Qualified type names.** `parser.cppm:120` keeps a type name's last
-  part; refuse any qualifier but `pg_catalog.` (3F000 `schema "foo" does
-  not exist`, `public.int4` 42704), as PG 17. Test as in the CONTRACT
-  table.
+- **Qualified type names. Built.** `parser.cppm` kept a type name's last
+  part; it now refuses any qualifier but `pg_catalog.` (3F000 `schema
+  "foo" does not exist`, `public.int4` 42704, and so `information_schema.`
+  and `pg_toast.`, which PG 17 always has), as PG 17; three parts are
+  0A000 and four 42601, as Q5 and *Name resolution with schemas* give
+  them. `pg_catalog.integer` and the grammar's other SQL spellings are
+  42704, as in PG 17 (a procedure variable declared so ran as `int4`). A
+  `CREATE TABLE IF NOT EXISTS` of a name in use skips before the
+  qualifier is checked, as PG 17 does. Test as in the CONTRACT table, the
+  embedded API test of a procedure variable, and
+  `tests/functional/cases/postgresql/qualified_type_names.yaml`.
 - **A view's dependencies from the binder's own resolution** (*Views
   resolve against what they were created against*, rule 1), which closes
   the `ORDER BY` subquery gap. A GitHub issue records the bug. Tests: a
