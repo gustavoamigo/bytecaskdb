@@ -130,7 +130,17 @@ struct Bound {
     -> QualifiedName;
 
 // Throws ast::SqlError with a message and the position of the offending node.
+// A CREATE SCHEMA binds to its own DDL, without its elements, which
+// bind_schema_element binds one at a time.
 [[nodiscard]] auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound;
+// An element of CREATE SCHEMA, bound against `cat`, the catalog the schema
+// (id `schema`) and the elements run before it made (docs/catalog_design.md,
+// *Schema semantics*). Each unqualified name it reads resolves with the
+// path (the new schema, then public): the first holding a relation of the
+// name, of any kind, or, for GRANT ON DOMAIN or TYPE, a type. Throws the
+// element's deferred refusal (42P16) first.
+[[nodiscard]] auto bind_schema_element(const ast::SchemaElement& element, std::uint32_t schema, const Catalog& cat)
+    -> Bound;
 // The same with $1 .. $n of the types `fixed_params` gives, as PostgreSQL
 // binds a statement with declared parameter types: a prepared statement's,
 // bound again after a DDL (docs/transaction_design.md, *A transaction binds
@@ -208,6 +218,7 @@ auto schema_id(std::string_view written, const Catalog& cat) -> std::optional<st
 }
 
 auto lookup_name(const ast::ObjectName& name, const Catalog& cat) -> QualifiedName {
+  if (name.schema.empty() && name.path_schema) return QualifiedName{*name.path_schema, name.name};
   return QualifiedName{schema_id(name.schema, cat).value_or(kMissingSchema), name.name};
 }
 
@@ -5859,6 +5870,25 @@ void stored_names(ast::Select& s, const View& v, const Catalog& cat) {
   });
 }
 
+// Each unqualified relation name of a schema element's query, in every
+// position, given the schema the path finds it in when that is the new one:
+// the binder records the name with that schema, as a view's stored names.
+void path_names(ast::Select& s, const std::function<void(ast::ObjectName&)>& on_path) {
+  if (s.set) {
+    ast::SetOperation set{s.set->kind, s.set->all, ast::clone(s.set->left), ast::clone(s.set->right)};
+    path_names(set.left, on_path);
+    path_names(set.right, on_path);
+    s.set = std::make_shared<const ast::SetOperation>(std::move(set));
+    return;
+  }
+  for (auto& item : s.from) on_path(item.table);
+  each_subquery(s, [&](std::shared_ptr<const ast::Select>& q) {
+    auto copy = ast::clone(*q);
+    path_names(copy, on_path);
+    q = std::make_shared<const ast::Select>(std::move(copy));
+  });
+}
+
 auto view_definition(const View& v, const Catalog& cat) -> ast::CreateView {
   auto parsed = ast::parse(v.definition);
   auto* def = std::get_if<ast::CreateView>(&parsed);
@@ -7352,6 +7382,52 @@ auto null_constant_at(ast::Compare& c, std::int32_t pos) -> bool {
 }
 
 }  // namespace
+
+auto bind_schema_element(const ast::SchemaElement& element, std::uint32_t schema, const Catalog& cat) -> Bound {
+  if (element.refusal) throw *element.refusal;
+  auto relation_in = [&](std::uint32_t at, const std::string& name) {
+    const QualifiedName q{at, name};
+    return cat.table(q) != nullptr || cat.view(q) != nullptr || cat.index(q).first != nullptr ||
+           cat.sequence(q) != nullptr;
+  };
+  // Public's is the default: only a name the new schema holds is marked.
+  auto relation_on_path = [&](ast::ObjectName& n) {
+    if (n.schema.empty() && relation_in(schema, n.name)) n.path_schema = schema;
+  };
+  auto statement = std::visit(
+      [&](const auto& e) -> ast::Statement {
+        using T = std::decay_t<decltype(e)>;
+        if constexpr (std::is_same_v<T, ast::CreateView>) {
+          ast::CreateView out{e.view, e.columns, ast::clone(e.query), e.pos, e.definition};
+          path_names(out.query, relation_on_path);
+          return out;
+        } else if constexpr (std::is_same_v<T, ast::CreateTable>) {
+          auto out = e;
+          // A table referencing itself finds itself in the new schema, where
+          // the path finds it once it exists, as PostgreSQL adds the key.
+          for (auto& f : out.foreign_keys) {
+            if (f.table.schema.empty() && f.table.name == e.table.name) {
+              f.table.path_schema = schema;
+            } else {
+              relation_on_path(f.table);
+            }
+          }
+          return out;
+        } else if constexpr (std::is_same_v<T, ast::Grant>) {
+          auto out = e;
+          const auto types = e.target == ast::Grant::Target::Domain || e.target == ast::Grant::Target::Type;
+          for (auto& o : out.objects) {
+            if (!o.schema.empty()) continue;
+            if (types ? cat.type(QualifiedName{schema, o.name}) != nullptr : relation_in(schema, o.name)) o.path_schema = schema;
+          }
+          return out;
+        } else {
+          return e;  // its names are the new schema's, as the parser wrote them
+        }
+      },
+      element.statement);
+  return bound::bind(statement, cat);
+}
 
 auto null_failing_constant(ast::Select& s, std::int32_t pos) -> bool {
   if (pos < 0 || s.set) return false;

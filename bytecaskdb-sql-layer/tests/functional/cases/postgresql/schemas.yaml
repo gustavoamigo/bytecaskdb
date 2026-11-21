@@ -325,3 +325,87 @@
       error: "42P01"
     - sql: DROP SCHEMA sch_x
       error: "3F000"
+
+# Stage 2: CREATE SCHEMA with elements.
+- name: CREATE SCHEMA with elements creates them in the schema, in PostgreSQL's order
+  features: [F311-02, F311-03, F311-05, pg:schemas]
+  setup:
+    - CREATE TABLE sch_el_t (a INTEGER)
+    - CREATE ROLE sch_el_r
+    - INSERT INTO sch_el_t VALUES (1), (2)
+  steps:
+    - sql: CREATE SCHEMA sch_el CREATE VIEW v AS SELECT a FROM sch_el_t CREATE INDEX i ON u (b) CREATE TABLE u (b INTEGER) GRANT SELECT ON u, sch_el_t TO sch_el_r
+    - sql: SELECT a FROM sch_el.v ORDER BY a
+      expected: [[1], [2]]
+      ordered: true
+    - sql: INSERT INTO sch_el.u VALUES (5)
+      rowcount: 1
+    - sql: CREATE TABLE sch_el.sch_el_t (a INTEGER)
+    - sql: SELECT count(*) FROM sch_el.v
+      expected: [[2]]
+    - sql: INSERT INTO sch_el.v VALUES (3)
+      rowcount: 1
+    - sql: SELECT count(*) FROM sch_el_t
+      expected: [[3]]
+  teardown:
+    - DROP VIEW sch_el.v
+    - DROP TABLE sch_el.sch_el_t
+    - DROP TABLE sch_el.u
+    - DROP SCHEMA sch_el
+    - DROP TABLE sch_el_t
+    - DROP ROLE sch_el_r
+
+- name: CREATE SCHEMA with elements fails as a whole, with PostgreSQL's SQLSTATEs
+  features: [F311-02, pg:schemas]
+  setup:
+    - CREATE TABLE sch_ef_t (a INTEGER)
+  steps:
+    - sql: CREATE SCHEMA sch_ef CREATE TABLE x (a INTEGER) CREATE TABLE sch_other.y (a INTEGER)
+      error: "42P15"
+    - sql: CREATE SCHEMA sch_ef CREATE TEMP TABLE x (a INTEGER)
+      error: "42P16"
+    - sql: CREATE SCHEMA sch_ef CREATE VIEW v1 AS SELECT * FROM v2 CREATE VIEW v2 AS SELECT 1 AS x
+      error: "42P01"
+    - sql: CREATE SCHEMA sch_ef CREATE VIEW v AS SELECT a FROM sch_ef_t CREATE TABLE sch_ef_t (b INTEGER)
+      error: "42703"
+    - sql: CREATE SCHEMA sch_ef CREATE TABLE x (a INTEGER) GRANT SELECT ON x TO sch_ef_nobody
+      error: "42704"
+    - sql: CREATE SCHEMA sch_ef CREATE FUNCTION f() RETURNS int AS 'select 1' LANGUAGE sql
+      error: "42601"
+    - sql: SELECT count(*) FROM sch_ef.x
+      error: "42P01"
+    - sql: DROP SCHEMA sch_ef
+      error: "3F000"
+  teardown:
+    - DROP TABLE sch_ef_t
+
+- name: a GRANT element WITH GRANT OPTION followed by a view element
+  features: [F311-02, F311-05, pg:schemas]
+  setup:
+    - CREATE ROLE sch_eg_r
+  steps:
+    - sql: CREATE SCHEMA sch_eg CREATE TABLE t (a INTEGER) GRANT SELECT ON t TO sch_eg_r WITH GRANT OPTION CREATE VIEW w AS SELECT 2 AS y
+    - sql: SELECT y FROM sch_eg.w
+      expected: [[2]]
+  teardown:
+    - DROP VIEW sch_eg.w
+    - DROP TABLE sch_eg.t
+    - DROP SCHEMA sch_eg
+    - DROP ROLE sch_eg_r
+
+- name: a view element's column qualified by the new schema, its table named unqualified
+  features: [F311-05, pg:schemas]
+  # which schema's table an unqualified FROM item of an element is is known
+  # only when the element binds, after its columns' qualifiers are read:
+  # refused (0A000)
+  unimplemented: true
+  steps:
+    - sql: CREATE SCHEMA sch_eq CREATE TABLE t (a INTEGER) CREATE VIEW v AS SELECT sch_eq.t.a FROM t
+    - sql: INSERT INTO sch_eq.t VALUES (4)
+      rowcount: 1
+    - sql: SELECT a FROM sch_eq.v
+      expected: [[4]]
+  teardown:
+    - DROP VIEW sch_eq.v
+    - DROP TABLE sch_eq.t
+    - DROP SCHEMA sch_eq

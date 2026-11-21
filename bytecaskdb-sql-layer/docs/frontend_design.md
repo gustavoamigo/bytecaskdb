@@ -1035,8 +1035,21 @@ column `s.t.c`. A missing schema is 42P01 where a statement reads
 (`relation "s.t" does not exist`), 3F000 where it creates or drops, and the
 `IF EXISTS` NOTICE `schema "s" does not exist, skipping`. A relation in
 `pg_catalog` is 42501.
-- Refused (0A000): `CREATE SCHEMA` with elements (stage 2), `IF NOT EXISTS`
-  with elements (as PostgreSQL), `DROP SCHEMA … CASCADE` (stage 5), `DROP
+- `CREATE SCHEMA` with elements (stage 2): `CREATE TABLE`, `VIEW`,
+  `INDEX`, `SEQUENCE` and `GRANT`, run in PostgreSQL 17's order
+  (sequences, tables, views, indexes, grants) as one statement, all or
+  nothing. What an element creates, and an index's table, is the new
+  schema's; one qualified by another schema is 42P15, a temporary one
+  42P16. A name an element reads resolves in the new schema, then
+  `public`. A view element stores its own text, cut from the statement.
+- Refused (0A000): `IF NOT EXISTS` with elements (as PostgreSQL), `CREATE
+  TRIGGER` as an element, a view element whose text cannot be cut out of
+  the statement (a `CREATE` or `GRANT` written inside it outside
+  parentheses, as in `SELECT a AS create`, which PostgreSQL takes), a
+  column `s.t.c` in a view element (`s` the new schema or `public`) whose
+  query names `t` unqualified and unaliased, which PostgreSQL reads in the
+  schema the path finds `t` in (qualifying the `FROM` item works), `DROP
+  SCHEMA … CASCADE` (stage 5), `DROP
   SCHEMA public` and `information_schema`, a domain, type or procedure in
   `pg_catalog` and anything in `information_schema` or `pg_temp`,
   `CREATE SCHEMA AUTHORIZATION CURRENT_USER` without a name, a name of
@@ -1838,8 +1851,9 @@ implemented (`functional_testing_design.md`).
   `postgres` (owner decision Q5 (a), `catalog_design.md`, *Name
   resolution with schemas*).
 - **Schemas are partial** (`catalog_design.md`, *Stages of schemas*):
-  `CREATE SCHEMA` with elements (stage 2), `DROP SCHEMA … CASCADE` (stage
-  5), privileges on a schema (#873), `SET search_path` (#871), and one
+  `DROP SCHEMA … CASCADE` (stage 5), a view element whose text holds a
+  `CREATE` or `GRANT` outside parentheses, `CREATE TRIGGER` as an
+  element, privileges on a schema (#873), `SET search_path` (#871), and one
   table name from two schemas in one `FROM` with neither aliased, which
   PostgreSQL reads (an alias on either works here).
 - **A procedure variable's type is read at the call.** A qualifier

@@ -681,7 +681,8 @@ both fixes before stage 1 (qualified type names; a view's dependencies
 from the binder's resolution), stage 1a (lookups keyed by (schema, name))
 and stage 1b (the schema record, `CREATE SCHEMA` and `DROP SCHEMA` without
 elements or `CASCADE`, qualified names; *Stages of schemas* says what was
-adapted); stages 2 to 5 are not built. This section covers what
+adapted) and stage 2 (`CREATE SCHEMA` with elements); stages 3 to 5 are
+not built. This section covers what
 `CREATE SCHEMA` and `DROP SCHEMA` do, how a schema-qualified name resolves,
 the schema record and the change to the name entries' keys, what an older
 build does with a database that holds a schema, `WITH CHECK OPTION` (which
@@ -1538,6 +1539,60 @@ f311_05_01_01 and 02.
   SCHEMA`; two `CREATE SCHEMA` with elements race and the loser is 40001
   with nothing written. An allocation-fault sweep over `CREATE SCHEMA`
   with elements in autocommit, the new internal-transaction path.
+
+As built, with what the code made different:
+- **The parser reads the elements and places them.** `ast::CreateSchema`
+  holds its `elements` in written order, each an `ast::SchemaElement`:
+  the element's statement (a `CreateSequence`, `CreateTable`,
+  `CreateView`, `CreateIndex` or `Grant`, read by the parser's own
+  converter for that statement), and two deferred errors. A name an
+  element creates, and an index's table, is written qualified by the new
+  schema's name as the statement gives it; one qualified by another
+  schema keeps its name and records the 42P15 (`misplaced`), and a
+  temporary table, view or sequence the 42P16 (`refusal`). `run_order`
+  gives PG 17's order. `CREATE TRIGGER` is refused (0A000) as the
+  statement is parsed, so before the schema's own errors (42P06, 42704),
+  where PostgreSQL reports those first.
+- **The path is a mark on the name, not a search in the binder.**
+  `bound::bind_schema_element` copies the element and gives each
+  unqualified name it reads that the new schema holds (a relation of any
+  kind, or a type for `GRANT … ON DOMAIN | TYPE`) `ObjectName::path_schema`,
+  which `lookup_name` honours; every other unqualified name stays
+  public's. A view element's `FROM` items are marked in every position,
+  subqueries and set operation arms included (`path_names`, as
+  `stored_names` walks them), so the binder's `resolved_names`, which
+  makes the view's stored names, records the schema each was found in.
+  A table's `REFERENCES` its own unqualified name is the new schema's
+  table, as PostgreSQL finds it once the table exists.
+- **The API.** `Transaction::create_schema_elements` steps the schema,
+  raises the first `misplaced` in written order, then binds and steps each
+  element against the transaction's catalog of the moment, with
+  `check_in_use`. Autocommit (`Database::execute`, by text or prepared)
+  runs it through `Database::schema_with_elements`: a transaction begun
+  with the session's user and the default options, the statement as its
+  one step, then its commit, outside the call's lock (the transaction's
+  calls take it). Its commit's 40001 is the caller's, as designed.
+- **The cut.** `element_ranges` scans the statement's tokens: each element
+  starts at a `CREATE` or `GRANT` at parenthesis depth 0 after the
+  statement's own, and ends at the last token before the next start,
+  comments and `;` left out. A `GRANT` after `WITH` (`WITH GRANT OPTION`)
+  and a `CREATE` or `GRANT` after `GRANT` or a comma (a privilege, as in
+  `GRANT CREATE ON …`) start no element. `view_element_text` parses the slice and
+  compares its tree with the element's, every `location` zeroed
+  (`zero_locations` walks protobuf-c's descriptors) and both packed.
+- **Not built:** a schema-qualified column (`s.t.c` or `s.t.*`, `s` the
+  new schema or `public`) in a view element whose query names `t`
+  unqualified and unaliased. The parser resolves such a qualifier against
+  the `FROM` items as written, an unqualified one taken as public's, but
+  which schema an element's unqualified `t` is (the new one or `public`)
+  is known only when the element binds: the parser would read the column
+  against the wrong item or refuse it with a wrong 42P01. It is refused
+  with 0A000 (`refuse_path_qualified_columns`, before the view is read),
+  where PostgreSQL reads it. Qualifying the `FROM` item works.
+- **Tests:** as listed above, in `tests/api_txn_ddl_test.cpp` (the
+  `schemas:` cases of stage 2) and `tests/functional/cases/postgresql/schemas.yaml`.
+  The allocation-fault sweep is written; it runs where allocation faults
+  are built in.
 
 **Stage 3: `WITH [LOCAL | CASCADED] CHECK OPTION`.** f311_04_01_01..03.
 - The view record's `check_option` (values 1 and 2 accepted at load from

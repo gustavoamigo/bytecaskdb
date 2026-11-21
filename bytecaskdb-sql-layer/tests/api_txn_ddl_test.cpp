@@ -10,6 +10,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -1309,6 +1310,258 @@ TEST_CASE("schemas: an allocation failure in a transaction of CREATE SCHEMA and 
       CHECK(db->execute("SELECT k FROM s.t").rows == Grid{{i(1)}});
       (void)db->execute("DROP TABLE s.t");
       (void)db->execute("DROP SCHEMA s");
+    }
+    if (!fired) break;
+    ++failed;
+  }
+  CHECK(failed > 0);
+}
+
+namespace {
+
+// Whether the database holds schema `s`, or any object of it.
+auto holds_schema(Database& db, std::string_view s) -> bool { return db.catalog()->schema(s) != nullptr; }
+
+}  // namespace
+
+TEST_CASE("schemas: CREATE SCHEMA with elements runs them in PostgreSQL's order, with the path (s, public)",
+          "[sql][api][schemas]") {
+  sql_test::TempDir dir{"schemas_elements"};
+  auto db = open(dir);
+  (void)db->execute("CREATE ROLE r");
+  // An index written before its table, and the table its own schema's even
+  // with a public table of the name.
+  (void)db->execute("CREATE TABLE b (a BIGINT)");
+  (void)db->execute("CREATE SCHEMA e1 CREATE INDEX i ON b (a) CREATE TABLE b (a BIGINT PRIMARY KEY)");
+  auto cat = db->catalog();
+  const auto e1 = cat->schema("e1")->id;
+  CHECK(cat->index({e1, "i"}).first == cat->table({e1, "b"}));
+  CHECK(cat->index({kPublicSchema, "i"}).first == nullptr);
+  // A view written before its table reads it: tables run first.
+  (void)db->execute(
+      "CREATE SCHEMA e2 CREATE VIEW v AS SELECT x FROM u CREATE SEQUENCE q CREATE TABLE u (x BIGINT PRIMARY KEY) "
+      "GRANT SELECT ON u, v TO r GRANT SELECT ON t TO r");
+  cat = db->catalog();
+  const auto e2 = cat->schema("e2")->id;
+  REQUIRE(cat->view({e2, "v"}) != nullptr);
+  CHECK(cat->view({e2, "v"})->names == std::vector<ViewName>{{ViewName::Kind::Relation, "u", e2}});
+  CHECK(cat->sequence({e2, "q"}) != nullptr);
+  const auto r = cat->role("r")->id;
+  auto granted_to_r = [&](std::uint32_t object) {
+    const auto acl = cat->acl(object);
+    return std::ranges::any_of(acl, [&](const AclEntry& e) { return e.grantee == r; });
+  };
+  CHECK(granted_to_r(cat->table({e2, "u"})->id));
+  CHECK(granted_to_r(cat->view({e2, "v"})->id));
+  CHECK(granted_to_r(cat->table({kPublicSchema, "t"})->id));  // t is public's: e2 holds no t
+  CHECK_FALSE(granted_to_r(cat->table({kPublicSchema, "b"})->id));
+  // A view over a later-written view is 42P01: views run in written order.
+  CHECK(state([&] {
+          (void)db->execute("CREATE SCHEMA e3 CREATE VIEW v1 AS SELECT * FROM v2 CREATE VIEW v2 AS SELECT 1 AS x");
+        }) == "42P01");
+  CHECK_FALSE(holds_schema(*db, "e3"));
+  // A table that references itself, unqualified, references its own schema's.
+  (void)db->execute("CREATE SCHEMA e4 CREATE TABLE t (k BIGINT PRIMARY KEY, up BIGINT REFERENCES t)");
+  CHECK(db->catalog()->table({db->catalog()->schema("e4")->id, "t"}) != nullptr);
+}
+
+TEST_CASE("schemas: an element placed elsewhere is 42P15, a temporary one 42P16, and CREATE TRIGGER 0A000",
+          "[sql][api][schemas]") {
+  sql_test::TempDir dir{"schemas_element_errors"};
+  auto db = open(dir);
+  CHECK(message([&] { (void)db->execute("CREATE SCHEMA s CREATE TABLE x (a BIGINT) CREATE TABLE o.y (a BIGINT)"); }) ==
+        "CREATE specifies a schema (o) different from the one being created (s)");
+  CHECK(state([&] { (void)db->execute("CREATE SCHEMA s CREATE INDEX i ON o.t (a)"); }) == "42P15");
+  CHECK(state([&] { (void)db->execute("CREATE SCHEMA s CREATE TEMP TABLE x (a BIGINT)"); }) == "42P16");
+  CHECK(state([&] { (void)db->execute("CREATE SCHEMA s CREATE TEMP SEQUENCE q"); }) == "42P16");
+  CHECK(state([&] { (void)db->execute("CREATE SCHEMA s CREATE TEMP VIEW v AS SELECT 1"); }) == "42P16");
+  // The schema's own errors come first, as in PostgreSQL 17.
+  CHECK(state([&] { (void)db->execute("CREATE SCHEMA public CREATE TABLE o.x (a BIGINT)"); }) == "42P06");
+  CHECK(state([&] { (void)db->execute("CREATE SCHEMA public CREATE TEMP TABLE x (a BIGINT)"); }) == "42P06");
+  CHECK(state([&] {
+          (void)db->execute("CREATE SCHEMA s CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()");
+        }) == "0A000");
+  CHECK(state([&] { (void)db->execute("CREATE SCHEMA s CREATE FUNCTION f() RETURNS int AS 'select 1' LANGUAGE sql"); }) ==
+        "42601");
+  CHECK(state([&] { (void)db->execute("CREATE SCHEMA s REVOKE SELECT ON t FROM PUBLIC"); }) == "42601");
+  CHECK(state([&] { (void)db->execute("CREATE SCHEMA IF NOT EXISTS s CREATE TABLE x (a BIGINT)"); }) == "0A000");
+  CHECK(state([&] { (void)db->execute("CREATE SCHEMA s CREATE TABLE x (a BIGINT)", {i(1)}); }) == "08P01");
+  CHECK_FALSE(holds_schema(*db, "s"));
+}
+
+TEST_CASE("schemas: a failing element leaves no schema and no element, in autocommit and in a transaction",
+          "[sql][api][txn][schemas]") {
+  sql_test::TempDir dir{"schemas_element_atomic"};
+  auto db = open(dir);
+  const std::vector<std::string> failing{
+      "CREATE SCHEMA s CREATE TABLE x (a BIGINT) CREATE SEQUENCE q CREATE SEQUENCE q",
+      "CREATE SCHEMA s CREATE TABLE x (a BIGINT) CREATE TABLE x (b BIGINT)",
+      "CREATE SCHEMA s CREATE TABLE x (a BIGINT) CREATE VIEW v AS SELECT * FROM nosuch",
+      "CREATE SCHEMA s CREATE TABLE x (a BIGINT) CREATE INDEX i ON x (nosuch)",
+      "CREATE SCHEMA s CREATE TABLE x (a BIGINT) GRANT SELECT ON x TO nobody",
+  };
+  for (const auto& sql : failing) {
+    INFO(sql);
+    CHECK(state([&] { (void)db->execute(sql); }) != "ok");
+    CHECK_FALSE(holds_schema(*db, "s"));
+    auto t = db->begin();
+    (void)t.execute("INSERT INTO t VALUES (2, 20)");
+    CHECK(state([&] { (void)t.execute(sql); }) != "ok");
+    CHECK(t.is_aborted());
+    CHECK(t.commit() == CommitOutcome::RolledBack);
+    CHECK_FALSE(holds_schema(*db, "s"));
+    CHECK(db->execute("SELECT k FROM t").rows == Grid{{i(1)}});
+  }
+  // In a transaction, one that works is the transaction's: others see it at its commit.
+  auto t = db->begin();
+  (void)t.execute("CREATE SCHEMA s CREATE TABLE x (a BIGINT) CREATE VIEW v AS SELECT a FROM x");
+  (void)t.execute("INSERT INTO s.x VALUES (5)");
+  CHECK(t.execute("SELECT a FROM s.v").rows == Grid{{i(5)}});
+  CHECK_FALSE(holds_schema(*db, "s"));
+  CHECK(t.commit() == CommitOutcome::Committed);
+  CHECK(db->execute("SELECT a FROM s.v").rows == Grid{{i(5)}});
+}
+
+TEST_CASE("schemas: a view created as an element keeps reading what it read at creation, through a reopen",
+          "[sql][api][schemas]") {
+  sql_test::TempDir dir{"schemas_element_view"};
+  {
+    auto db = open(dir);
+    (void)db->execute("CREATE TABLE t1 (k BIGINT PRIMARY KEY, a BIGINT)");
+    (void)db->execute("INSERT INTO t1 VALUES (1, 10), (2, 20)");
+    (void)db->execute(
+        "CREATE SCHEMA s "
+        "CREATE VIEW v AS SELECT a FROM t1 "
+        "CREATE VIEW vs AS SELECT k, (SELECT MAX(a) FROM t1) AS m FROM t "
+        "CREATE VIEW vin AS SELECT k FROM t WHERE k IN (SELECT k FROM t1) "
+        "CREATE VIEW vex AS SELECT k FROM t WHERE EXISTS (SELECT 1 FROM t1 WHERE t1.k = 2)");
+    const auto s = db->catalog()->schema("s")->id;
+    // The view stores its own text, an ordinary CREATE VIEW.
+    CHECK(db->catalog()->view({s, "v"})->definition == "CREATE VIEW v AS SELECT a FROM t1");
+    CHECK(db->catalog()->view({s, "vex"})->definition == "CREATE VIEW vex AS SELECT k FROM t WHERE EXISTS (SELECT 1 FROM t1 WHERE t1.k = 2)");
+    (void)db->execute("CREATE TABLE s.t1 (k BIGINT PRIMARY KEY, a BIGINT)");
+    (void)db->execute("CREATE TABLE s.t (k BIGINT PRIMARY KEY)");
+    (void)db->execute("INSERT INTO s.t1 VALUES (9, 90)");
+    CHECK(db->execute("SELECT a FROM s.v ORDER BY a").rows == Grid{{i(10)}, {i(20)}});
+    db->close();
+  }
+  auto db = Database::open(dir.path());
+  CHECK(db->execute("SELECT a FROM s.v ORDER BY a").rows == Grid{{i(10)}, {i(20)}});
+  CHECK(db->execute("SELECT k, m FROM s.vs").rows == Grid{{i(1), i(20)}});
+  CHECK(db->execute("SELECT k FROM s.vin").rows == Grid{{i(1)}});
+  CHECK(db->execute("SELECT k FROM s.vex").rows == Grid{{i(1)}});
+}
+
+TEST_CASE("schemas: INSERT through an element view, and a view whose text cannot be cut out is 0A000",
+          "[sql][api][schemas]") {
+  sql_test::TempDir dir{"schemas_element_insert"};
+  auto db = open(dir);
+  // Comments and a closing semicolon are not the view's text.
+  (void)db->execute(
+      "CREATE SCHEMA s /* c */ CREATE TABLE x (k BIGINT PRIMARY KEY, a BIGINT) -- x\n"
+      " CREATE VIEW v (kk) AS SELECT k /* create */ FROM x ;");
+  const auto s = db->catalog()->schema("s")->id;
+  CHECK(db->catalog()->view({s, "v"})->definition == "CREATE VIEW v (kk) AS SELECT k /* create */ FROM x");
+  CHECK(db->execute("INSERT INTO s.v VALUES (3)").affected == 1);
+  CHECK(db->execute("SELECT k FROM s.x").rows == Grid{{i(3)}});
+  CHECK(message([&] { (void)db->execute("CREATE SCHEMA s2 CREATE VIEW v AS SELECT a AS create FROM t"); }) ==
+        "CREATE VIEW as a schema element whose text cannot be cut out of the statement is not supported");
+  CHECK(state([&] {
+          (void)db->execute("CREATE SCHEMA s2 CREATE VIEW v AS SELECT a AS grant FROM t CREATE TABLE y (a BIGINT)");
+        }) == "0A000");
+  CHECK_FALSE(holds_schema(*db, "s2"));
+  // The GRANT of WITH GRANT OPTION, and a privilege CREATE, start no element:
+  // the view after them is cut out whole.
+  (void)db->execute("CREATE ROLE r");
+  (void)db->execute(
+      "CREATE SCHEMA s3 GRANT SELECT ON t TO r WITH GRANT OPTION CREATE TABLE y (a BIGINT) "
+      "GRANT SELECT, INSERT ON y TO r WITH GRANT OPTION CREATE VIEW w AS SELECT 2 AS z");
+  const auto s3 = db->catalog()->schema("s3")->id;
+  CHECK(db->catalog()->view({s3, "w"})->definition == "CREATE VIEW w AS SELECT 2 AS z");
+  CHECK(db->execute("SELECT z FROM s3.w").rows == Grid{{i(2)}});
+  // s.t.c where t is read unqualified: which schema's t is known only at bind.
+  for (const auto* sql : {"CREATE SCHEMA s4 CREATE TABLE y (a BIGINT) CREATE VIEW v AS SELECT s4.y.a FROM y",
+                          "CREATE SCHEMA s4 CREATE VIEW v AS SELECT public.t.k FROM t",
+                          "CREATE SCHEMA s4 CREATE VIEW v AS SELECT k FROM t WHERE EXISTS (SELECT s4.y.* FROM y)"}) {
+    INFO(sql);
+    CHECK(state([&] { (void)db->execute(sql); }) == "0A000");
+    CHECK_FALSE(holds_schema(*db, "s4"));
+  }
+  // Qualified in its FROM too, it is read as anywhere else.
+  (void)db->execute("CREATE SCHEMA s4 CREATE TABLE y (a BIGINT) CREATE VIEW v AS SELECT s4.y.a FROM s4.y");
+  (void)db->execute("INSERT INTO s4.y VALUES (7)");
+  CHECK(db->execute("SELECT a FROM s4.v").rows == Grid{{i(7)}});
+}
+
+TEST_CASE("schemas: a statement prepared through a view rebinds after CREATE SCHEMA with elements",
+          "[sql][api][schemas]") {
+  sql_test::TempDir dir{"schemas_element_rebind"};
+  auto db = open(dir);
+  (void)db->execute("CREATE VIEW v AS SELECT a FROM t");
+  const auto& st = db->prepare("SELECT a FROM v");
+  const auto before = db->catalog()->version();
+  (void)db->execute("CREATE SCHEMA s CREATE TABLE t (a BIGINT) CREATE VIEW v AS SELECT 99 AS a");
+  CHECK(db->catalog()->version() > before);
+  CHECK(db->execute(st, {}).rows == Grid{{i(10)}});
+  CHECK(db->execute("SELECT a FROM s.v").rows == Grid{{i(99)}});
+}
+
+TEST_CASE("schemas: CREATE SCHEMA with elements that loses to another DDL is 40001 with nothing written, "
+          "and a crash at its commit leaves nothing after reopen",
+          "[sql][api][schemas]") {
+  sql_test::TempDir dir{"schemas_element_race"};
+  {
+    auto db = open(dir);
+    std::string outcome;
+    db->live_catalog_for_testing().set_commit_hook_for_testing([&] {
+      std::thread other{[&] { outcome = state([&] { (void)db->execute("CREATE SCHEMA s2 CREATE TABLE x (a BIGINT)"); }); }};
+      other.join();
+    });
+    (void)db->execute("CREATE SCHEMA s1 CREATE TABLE x (a BIGINT)");
+    db->live_catalog_for_testing().set_commit_hook_for_testing({});
+    CHECK(outcome == "40001");
+    CHECK(holds_schema(*db, "s1"));
+    CHECK_FALSE(holds_schema(*db, "s2"));
+    db->live_catalog_for_testing().set_commit_hook_for_testing([] { throw std::runtime_error{"crash"}; });
+    CHECK_THROWS(db->execute("CREATE SCHEMA s3 CREATE TABLE x (a BIGINT) CREATE VIEW v AS SELECT a FROM x"));
+    db->live_catalog_for_testing().set_commit_hook_for_testing({});
+    db->close();
+  }
+  auto db = Database::open(dir.path());
+  CHECK(holds_schema(*db, "s1"));
+  CHECK_FALSE(holds_schema(*db, "s3"));
+  CHECK(state([&] { (void)db->execute("SELECT a FROM s3.x"); }) == "42P01");
+}
+
+TEST_CASE("schemas: an allocation failure in CREATE SCHEMA with elements in autocommit writes all or nothing",
+          "[sql][api][schemas][alloc]") {
+  if (!bytecask::testing::kAllocFaultsAvailable) SKIP("no allocation faults in this build");
+  sql_test::TempDir dir{"schemas_element_alloc"};
+  auto db = open(dir);
+  auto failed = 0;
+  for (long nth = 1;; ++nth) {
+    REQUIRE(nth < 200000);
+    std::string outcome = "ok";
+    bool fired = false;
+    {
+      bytecask::testing::ScopedAllocFaults faults{nth, false};
+      outcome = state([&] {
+        (void)db->execute("CREATE SCHEMA s CREATE TABLE x (k BIGINT PRIMARY KEY) CREATE VIEW v AS SELECT k FROM x");
+      });
+      fired = faults.report().fired;
+    }
+    INFO("allocation " << nth << ": " << outcome);
+    const auto cat = db->catalog();
+    const auto* s = cat->schema("s");
+    CHECK((s != nullptr) == (outcome == "ok"));
+    if (s != nullptr) {
+      REQUIRE(cat->table({s->id, "x"}) != nullptr);
+      REQUIRE(cat->view({s->id, "v"}) != nullptr);
+      (void)db->execute("DROP VIEW s.v");
+      (void)db->execute("DROP TABLE s.x");
+      (void)db->execute("DROP SCHEMA s");
+    } else {
+      CHECK(cat->schemas().empty());
     }
     if (!fired) break;
     ++failed;
