@@ -392,10 +392,17 @@ derive the entries they remove from the snapshot's row, so a second write
 would leave the first one's entries without a row. Only a wrong plan
 reaches it, since one SQL statement affects each row at most once
 (PostgreSQL refuses an `ON CONFLICT DO UPDATE` that would affect a row
-twice). The exception is a `bc_insert` of a key the plan already put
-there: that is `INSERT … VALUES (1, …), (1, …)`, a duplicate key, and it
-raises `BC_C_UNIQUE` (SQLSTATE 23505, as PostgreSQL reports it), never
-retried. The tracking spans the execution, every run between
+twice). The exceptions are writes that put a new row at a key, a
+`bc_insert` or a `bc_update` that moves a row's primary key:
+- into a key the plan already put a row at, it is `INSERT … VALUES (1, …),
+  (1, …)`, a duplicate key, and raises `BC_C_UNIQUE` (SQLSTATE 23505, as
+  PostgreSQL reports it), never retried;
+- into a key the plan vacated (it moved or deleted the row there), it takes
+  the key, whatever the snapshot holds: the vacating write is in the plan,
+  and the engine checks it for a concurrent change. That is PostgreSQL's
+  row-by-row unique check, which lets `UPDATE t SET id = id - 1` move each
+  row into the key the row before it left, and refuses `SET id = id + 1`
+  when a row moves into a key a row not yet moved still holds. The tracking spans the execution, every run between
 `bc_ctx_begin` and the commit: those runs share the snapshot and the write
 plan, and each derives the entries it removes from the snapshot's row, so
 a row written by one run and again by a later one would keep both runs'

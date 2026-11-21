@@ -4985,10 +4985,9 @@ auto bind(const ast::Statement& stmt, const Catalog& cat) -> Bound {
           const auto* t = b.table(s.table, s.pos);
           std::vector<std::pair<logical::ColumnRef, logical::Expr>> set;
           for (const auto& a : s.set) {
+            // A primary key column too: the row moves to its new key, each
+            // row's checked in turn, as PostgreSQL's unique check does.
             const auto* c = Binder::column(*t, a.column, a.pos);
-            if (std::ranges::find(t->pk_col_ids, c->id) != t->pk_col_ids.end()) {
-              throw SqlError{"updating a primary key column is not supported", a.pos};
-            }
             auto v = b.value(*t, a.value, *c);
             // A constant is checked against the column's type now, as
             // PostgreSQL folds its cast when it plans the statement.

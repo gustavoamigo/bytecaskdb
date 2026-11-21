@@ -180,7 +180,13 @@ TEST_CASE("binder: anything outside the scope is rejected with a message and pos
         "could not determine data type of parameter $1");
   CHECK(rejected(cat, "UPDATE t SET name = name - $1 WHERE id = $2").first ==
         "operator - is only supported on an integer or DECIMAL column of the assigned column's type");
-  CHECK(rejected(cat, "UPDATE t SET id = $1 WHERE id = $2").second == 13);
+  {
+    // A primary key column is set as any other: the runtime moves the row.
+    auto b = bind_sql(cat, "UPDATE t SET id = $1 WHERE id = $2");
+    const auto& u = get<logical::Update>(b);
+    REQUIRE(u.set.size() == 1);
+    CHECK(u.set[0].first.col == 0);
+  }
   CHECK(rejected(cat, "INSERT INTO t VALUES ($1, $2, $3, $4)").first == "INSERT has more expressions than target columns");
   CHECK(rejected(cat, "INSERT INTO t (id, qty) VALUES ($1)").first == "INSERT has 1 values for 2 columns");
   // CHAR(n) is a type; a CHAR of no length, which PostgreSQL leaves unbounded, and of length 0 are not.

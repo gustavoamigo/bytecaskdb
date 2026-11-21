@@ -787,6 +787,13 @@ search refuses*).
 The proof machine expects each one, or doesn't generate it, so it doesn't
 fail on them.
 
+- **An `UPDATE` of a primary key checks each row's new key in the order
+  it reads the rows**, key order for a scan, as PostgreSQL checks them in
+  the order it reads them, heap order for a sequential scan. Either refuses
+  a row moving into a key a row it has not moved yet holds (23505), so a
+  statement that succeeds in one order can fail in the other, as one can
+  in PostgreSQL between two physical layouts of the same rows.
+
 - **A VARCHAR(n) value whose excess is only spaces is refused.** (A
   `CHAR(n)` cuts it, as PostgreSQL does: `types_design.md`, *CHAR(n)*.)
   PostgreSQL truncates it to n characters and stores it; the layer refuses
