@@ -1316,6 +1316,295 @@ subquery's value is one, hidden), `Add`, `Sub`, `Mul`, `Div`, `Compare`,
   before. An expression adds locals and a call per operator to each row it
   is evaluated for; no performance claim is made.
 
+### Expression filters (stage P)
+
+Status: **design, approved by the owner on 2026-11-22.** The dialect is
+`frontend_design.md`, *Expressions in WHERE, ON and HAVING (stage P)*:
+which forms, their types, and the order conjuncts are tried in. This
+section is how the planner and codegen run them. **A conjunct whose
+operands are expressions of columns, or of another type than the column
+they are compared with, is a filter on each row a plan reads, never a
+key's bound**, evaluated by the select list's evaluator (*Expressions
+over columns*).
+
+#### The logical plan of an expression filter
+
+No new `Kind`. A conjunct is a BOOLEAN `logical::Expr`: a `Compare`,
+`IsNull`, `Like` or `And`/`Or`/`Not` whose operands are any value
+expression, or (open question 2) a BOOLEAN value standing alone. The
+comment at `plan/logical.cppm:60-69` changes: `And`, `Or`, `Not`, `IsNull`
+and `Like` are values over any operands in a filter as in a select list.
+`Like`'s first two arguments become any text expressions. P1b adds one
+field, `bool in_list` on `logical::Expr`, set only on the `Or` an `IN`
+list's no-column items make (`frontend_design.md`, *Evaluation order*,
+step 3): the cost reads it, and an explicit `OR` of the same shape is
+costed as written.
+
+The rewrites (`plan/rewrite.cppm`): `fold` folds constants, and
+`push_down` (:347) already decides where a conjunct goes by the tables it
+reads (`reads_only`, :329), whatever its form. **`reads_none` (:323)
+changes:** today it requires `is_predicate`, so `WHERE $1 = $2` over a
+join stays above it and the search refuses it (`no plan: a conjunct that
+reads no column`, `search.cppm:990-995`), and an inner join's `ON`
+conjunct of no column reaches `use_of`'s `NoColumn` (:1090-1093). Stage
+P1a drops the `is_predicate` test, so any conjunct of no column is a
+filter of the leftmost side, every row alike. P1b adds `normalise`, run
+on each `Filter`'s and join predicate's conjuncts before the search: `NOT`
+moved inward (a marked `in_list` unit kept whole) and nested `AND`s
+flattened into conjuncts.
+
+#### The search: a filter, never a key's bound
+
+- **Where a conjunct goes** (`flatten`, `plan/search.cppm:947-1090`). A
+  conjunct `use_of` (:262-295) accepts stays a key candidate as today.
+  Every other conjunct of one table, where `use_of` returns `Operand` or
+  `NoColumn` or the conjunct is no `Compare`, goes to `Rel::preds` (:550),
+  where `is_predicate` conjuncts and same-table column pairs go today,
+  instead of the `no_plan` refusal (:1006-1012). Of several tables, it is a
+  join filter (`q.cross`, :1074-1084), as a multi-table predicate is today.
+- **`use_of` checks types (B1).** Today it returns `Ok` for any `Param`
+  operand, and codegen's `comparison()` reads the parameter as the
+  column's type (`param(lhs.type, …)`, `codegen.cppm:~918`) without
+  rescaling (`compare_text`, :508-524). That is safe only because every
+  column-against-parameter conjunct has the parameter typed as the
+  column; `d > $1::int` (`d` DECIMAL(10,2)) would compare the raw 500
+  with 5, and as a key would bound by 0.05. `use_of` returns `Ok` only when
+  the operand's `SqlType` equals the column's, or in the wider-integer
+  subquery case (`subquery_param_type`); every other conjunct is
+  evaluated.
+- **One `$n ± k` predicate (B2).** `add_computed` (:229-233) is called on
+  every compare filter (:1666, access filters and `preds`; :1769, probe
+  filters; :1881, `q.post`) and `computed_of` (`physical.cppm:529-532`)
+  reads `args[0].param` and `args[1].constant` of any `Add`/`Sub`. With
+  stage P, `b = a + 1` reaches it and records a bogus `{param 0, offset
+  0}`, whose code reads an unrelated parameter as an INTEGER (a spurious
+  22003). One predicate, `is_computed(e)` (an INTEGER `Add`/`Sub` of a
+  `Param` and a `Const`), is used by `use_of`, `add_computed`,
+  `comparison()` and `Checker::operand`.
+- **Its columns are the plan's needs.** `columns_of` the conjunct joins the
+  `Rel`'s needed columns, so projection pruning and a covering index's
+  choice include them, and a column read only by a filter is read from the
+  row, a DOUBLE never from a key (*Filters on DOUBLE and REAL columns*).
+- **Beside a key on the same column.** `id = $1 AND id * 2 = 10`: the key
+  is the point lookup, the expression a filter of the one row read. `id >
+  5 AND lower(s) = 'x'`: a range scan from 6, filtered. `id + 0 = 500`:
+  no key, a full scan with the filter (PG 17 also scans: `id + 0 = 500`,
+  `id * 2 = 1000`, `-id = -500` are all `Seq Scan … Filter`). An `OR` with
+  an expression among its operands is one filter, as any `OR` is.
+- **The order of the filter** (`residual`, :578-585). Today the conjuncts
+  the key leaves, in written order, then `preds`. P1a records each
+  conjunct's written place in `flatten` and returns the residual in
+  written order. P1b stably sorts it by `filter_cost`, and a join filter
+  and a `HAVING`'s conjuncts the same way. `filter_cost` is one function
+  in `plan/search.cppm` over `logical::Expr`, in half calls
+  (`frontend_design.md`, *Evaluation order*, step 4):
+  - 0 for a subtree that reads no column, no clock parameter and no
+    `Random`; the clock parameters are the logical plan's clock slots,
+    which `filter_cost` is given (a clock reading is a fixed `Param`,
+    `clock_reading`, `binder.cppm:2563`);
+  - otherwise a call for each `Add`, `Sub`, `Mul`, `Div`, `Mod`, `Neg`,
+    `Abs`, `Compare`, `Concat`, `Substr`, `TextFn`, `Extract`, `Like`,
+    `Random` and clock parameter; two for a `JsonbCast` to or from text,
+    one for stage 3's casts from jsonb to a number or BOOLEAN;
+  - an `in_list` `Or`: its left operand's cost once plus half a call per
+    item;
+  - an `InSet` under `Not` or `Or`: one call; a top-level `InSet`
+    conjunct, or a quantified conjunct over a subquery's `Bounds`: after
+    every other conjunct; a `Truth`: nothing;
+  - nothing for the rest.
+- **Selectivity.** An expression conjunct is costed as a range's
+  (`selectivity`, :215-218), as a predicate is.
+- **Refused** only as before: more than 32 tables, and the rest of *What
+  the search refuses*. The two `use_of` messages of :1006-1012 and the
+  `reads no column` refusal of :990-995 go.
+
+#### Outer joins, NULL-extended rows, LIMIT and cursors
+
+Examples are PG 17 over `jz_t(a, b)` = (0,1), (1,NULL), (2,3), (NULL,4),
+(-1,0) and `jz_u(x, y)` = (1,10), (2,0), (3,5), (5,1).
+
+- **An `ON` of a left join.** A conjunct reading only the right side is a
+  filter of the right table's rows (`push_down`, as today), tried on each
+  inner row the loop reads; one reading only the left side, or both, stays
+  in the join's predicate and is tried per pair: a pair it rejects is not
+  a match, and a left row no pair matches is NULL-extended. `jz_t LEFT
+  JOIN jz_u ON t.a > 0 AND u.x = t.a`: the rows with `a` of -1, 0 and NULL
+  come back NULL-extended, the rest matched; in a `WHERE` the same
+  conjunct drops them. `ON t.a + 1 = u.x` returns 5 rows: (-1, NULL), (0,
+  1), (1, 2), (2, 3), (NULL, NULL) as `(t.a, u.x)`.
+- **A `WHERE` above a left join** that reads the right side stays above it
+  (`push_down`'s left-outer branch, `plan/rewrite.cppm:347-400`) and is
+  evaluated on NULL-extended rows, whose right columns read NULL (`eval`
+  reads a NULL-extended side's columns as NULL, as the select list does).
+  PG 17 reduces the join to an inner join when the `WHERE` is strict
+  (`frontend_design.md`, *Differences*, open question 8).
+- **A `FULL JOIN`'s two arms** (*FULL JOIN*) take the `ON` as each arm's
+  outer join does. The layer accepts and refuses as PG 17 does: an `ON`
+  with an equality of an expression of each side is taken, with any
+  further conjuncts beside it (`ON t.a + 1 = u.x AND t.a > 0` and `… AND
+  t.a < u.y` each return 7 rows); an `ON` with no equality across the two
+  sides is 0A000 `FULL JOIN is only supported with merge-joinable or
+  hash-joinable join conditions` (`ON t.a < u.x`, `ON lower(t.s) = 'x'`,
+  `ON t.a + u.x = 3`; PG 17's `joinrels.c:992`). A functional case for
+  each.
+- **`LIMIT`.** The filter is below the `Limit`, so rows after the limit's
+  last are never read or evaluated; under a `Sort` every row is filtered
+  before it is sorted. PG 17's plans do the same for the same order.
+- **Cursors.** A filter of no `random()` is deterministic, so a replay
+  cursor reads the same rows and an error recurs at the same row
+  (`cursor_design.md`, *The replay cursor*); this is why `random()` is
+  refused in a filter.
+- **`UPDATE` and `DELETE`.** The filter is applied to each row read before
+  `bc_update` or `bc_delete`; an error raised ends the statement, whose
+  writes are rolled back as for any run-time error. `SELECT … FOR UPDATE`
+  locks the rows the filter keeps, as for a column filter today.
+
+#### A row-independent operand computed once (stage P2)
+
+An operand that reads no column and is not `random()` (`$1 - 100` beside a
+BIGINT, `$1::bigint - 100`, `lower($1)`, `abs($1) + 1`, the clock) is the
+same for every row. P2 generalises `physical::Computed`
+(`plan/physical.cppm:464-470`, today `$param + offset` as an INTEGER) to
+any such `logical::Expr` of the column's type, printed by `eval` before
+the plan's first read, and lets `use_of` return `Ok` for it, so `createat
+> $1 - 100` bounds a range scan as `ol_o_id >= $3 - 20` does today. A NULL
+value bounds nothing and the conjunct keeps no row, as a NULL parameter
+does today. An error it raises is raised before any row is read, empty
+table or not, as PG 17's custom plan does (`a = 1/$1` with 0 on an empty
+table: 22012). A conjunct of no column is a test made once at the same
+place (PG 17's one-time filter): false or NULL, and the plan reads
+nothing. Such an operand costs nothing in `filter_cost`, as in PG 17's
+custom plan, so a conjunct a key takes costs 1, or 2 beside the clock.
+
+#### The physical check of an expression filter
+
+`Checker::predicate_of` (`plan/physical.cppm:873-943`) keeps today's
+leaves and, for any other conjunct, checks it with `value()` (:771-857),
+the Emit's validator: BOOLEAN, every column read of a table in hand at the
+filter, no `Aggregate` outside a `HAVING`, no `Random`. One function,
+`physical::evaluated(const Expr&)`, says whether a conjunct is printed by
+`truth` (today's leaves, with the operand typed as the column or
+`is_computed`, the same test as `use_of`'s) or by `eval` (anything else);
+the checker and codegen both call it, so they never disagree. The
+`Filter` check (:1398-1424) takes an evaluated conjunct wherever a
+predicate may be. In P3 a `HAVING` conjunct is an evaluated one over the
+group's keys and aggregates (:1400-1410).
+
+#### Codegen of an expression filter
+
+- **One evaluator.** For an `evaluated` conjunct, codegen prints `eval(c)`
+  and tests `n || !v`, the CHECK constraint's pattern (`checked_row`,
+  :2849-2860). A conjunct that `truth` prints today prints exactly as
+  before.
+- **Every conjunct-test site prints per conjunct (B3).** `eval` prints
+  statements, so a conjunct test can no longer be one C expression
+  spliced into a condition string. The sites are: `produce(physical::
+  Filter)` (:1523-1565) through `miss()`; a Filter over a one-row
+  aggregate's row (`*hit_ += " && !(" + fails(c) + ")"`, :1553, where
+  `hit_` is set by `PointGet` without a miss, :973); `outer_index_join`'s
+  match (`matched = found && !(fails(c))`, :1270); `HAVING`'s
+  `group_fails` chain (:1529); and the probe, nested-loop and cross
+  filters. At the condition-string sites the test becomes a block per
+  conjunct: `bool m = found; if (m) { <eval c1>; m = !(n1 || !v1); } if (m)
+  { <eval c2>; … }`. So no conjunct's code runs before `found` is tested
+  (`eval` reads a NOT NULL column with no null test, which over
+  `bc_empty` is UB) or after an earlier conjunct rejects the row:
+  `SELECT count(a) FROM t WHERE id = $1 AND 10/a > 0` with no such id,
+  and `t LEFT JOIN u ON u.id = t.k AND 10/u.y > 0` for a left row with no
+  match, raise nothing, and `HAVING 100/sum(v) > 0 AND sum(v) <> 0` runs
+  under P1b's order as in PG 17. `fails()` keeps returning a C
+  expression for `truth` conjuncts only; `physical::check` rejects an
+  evaluated conjunct at any site that has not moved to blocks.
+- **Inside a conjunct**, `eval_connective`, `eval_case` and
+  `eval_coalesce` evaluate an operand only while the result is unsettled,
+  in written order.
+- **What `eval` gains** (:1711-1715): `Like` (`bc_like`/`bc_ilike` of two
+  `bc_view`s and the escape, as `truth` prints it today), `Truth` and
+  `InSet` over a column (a subquery's flag and `bc_sub_has_*`), so a
+  conjunct holding them beside an expression is one `eval`. `Aggregate`
+  in P3, reading the group's folded value as `group_fails` (:2296) does.
+- **Errors** need nothing new: `bc_add`, `bc_mul`, `bc_div` and kin raise
+  `BC_E_ARITH` (22003, 22012); the casts, `substring`, `LIKE`'s escape and
+  jsonb raise `BC_E_DATA` with their SQLSTATE (`jsonb_design.md`, stage 0).
+  A helper is called only for a row whose operands are not NULL, so a NULL
+  or a NULL-extended row raises nothing.
+- **An `IN` list's left operand** is printed once per `=` the parser made
+  of it (`lower(s) IN ($1 … $100)` calls `lower` up to 100 times per row).
+  Evaluating it once is a follow-up; results and errors do not change.
+- **Memory.** A filter's text values (`bc_text_case`, `bc_trim`,
+  `bc_jsonb_text`) are allocated in the loop's arena level and released at
+  its next step (*Memory*, "a view returned inside a loop lives until that
+  loop's next step"), charged to the statement's budget like any
+  allocation: a filter's memory is bounded by one row's expressions, not
+  by the rows read. A P2 value is allocated before the loops and lives for
+  the statement.
+- **Cost.** A plan with no expression filter prints what it printed before,
+  but for the order of its filter conjuncts. An expression filter costs a
+  call per operator per row it is evaluated on; no performance claim is
+  made, so no benchmark is required.
+
+#### What jsonb stage 3 gets from stage P
+
+Stage 3 adds `->`, `->>`, `#>`, `#>>`, `jsonb_typeof`,
+`jsonb_array_length` and the casts from jsonb as kinds of `eval` for the
+select list. After P1a, each is also a filter with no further work:
+`WHERE props->>'k' = $1` (`$1` typed text by its peer), `WHERE
+Timezone->>'useAutomaticTimezone' = 'true'`, `WHERE (props->>'n')::int >
+5`, `WHERE props->'a' IS NULL`, `WHERE LOWER(Attrs->>$1) LIKE LOWER($2)`,
+`IN` lists and `BETWEEN` of them, in `ON`, `UPDATE` and `DELETE`; after
+P3, in `HAVING`. Its `filter_cost` (P1b) is a call per operator, as PG 17
+counts `jsonb_object_field_text`, and a call for a cast from jsonb to a
+number or BOOLEAN. Comparing two jsonb values (`Data->'k' = $1::jsonb`)
+still waits for stage 2. Stage 3's tests add a `WHERE` step to each
+operator's functional case.
+
+#### Tests of stage P (planner and proof)
+
+- `tests/search_test.cpp`: an expression conjunct goes to `preds`, never a
+  key's bound, beside a key on the same column (`id = $1 AND id * 2 = 10`
+  is a point lookup and a filter); `id + 0 = 500` a full scan; `d >
+  $1::int` a filter, no key; `b = a + 1` records no computed value; the
+  residual in written order (P1a) and in cost order, ties as written
+  (P1b); its columns among the needs and a covering index's; `WHERE $1 =
+  $2` over a join, and in an inner and a left `ON`, a filter of the
+  leftmost side; a left join's `ON` expression a right-side filter or a
+  join filter by what it reads; P2: `c > $1 - 100` a range bound.
+- `tests/rewrite_test.cpp` (P1b): `normalise` moves `NOT` inward, keeps an
+  `in_list` unit whole, and flattens a `BETWEEN`'s `AND`.
+- `tests/physical_test.cpp`: an evaluated conjunct of a non-BOOLEAN, of a
+  column of a table not in hand, of `Random`, broken; `evaluated` and
+  `use_of` agree on `d > $1::int`.
+- `tests/codegen_test.cpp`: a filter printed by `eval`; a later conjunct's
+  locals after the earlier's `continue`; the block per conjunct at the
+  `hit_`, `outer_index_join` and `group_fails` sites, no `eval` before
+  `found`; `truth`-printed filters unchanged.
+- `tests/api_test.cpp`: `embedded API: an expression filter raises only for
+  rows it evaluates` (`1/a > 0 OR a = 0` 22012; a `DELETE` raising 22012
+  deletes nothing; `count(a) … WHERE id = $1 AND 10/a > 0` with no such
+  id, and a left index join's unmatched row, raise nothing; P1b: `1/a > 0
+  AND a <> 0` rows).
+- **The proof machines** (`tests/proof/test_sql_machine.py`).
+  `KeylessMachine.draw_predicate` (:1728; the class is at :1632) draws,
+  beside today's column operand, an expression operand from a new
+  `draw_value(t, depth)`: over integer columns `+`, `-`, `*` with small
+  literals, `abs`, `COALESCE`, `CASE`; over text columns `lower`, `upper`,
+  `||`, `btrim`, `substring`; compared with a literal or a `$n`, under `IS
+  NULL`, `LIKE`, `IN` and `BETWEEN`, and now and then a column on both
+  sides. `SqlMachine.write` and `join_on` take `(column, operator, value)`
+  triples (:589, :662), so the keyed machine gets one new rule,
+  `select_with_expression`, which adds a drawn expression conjunct as SQL
+  text to a keyed `select`'s `WHERE`, and none in `write` or `join_on`;
+  it draws no `/` or overflowing `*`, so neither side can raise. From
+  P1b, the keyless machine also draws `/` and overflowing `*`, and `NOT`
+  over them, in single-table `WHERE`s with no subquery only (where the
+  layer and PG 17 both scan one table and *Differences* do not apply),
+  and asserts the two sides return the same rows or the same SQLSTATE:
+  the check that the conjunct order matches. P3 extends `draw_having`
+  (:835). A fixed case, `proof:
+  test_a_cheaper_conjunct_guards_a_division` (P1b), runs the PG 17
+  examples of *Evaluation order* on both sides; reverting the cost sort
+  fails it.
+
 ### Aggregates
 
 **One row of `COUNT` or `SUM`.** A lone `COUNT`, `COUNT(DISTINCT)` or
