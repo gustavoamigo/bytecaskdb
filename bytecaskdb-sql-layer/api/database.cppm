@@ -1820,8 +1820,8 @@ auto Statement::params() const -> std::vector<ParamInfo> {
 
 auto Statement::current_of_table() const -> std::string_view {
   if (current_of().empty()) return {};
-  if (const auto* u = std::get_if<ast::Update>(&ast_)) return u->table;
-  return std::get<ast::Delete>(ast_).table;
+  if (const auto* u = std::get_if<ast::Update>(&ast_)) return u->table.name;
+  return std::get<ast::Delete>(ast_).table.name;
 }
 
 auto Statement::current_of() const -> std::string_view {
@@ -2499,27 +2499,27 @@ auto skipped(const Ddl& ddl) -> Notice {
       [](const auto& d) -> Notice {
         using T = std::decay_t<decltype(d)>;
         if constexpr (std::is_same_v<T, CreateTableDdl>) {
-          return {"42P07", "relation \"" + d.name + "\" already exists, skipping"};
+          return {"42P07", "relation \"" + d.name.name + "\" already exists, skipping"};
         } else if constexpr (std::is_same_v<T, DropTableDdl>) {
-          return {"00000", "table \"" + d.name + "\" does not exist, skipping"};
+          return {"00000", "table \"" + d.name.name + "\" does not exist, skipping"};
         } else if constexpr (std::is_same_v<T, DropIndexDdl>) {
-          return {"00000", "index \"" + d.name + "\" does not exist, skipping"};
+          return {"00000", "index \"" + d.name.name + "\" does not exist, skipping"};
         } else if constexpr (std::is_same_v<T, DropViewDdl>) {
-          return {"00000", "view \"" + d.name + "\" does not exist, skipping"};
+          return {"00000", "view \"" + d.name.name + "\" does not exist, skipping"};
         } else if constexpr (std::is_same_v<T, DropRoleDdl>) {
           return {"00000", "role \"" + d.names.front() + "\" does not exist, skipping"};
         } else if constexpr (std::is_same_v<T, DropTypeDdl>) {
-          return {"00000", "type \"" + d.name + "\" does not exist, skipping"};
+          return {"00000", "type \"" + d.name.name + "\" does not exist, skipping"};
         } else if constexpr (std::is_same_v<T, DropSequenceDdl>) {
-          return {"00000", "sequence \"" + d.name + "\" does not exist, skipping"};
+          return {"00000", "sequence \"" + d.name.name + "\" does not exist, skipping"};
         } else if constexpr (std::is_same_v<T, CreateSequenceDdl>) {
-          return {"42P07", "relation \"" + d.name + "\" already exists, skipping"};
+          return {"42P07", "relation \"" + d.name.name + "\" already exists, skipping"};
         } else if constexpr (std::is_same_v<T, DropProcedureDdl>) {
           std::string args;
           for (const auto& t : d.arg_types.value_or(std::vector<SqlType>{})) {
             args += (args.empty() ? "" : ",") + std::string{notice_type_name(t.kind)};
           }
-          return {"00000", "procedure " + d.name + "(" + args + ") does not exist, skipping"};
+          return {"00000", "procedure " + d.name.name + "(" + args + ") does not exist, skipping"};
         } else {
           throw std::logic_error("a DDL that never skips changed nothing");
         }
@@ -2608,7 +2608,7 @@ namespace {
 
 // Whether a relation of the catalog has the name: a table, view, index or
 // sequence, which CREATE TABLE AS looks for before it plans its query.
-auto relation_taken(const Catalog& cat, const std::string& name) -> bool {
+auto relation_taken(const Catalog& cat, const QualifiedName& name) -> bool {
   return cat.table(name) != nullptr || cat.view(name) != nullptr || cat.index(name).first != nullptr ||
          cat.sequence(name) != nullptr;
 }
@@ -2686,7 +2686,7 @@ auto Database::create_table_as(const Statement& stmt, const std::vector<Value>& 
   // As PostgreSQL: a relation of the name is found before the query is
   // planned, and IF NOT EXISTS then skips the statement.
   if (relation_taken(*live_->current(), ctas.table)) {
-    if (!ctas.if_not_exists) throw DdlRefused("relation \"" + ctas.table + "\" already exists", kDuplicateTable);
+    if (!ctas.if_not_exists) throw DdlRefused("relation \"" + ctas.table.name + "\" already exists", kDuplicateTable);
     out.notices.push_back(skipped(Ddl{ddl}));
     return out;
   }
@@ -3541,14 +3541,14 @@ void Transaction::check_in_use(const Ddl& ddl, const Catalog& cat) const {
     }
     return false;
   };
-  auto table_in_use = [&](std::string_view command, const std::string& name) {
+  auto table_in_use = [&](std::string_view command, const QualifiedName& name) {
     const auto* t = cat.table(name);
     if (t == nullptr) return;
     auto reads = [&](std::uint32_t id) {
       return id == t->id || std::ranges::any_of(t->indexes, [&](const Index& ix) { return ix.id == id; });
     };
     if (read_by_a_cursor(reads)) {
-      throw DdlRefused("cannot " + std::string{command} + " \"" + name +
+      throw DdlRefused("cannot " + std::string{command} + " \"" + name.name +
                            "\" because it is being used by active queries in this session",
                        kObjectInUse);
     }
@@ -3567,7 +3567,7 @@ void Transaction::check_in_use(const Ddl& ddl, const Catalog& cat) const {
     // other way does not hold it (PostgreSQL's index_drop).
     const auto [table, ix] = cat.index(di->name);
     if (ix != nullptr && read_by_a_cursor([id = ix->id](std::uint32_t o) { return o == id; })) {
-      throw DdlRefused("cannot DROP INDEX \"" + di->name + "\" because it is being used by active queries in this session",
+      throw DdlRefused("cannot DROP INDEX \"" + di->name.name + "\" because it is being used by active queries in this session",
                        kObjectInUse);
     }
   }
@@ -3677,7 +3677,7 @@ auto Transaction::create_table_as(const Target& t, const ast::CreateTableAs& cta
   // As PostgreSQL: a relation of the name is found before the query is
   // planned, and IF NOT EXISTS then skips the statement.
   if (relation_taken(*cat, ctas.table)) {
-    if (!ctas.if_not_exists) throw DdlRefused("relation \"" + ctas.table + "\" already exists", kDuplicateTable);
+    if (!ctas.if_not_exists) throw DdlRefused("relation \"" + ctas.table.name + "\" already exists", kDuplicateTable);
     out.notices.push_back(skipped(Ddl{ddl}));
     return out;
   }
@@ -3764,10 +3764,10 @@ auto Transaction::refit_locked(const Target& t, std::shared_ptr<const PortalRead
     out.command = s != nullptr ? s->command() : Statement::command_of(*plan.private_->parse_);
     if (const auto* u = std::get_if<ast::Update>(s != nullptr ? &s->ast_ : plan.private_->parse_.get())) {
       out.current_of = u->current_of;
-      if (!u->current_of.empty()) out.current_of_table = u->table;
+      if (!u->current_of.empty()) out.current_of_table = u->table.name;
     } else if (const auto* d = std::get_if<ast::Delete>(s != nullptr ? &s->ast_ : plan.private_->parse_.get())) {
       out.current_of = d->current_of;
-      if (!d->current_of.empty()) out.current_of_table = d->table;
+      if (!d->current_of.empty()) out.current_of_table = d->table.name;
     }
     return out;
   });
@@ -4283,7 +4283,7 @@ auto Transaction::procedure(std::string_view name) -> std::shared_ptr<const Proc
     for (auto attempt = 0;; ++attempt) {
       const auto fresh = bc_txn_catalog_version(h_->txn) == 0;
       auto cat = bc_txn_catalog(h_->txn);
-      const auto* def = cat->procedure(name);
+      const auto* def = cat->procedure(QualifiedName{kPublicSchema, std::string{name}});  // the session's path
       if (def != nullptr) return {cat, def};
       // A binder error at a stale pin (exception 1); a first statement
       // re-pins. A transaction that has run DDL reports its own catalog's.
@@ -4318,7 +4318,7 @@ auto Transaction::call_locked(std::string_view procedure, const std::vector<Valu
       const Database::TxnCatalog tc{bc_txn_pinned_catalog(h_->txn), cat};
       const auto base = tc.base->version();
       const auto first = fresh && bc_txn_first_statement(h_->txn);
-      const auto* def = cat->procedure(procedure);
+      const auto* def = cat->procedure(QualifiedName{kPublicSchema, std::string{procedure}});  // the session's path
       std::shared_ptr<const CompiledProcedure> plan;
       std::exception_ptr bind_error;
       if (def == nullptr) {
@@ -4556,7 +4556,7 @@ auto Database::alternatives_for_testing(std::string_view sql, const std::vector<
 auto Database::table_rows(std::string_view table) const -> Rows {
   auto lock = enter();
   auto [cat, snap] = live_->pin();
-  const auto* t = cat->table(table);
+  const auto* t = cat->table(QualifiedName{kPublicSchema, std::string{table}});  // the session's path
   if (t == nullptr) throw ast::SqlError("relation \"" + std::string{table} + "\" does not exist", -1, kUndefinedTable);
   Rows out;
   // The table's layout with its slots in column order, the order the rows

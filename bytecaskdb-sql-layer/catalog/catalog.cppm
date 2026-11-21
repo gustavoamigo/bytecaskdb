@@ -54,6 +54,7 @@ export module bytecask.sql.catalog;
 
 export import bytecask.sql.key_codec;
 export import bytecask.sql.sqlstate;
+export import bytecask.sql.names;
 export import bytecask.sql.row_codec;
 
 export namespace bytecask::sql {
@@ -566,7 +567,7 @@ struct CheckSpec {
 // primary key: they are written in the table's batch under row ids 1..n,
 // as a backfill, within its limit.
 struct CreateTableDdl {
-  std::string name;
+  QualifiedName name;
   std::vector<ColumnSpec> columns;
   std::vector<std::string> pk;
   std::vector<UniqueSpec> unique;
@@ -576,41 +577,41 @@ struct CreateTableDdl {
 };
 struct CreateIndexDdl {
   std::string name;
-  std::string table;
+  QualifiedName table;  // `name` is in its schema
   std::vector<IndexColumnSpec> columns;
   bool unique{false};
 };
 struct DropTableDdl {
-  std::string name;
+  QualifiedName name;
   bool if_exists{false};
 };
 struct DropIndexDdl {
-  std::string name;
+  QualifiedName name;
   bool if_exists{false};
 };
 struct AddColumnDdl {
-  std::string table;
+  QualifiedName table;
   ColumnSpec column;
 };
 struct CreateViewDdl {
-  std::string name;
+  QualifiedName name;
   std::string definition;
   std::vector<std::uint32_t> depends_on;
   std::vector<std::string> columns;
 };
 struct DropViewDdl {
-  std::string name;
+  QualifiedName name;
   bool if_exists{false};
 };
 struct CreateProcedureDdl {
-  std::string name;
+  QualifiedName name;
   std::string definition;
   bool replace{false};
   std::vector<ProcedureArg> args;
 };
 // `arg_types`: the DROP's argument list, nullopt when none was written.
 struct DropProcedureDdl {
-  std::string name;
+  QualifiedName name;
   std::optional<std::vector<SqlType>> arg_types;
   bool if_exists{false};
 };
@@ -625,24 +626,24 @@ struct DropRoleDdl {
 // in PostgreSQL's order (the objects, the grantees and the grantor, the
 // privileges, their columns).
 struct CreateDomainDdl {
-  std::string name;
+  QualifiedName name;
   SqlType base;
 };
 struct CreateTypeDdl {
-  std::string name;
+  QualifiedName name;
 };
 struct CreateSequenceDdl {
-  std::string name;
+  QualifiedName name;
   bool if_not_exists{false};
 };
 // DROP DOMAIN (`domain`) or DROP TYPE, which drops a domain too.
 struct DropTypeDdl {
-  std::string name;
+  QualifiedName name;
   bool domain{false};
   bool if_exists{false};
 };
 struct DropSequenceDdl {
-  std::string name;
+  QualifiedName name;
   bool if_exists{false};
 };
 struct GrantDdl {
@@ -654,7 +655,7 @@ struct GrantDdl {
   bool grant{true};
   bool grant_option{false};
   std::vector<Privilege> privileges;  // empty: ALL
-  std::vector<std::string> objects;
+  std::vector<QualifiedName> objects;
   std::vector<std::string> grantees;  // "" is PUBLIC
   std::optional<std::string> grantor;
   Target target{Target::Table};  // what ON names: a table or view, a sequence, a domain, a type
@@ -707,24 +708,24 @@ public:
   [[nodiscard]] auto version() const noexcept -> std::uint64_t { return version_; }
   [[nodiscard]] auto next_object_id() const noexcept -> std::uint64_t { return next_id_; }
   [[nodiscard]] auto tables() const -> const std::map<std::uint32_t, Table>& { return tables_; }
-  [[nodiscard]] auto table(std::string_view name) const -> const Table*;
+  [[nodiscard]] auto table(const QualifiedName& name) const -> const Table*;
   [[nodiscard]] auto table(std::uint32_t id) const -> const Table*;
   [[nodiscard]] auto views() const -> const std::map<std::uint32_t, View>& { return views_; }
-  [[nodiscard]] auto view(std::string_view name) const -> const View*;
+  [[nodiscard]] auto view(const QualifiedName& name) const -> const View*;
   [[nodiscard]] auto view(std::uint32_t id) const -> const View*;
   [[nodiscard]] auto procedures() const -> const std::map<std::uint32_t, Procedure>& { return procedures_; }
-  [[nodiscard]] auto procedure(std::string_view name) const -> const Procedure*;
+  [[nodiscard]] auto procedure(const QualifiedName& name) const -> const Procedure*;
   [[nodiscard]] auto types() const -> const std::map<std::uint32_t, TypeObject>& { return types_; }
-  [[nodiscard]] auto type(std::string_view name) const -> const TypeObject*;
+  [[nodiscard]] auto type(const QualifiedName& name) const -> const TypeObject*;
   [[nodiscard]] auto sequences() const -> const std::map<std::uint32_t, Sequence>& { return sequences_; }
-  [[nodiscard]] auto sequence(std::string_view name) const -> const Sequence*;
+  [[nodiscard]] auto sequence(const QualifiedName& name) const -> const Sequence*;
   [[nodiscard]] auto roles() const -> const std::map<std::uint32_t, Role>& { return roles_; }
   [[nodiscard]] auto role(std::string_view name) const -> const Role*;
   // A table's or view's ACL, by its id: empty when nothing is granted on it.
   [[nodiscard]] auto acls() const -> const std::map<std::uint32_t, std::vector<AclEntry>>& { return acls_; }
   [[nodiscard]] auto acl(std::uint32_t object) const -> std::span<const AclEntry>;
   // An index by name, with its table.
-  [[nodiscard]] auto index(std::string_view name) const -> std::pair<const Table*, const Index*>;
+  [[nodiscard]] auto index(const QualifiedName& name) const -> std::pair<const Table*, const Index*>;
   // A table or an index: both draw ids from one counter.
   [[nodiscard]] auto key_layout(std::uint32_t table_or_index) const -> const KeyLayout*;
 
@@ -795,11 +796,13 @@ private:
   std::uint64_t version_{0};
   std::map<std::uint32_t, Table> tables_;
   std::map<std::uint32_t, View> views_;
-  std::map<std::string, std::uint32_t, std::less<>> names_;  // table, index or view name -> id
+  // The lookups by name are keyed by (schema, name); every object is in
+  // public until stage 1b gives records a schema.
+  std::map<QualifiedName, std::uint32_t> names_;  // table, index, view or sequence name -> id
   std::map<std::uint32_t, Procedure> procedures_;
-  std::map<std::string, std::uint32_t, std::less<>> procedure_names_;  // a namespace of their own
+  std::map<QualifiedName, std::uint32_t> procedure_names_;  // a namespace of their own
   std::map<std::uint32_t, TypeObject> types_;
-  std::map<std::string, std::uint32_t, std::less<>> type_names_;  // the type namespace: domains and shell types
+  std::map<QualifiedName, std::uint32_t> type_names_;  // the type namespace: domains and shell types
   std::map<std::uint32_t, Sequence> sequences_;                   // named in names_, the relation namespace
   std::map<std::uint32_t, Role> roles_;
   std::map<std::string, std::uint32_t, std::less<>> role_names_;  // a namespace of their own
@@ -2324,7 +2327,7 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
   for (const auto& e : snap.iter_from({}, names)) {
     if (!has_prefix(e.key, names)) break;
     auto name = as_string(e.key.subspan(names.size()));
-    auto it = cat.names_.find(name);
+    auto it = cat.names_.find(QualifiedName{kPublicSchema, name});
     auto kind = e.value.empty() ? 0 : std::to_integer<std::uint8_t>(e.value[0]);
     if (it == cat.names_.end() || e.value.size() != 5 || be_value(e.value.subspan(1)) != it->second ||
         kind != (cat.tables_.contains(it->second)      ? kKindTable
@@ -2340,14 +2343,17 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
   // shares a name with a table's or view's row type.
   for (const auto& [id, t] : cat.types_) {
     use(id);
-    if (cat.table(t.name) != nullptr || cat.view(t.name) != nullptr) corrupt("type " + t.name + " shares a relation's row type name");
+    // A type and the relations whose row type names it clash within the
+    // type's schema: public, the only one until stage 1b.
+    auto row_type = QualifiedName{kPublicSchema, t.name};
+    if (cat.table(row_type) != nullptr || cat.view(row_type) != nullptr) corrupt("type " + t.name + " shares a relation's row type name");
   }
   std::size_t type_entries = 0;
   auto type_names = Bytes{std::byte{kNsCatalog}, kSubTypeName};
   for (const auto& e : snap.iter_from({}, type_names)) {
     if (!has_prefix(e.key, type_names)) break;
     auto name = as_string(e.key.subspan(type_names.size()));
-    auto it = cat.type_names_.find(name);
+    auto it = cat.type_names_.find(QualifiedName{kPublicSchema, name});
     if (it == cat.type_names_.end() || e.value.size() != 5 || std::to_integer<std::uint8_t>(e.value[0]) != kKindType ||
         be_value(e.value.subspan(1)) != it->second) {
       corrupt("type name entry " + name + " does not match the records");
@@ -2361,7 +2367,7 @@ auto Catalog::load(const Snapshot& snap) -> Catalog {
   for (const auto& e : snap.iter_from({}, procedure_names)) {
     if (!has_prefix(e.key, procedure_names)) break;
     auto name = as_string(e.key.subspan(procedure_names.size()));
-    auto it = cat.procedure_names_.find(name);
+    auto it = cat.procedure_names_.find(QualifiedName{kPublicSchema, name});
     if (it == cat.procedure_names_.end() || e.value.size() != 5 ||
         std::to_integer<std::uint8_t>(e.value[0]) != kKindProcedure || be_value(e.value.subspan(1)) != it->second) {
       corrupt("procedure name entry " + name + " does not match the records");
@@ -2435,7 +2441,7 @@ void Catalog::rebuild_lookups() {
   names_.clear();
   procedure_names_.clear();
   for (const auto& [id, p] : procedures_) {
-    if (!procedure_names_.emplace(p.name, id).second) corrupt("procedure name " + p.name + " is used twice");
+    if (!procedure_names_.emplace(QualifiedName{kPublicSchema, p.name}, id).second) corrupt("procedure name " + p.name + " is used twice");
   }
   role_names_.clear();
   for (const auto& [id, r] : roles_) {
@@ -2443,29 +2449,23 @@ void Catalog::rebuild_lookups() {
   }
   type_names_.clear();
   for (const auto& [id, t] : types_) {
-    if (!type_names_.emplace(t.name, id).second) corrupt("type name " + t.name + " is used twice");
+    if (!type_names_.emplace(QualifiedName{kPublicSchema, t.name}, id).second) corrupt("type name " + t.name + " is used twice");
   }
   key_layouts_.clear();
-  auto name_taken = [&](const std::string& n) {
-    if (names_.contains(n)) corrupt("name " + n + " is used twice");
+  // Every record is of public until stage 1b gives records a schema; an
+  // index's name is in its table's.
+  auto name_taken = [&](const std::string& n, std::uint32_t id) {
+    if (!names_.emplace(QualifiedName{kPublicSchema, n}, id).second) corrupt("name " + n + " is used twice");
   };
-  for (const auto& [id, v] : views_) {
-    name_taken(v.name);
-    names_[v.name] = id;
-  }
-  for (const auto& [id, s] : sequences_) {
-    name_taken(s.name);
-    names_[s.name] = id;
-  }
+  for (const auto& [id, v] : views_) name_taken(v.name, id);
+  for (const auto& [id, s] : sequences_) name_taken(s.name, id);
   for (const auto& [id, t] : tables_) {
-    name_taken(t.name);
-    names_[t.name] = id;
+    name_taken(t.name, id);
     std::vector<KeyPart> pk_parts;
     for (auto cid : t.pk_col_ids) pk_parts.push_back(key_part(*t.column(cid)));
     key_layouts_[id] = KeyLayout{kNsRow, &t, nullptr, pk_parts, 0};
     for (const auto& ix : t.indexes) {
-      name_taken(ix.name);
-      names_[ix.name] = ix.id;
+      name_taken(ix.name, ix.id);
       KeyLayout kl{kNsIndex, &t, &ix, {}, ix.parts.size()};
       for (const auto& p : ix.parts) {
         const auto* c = t.column(p.col_id);
@@ -2494,7 +2494,7 @@ auto Catalog::estimated_bytes() const noexcept -> std::uint64_t {
   return out;
 }
 
-auto Catalog::table(std::string_view name) const -> const Table* {
+auto Catalog::table(const QualifiedName& name) const -> const Table* {
   auto it = names_.find(name);
   if (it == names_.end()) return nullptr;
   return table(it->second);
@@ -2505,7 +2505,7 @@ auto Catalog::table(std::uint32_t id) const -> const Table* {
   return it == tables_.end() ? nullptr : &it->second;
 }
 
-auto Catalog::view(std::string_view name) const -> const View* {
+auto Catalog::view(const QualifiedName& name) const -> const View* {
   auto it = names_.find(name);
   return it == names_.end() ? nullptr : view(it->second);
 }
@@ -2515,17 +2515,17 @@ auto Catalog::view(std::uint32_t id) const -> const View* {
   return it == views_.end() ? nullptr : &it->second;
 }
 
-auto Catalog::procedure(std::string_view name) const -> const Procedure* {
+auto Catalog::procedure(const QualifiedName& name) const -> const Procedure* {
   auto it = procedure_names_.find(name);
   return it == procedure_names_.end() ? nullptr : &procedures_.at(it->second);
 }
 
-auto Catalog::type(std::string_view name) const -> const TypeObject* {
+auto Catalog::type(const QualifiedName& name) const -> const TypeObject* {
   auto it = type_names_.find(name);
   return it == type_names_.end() ? nullptr : &types_.at(it->second);
 }
 
-auto Catalog::sequence(std::string_view name) const -> const Sequence* {
+auto Catalog::sequence(const QualifiedName& name) const -> const Sequence* {
   auto it = names_.find(name);
   if (it == names_.end()) return nullptr;
   auto s = sequences_.find(it->second);
@@ -2549,7 +2549,7 @@ auto Catalog::find_view_dependent(std::uint32_t id) const -> const View* {
   return nullptr;
 }
 
-auto Catalog::index(std::string_view name) const -> std::pair<const Table*, const Index*> {
+auto Catalog::index(const QualifiedName& name) const -> std::pair<const Table*, const Index*> {
   auto it = names_.find(name);
   if (it == names_.end()) return {nullptr, nullptr};
   const auto* kl = key_layout(it->second);
@@ -2593,6 +2593,30 @@ auto Catalog::constants(const Table& t) -> std::vector<PlanConstant> {
 
 // --------------------------------------------------------------------- DDL
 
+namespace {
+
+// Stage 1a of schemas: every object is in public, and no record names a
+// schema yet. A DDL naming another schema, which only the Catalog API can
+// build, is refused rather than written to public.
+void public_schema_only(const Ddl& ddl) {
+  auto check = [](const QualifiedName& n) {
+    if (n.schema != kPublicSchema) {
+      throw DdlRefused("schema of id " + std::to_string(n.schema) + " does not exist", kInvalidSchemaName);
+    }
+  };
+  std::visit(
+      [&](const auto& d) {
+        if constexpr (requires { d.name.schema; }) check(d.name);
+        if constexpr (requires { d.table.schema; }) check(d.table);
+        if constexpr (std::is_same_v<std::remove_cvref_t<decltype(d)>, GrantDdl>) {
+          for (const auto& o : d.objects) check(o);
+        }
+      },
+      ddl);
+}
+
+}  // namespace
+
 auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<DdlOp>& ops, bool& backfill,
                            std::size_t backfill_limit) const
     -> std::shared_ptr<const Catalog> {
@@ -2604,26 +2628,27 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
     next->rebuild_lookups();
     return std::shared_ptr<const Catalog>{std::move(next)};
   };
-  auto name_free = [&](const std::string& name) {
-    if (names_.contains(name)) throw DdlRefused("relation \"" + name + "\" already exists", kDuplicateTable);
+  public_schema_only(ddl);
+  auto name_free = [&](const QualifiedName& name) {
+    if (names_.contains(name)) throw DdlRefused("relation \"" + name.name + "\" already exists", kDuplicateTable);
   };
   // A table's or view's row type, a domain and a shell type share one namespace.
-  auto type_free = [&](const std::string& name) {
-    if (type_names_.contains(name)) throw DdlRefused("type \"" + name + "\" already exists", kDuplicateObject);
+  auto type_free = [&](const QualifiedName& name) {
+    if (type_names_.contains(name)) throw DdlRefused("type \"" + name.name + "\" already exists", kDuplicateObject);
   };
-  auto find_table = [&](const std::string& name) -> const Table& {
+  auto find_table = [&](const QualifiedName& name) -> const Table& {
     const auto* t = table(name);
-    if (t == nullptr && view(name) != nullptr) throw DdlRefused("\"" + name + "\" is not a table", kWrongObjectType);
-    if (t == nullptr) throw DdlRefused("relation \"" + std::string{name} + "\" does not exist", kUndefinedTable);
+    if (t == nullptr && view(name) != nullptr) throw DdlRefused("\"" + name.name + "\" is not a table", kWrongObjectType);
+    if (t == nullptr) throw DdlRefused("relation \"" + name.name + "\" does not exist", kUndefinedTable);
     return *t;
   };
   backfill = false;
 
   if (const auto* ct = std::get_if<CreateTableDdl>(&ddl)) {
-    auto name = std::string{ct->name};
+    auto name = ct->name.name;
     // IF NOT EXISTS: a name taken now changes nothing. One the binder found
     // taken, and a DDL since has freed, is a conflict with that DDL.
-    if (ct->if_not_exists && names_.contains(name)) return nullptr;
+    if (ct->if_not_exists && names_.contains(ct->name)) return nullptr;
     if (ct->if_not_exists && ct->columns.empty()) throw DdlInProgress{};
     // PostgreSQL's order: the statement's own columns and key parts are
     // refused before a name already taken (42701, 42703 over 42P07); a table
@@ -2666,8 +2691,8 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
       }
       unique.push_back(u);
     }
-    name_free(name);
-    type_free(name);
+    name_free(ct->name);
+    type_free(ct->name);
     if (ct->columns.empty()) throw DdlRefused("a table needs columns", kFeatureNotSupported);
     Table t;
     t.name = name;
@@ -2700,7 +2725,8 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
     // Each a unique index, named in order: as written, or as PostgreSQL
     // chooses, past every relation name and the ones before it.
     auto taken = [&](const std::string& n) {
-      return names_.contains(n) || n == t.name || std::ranges::contains(t.indexes, n, &Index::name);
+      return names_.contains(QualifiedName{ct->name.schema, n}) || n == t.name ||
+             std::ranges::contains(t.indexes, n, &Index::name);
     };
     for (const auto& u : unique) {
       Index ix;
@@ -2766,7 +2792,7 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
 
   if (const auto* ci = std::get_if<CreateIndexDdl>(&ddl)) {
     auto name = std::string{ci->name};
-    name_free(name);
+    name_free(QualifiedName{ci->table.schema, name});  // an index is in its table's schema
     auto t = find_table(ci->table);
     if (ci->columns.empty()) throw DdlRefused("an index needs columns");
     Index ix;
@@ -2815,11 +2841,11 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
   if (const auto* dt = std::get_if<DropTableDdl>(&ddl)) {
     const auto* found = table(dt->name);
     if (found == nullptr) {
-      if (view(dt->name) != nullptr) throw DdlRefused("\"" + std::string{dt->name} + "\" is not a table", kWrongObjectType);
-      if (index(dt->name).first != nullptr) throw DdlRefused("\"" + std::string{dt->name} + "\" is an index", kWrongObjectType);
-      if (sequence(dt->name) != nullptr) throw DdlRefused("\"" + std::string{dt->name} + "\" is not a table", kWrongObjectType);
+      if (view(dt->name) != nullptr) throw DdlRefused("\"" + dt->name.name + "\" is not a table", kWrongObjectType);
+      if (index(dt->name).first != nullptr) throw DdlRefused("\"" + dt->name.name + "\" is an index", kWrongObjectType);
+      if (sequence(dt->name) != nullptr) throw DdlRefused("\"" + dt->name.name + "\" is not a table", kWrongObjectType);
       if (dt->if_exists) return nullptr;
-      throw DdlRefused("table \"" + std::string{dt->name} + "\" does not exist", kUndefinedTable);
+      throw DdlRefused("table \"" + dt->name.name + "\" does not exist", kUndefinedTable);
     }
     const auto& t = *found;
     if (const auto* dependent = find_view_dependent(t.id)) {
@@ -2846,17 +2872,17 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
     auto [owner, found] = index(di->name);
     if (found == nullptr) {
       if (table(di->name) != nullptr || view(di->name) != nullptr || sequence(di->name) != nullptr) {
-        throw DdlRefused("\"" + std::string{di->name} + "\" is not an index", kWrongObjectType);
+        throw DdlRefused("\"" + di->name.name + "\" is not an index", kWrongObjectType);
       }
       if (di->if_exists) return nullptr;
-      throw DdlRefused("index \"" + std::string{di->name} + "\" does not exist", kUndefinedObject);
+      throw DdlRefused("index \"" + di->name.name + "\" does not exist", kUndefinedObject);
     }
     auto t = *owner;
     auto id = found->id;
     std::erase_if(t.indexes, [&](const Index& ix) { return ix.id == id; });
     ++t.version;
     put_op(ops, DdlOp::Kind::Put, table_record_key(t.id), serialize_table(t));
-    put_op(ops, DdlOp::Kind::Del, name_entry_key(std::string{di->name}));
+    put_op(ops, DdlOp::Kind::Del, name_entry_key(di->name.name));
     auto p = index_prefix(id);
     put_op(ops, DdlOp::Kind::DelRange, p, key_successor(p));
     next->put_table(std::move(t));
@@ -2866,12 +2892,12 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
   if (const auto* cv = std::get_if<CreateViewDdl>(&ddl)) {
     name_free(cv->name);
     type_free(cv->name);
-    View v{0, cv->name, cv->definition, cv->depends_on, cv->columns};
+    View v{0, cv->name.name, cv->definition, cv->depends_on, cv->columns};
     std::ranges::sort(v.depends_on);
     v.depends_on.erase(std::unique(v.depends_on.begin(), v.depends_on.end()), v.depends_on.end());
     for (auto dep : v.depends_on) {
       if (table(dep) == nullptr && view(dep) == nullptr) {
-        throw DdlRefused("a relation view \"" + cv->name + "\" reads does not exist", kUndefinedTable);
+        throw DdlRefused("a relation view \"" + v.name + "\" reads does not exist", kUndefinedTable);
       }
     }
     v.id = reserve_ids(next->next_id_, 1);
@@ -2886,10 +2912,10 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
     const auto* found = view(dv->name);
     if (found == nullptr) {
       if (table(dv->name) != nullptr || index(dv->name).first != nullptr || sequence(dv->name) != nullptr) {
-        throw DdlRefused("\"" + dv->name + "\" is not a view", kWrongObjectType);
+        throw DdlRefused("\"" + dv->name.name + "\" is not a view", kWrongObjectType);
       }
       if (dv->if_exists) return nullptr;
-      throw DdlRefused("view \"" + dv->name + "\" does not exist", kUndefinedTable);
+      throw DdlRefused("view \"" + dv->name.name + "\" does not exist", kUndefinedTable);
     }
     if (const auto* dependent = find_view_dependent(found->id)) {
       throw DdlRefused("cannot drop view " + found->name + " because other objects depend on it: view " +
@@ -2912,13 +2938,13 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
       }
       if (!sql_type_valid(a.type)) throw DdlRefused("argument " + a.name + " has an invalid type", kFeatureNotSupported);
     }
-    Procedure p{0, cp->name, cp->definition, cp->args};
+    Procedure p{0, cp->name.name, cp->definition, cp->args};
     if (const auto* existing = procedure(cp->name)) {
-      if (!cp->replace) throw DdlRefused("procedure \"" + cp->name + "\" already exists", kDuplicateFunction);
+      if (!cp->replace) throw DdlRefused("procedure \"" + p.name + "\" already exists", kDuplicateFunction);
       // PostgreSQL would overload, or refuse a renamed argument: one
       // procedure per name keeps neither (docs/procedures_design.md).
       if (existing->args != cp->args) {
-        throw DdlRefused("CREATE OR REPLACE PROCEDURE cannot change the arguments of procedure \"" + cp->name +
+        throw DdlRefused("CREATE OR REPLACE PROCEDURE cannot change the arguments of procedure \"" + p.name +
                              "\": drop it first",
                          kFeatureNotSupported);
       }
@@ -2946,7 +2972,7 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
     if (found != nullptr && dp->arg_types && !matches(true) && !matches(false)) found = nullptr;
     if (found == nullptr) {
       if (dp->if_exists) return nullptr;
-      throw DdlRefused("procedure " + dp->name + (dp->arg_types ? " with these argument types" : "") + " does not exist",
+      throw DdlRefused("procedure " + dp->name.name + (dp->arg_types ? " with these argument types" : "") + " does not exist",
                        kUndefinedFunction);
     }
     put_op(ops, DdlOp::Kind::Del, procedure_record_key(found->id));
@@ -2999,10 +3025,11 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
     // does: the domain takes its id, and so keeps what was granted on it.
     const auto* shell = type(cd->name);
     if ((shell != nullptr && shell->kind != TypeObject::Kind::Shell) || table(cd->name) != nullptr || view(cd->name) != nullptr) {
-      throw DdlRefused("type \"" + cd->name + "\" already exists", kDuplicateObject);
+      throw DdlRefused("type \"" + cd->name.name + "\" already exists", kDuplicateObject);
     }
-    if (!sql_type_valid(cd->base)) throw DdlRefused("domain " + cd->name + " has an invalid type", kFeatureNotSupported);
-    TypeObject t{shell != nullptr ? shell->id : reserve_ids(next->next_id_, 1), cd->name, TypeObject::Kind::Domain, cd->base};
+    if (!sql_type_valid(cd->base)) throw DdlRefused("domain " + cd->name.name + " has an invalid type", kFeatureNotSupported);
+    TypeObject t{shell != nullptr ? shell->id : reserve_ids(next->next_id_, 1), cd->name.name, TypeObject::Kind::Domain,
+                 cd->base};
     if (shell == nullptr) {
       put_op(ops, DdlOp::Kind::EnsureAbsent, type_name_key(t.name));
       put_op(ops, DdlOp::Kind::Put, type_name_key(t.name), name_value(kKindType, t.id));
@@ -3014,9 +3041,9 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
 
   if (const auto* cty = std::get_if<CreateTypeDdl>(&ddl)) {
     if (type(cty->name) != nullptr || table(cty->name) != nullptr || view(cty->name) != nullptr) {
-      throw DdlRefused("type \"" + cty->name + "\" already exists", kDuplicateObject);
+      throw DdlRefused("type \"" + cty->name.name + "\" already exists", kDuplicateObject);
     }
-    TypeObject t{reserve_ids(next->next_id_, 1), cty->name, TypeObject::Kind::Shell, {}};
+    TypeObject t{reserve_ids(next->next_id_, 1), cty->name.name, TypeObject::Kind::Shell, {}};
     put_op(ops, DdlOp::Kind::EnsureAbsent, type_name_key(t.name));
     put_op(ops, DdlOp::Kind::Put, type_name_key(t.name), name_value(kKindType, t.id));
     put_op(ops, DdlOp::Kind::Put, type_record_key(t.id), serialize_type(t));
@@ -3027,9 +3054,9 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
   if (const auto* cs = std::get_if<CreateSequenceDdl>(&ddl)) {
     if (names_.contains(cs->name)) {
       if (cs->if_not_exists) return nullptr;
-      throw DdlRefused("relation \"" + cs->name + "\" already exists", kDuplicateTable);
+      throw DdlRefused("relation \"" + cs->name.name + "\" already exists", kDuplicateTable);
     }
-    Sequence s{reserve_ids(next->next_id_, 1), cs->name};
+    Sequence s{reserve_ids(next->next_id_, 1), cs->name.name};
     put_op(ops, DdlOp::Kind::EnsureAbsent, name_entry_key(s.name));
     put_op(ops, DdlOp::Kind::Put, name_entry_key(s.name), name_value(kKindSequence, s.id));
     put_op(ops, DdlOp::Kind::Put, sequence_record_key(s.id), serialize_sequence(s));
@@ -3041,15 +3068,15 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
     const auto* found = type(dty->name);
     if (found == nullptr) {
       if (table(dty->name) != nullptr || view(dty->name) != nullptr) {
-        if (dty->domain) throw DdlRefused("\"" + dty->name + "\" is not a domain", kWrongObjectType);
-        throw DdlRefused("cannot drop type " + dty->name + " because table or view " + dty->name + " requires it",
+        if (dty->domain) throw DdlRefused("\"" + dty->name.name + "\" is not a domain", kWrongObjectType);
+        throw DdlRefused("cannot drop type " + dty->name.name + " because table or view " + dty->name.name + " requires it",
                          kDependentObjectsStillExist);
       }
       if (dty->if_exists) return nullptr;
-      throw DdlRefused("type \"" + dty->name + "\" does not exist", kUndefinedObject);
+      throw DdlRefused("type \"" + dty->name.name + "\" does not exist", kUndefinedObject);
     }
     if (dty->domain && found->kind != TypeObject::Kind::Domain) {
-      throw DdlRefused("\"" + dty->name + "\" is not a domain", kWrongObjectType);
+      throw DdlRefused("\"" + dty->name.name + "\" is not a domain", kWrongObjectType);
     }
     put_op(ops, DdlOp::Kind::Del, type_record_key(found->id));
     put_op(ops, DdlOp::Kind::Del, type_name_key(found->name));
@@ -3062,9 +3089,9 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
   if (const auto* ds = std::get_if<DropSequenceDdl>(&ddl)) {
     const auto* found = sequence(ds->name);
     if (found == nullptr) {
-      if (names_.contains(ds->name)) throw DdlRefused("\"" + ds->name + "\" is not a sequence", kWrongObjectType);
+      if (names_.contains(ds->name)) throw DdlRefused("\"" + ds->name.name + "\" is not a sequence", kWrongObjectType);
       if (ds->if_exists) return nullptr;
-      throw DdlRefused("sequence \"" + ds->name + "\" does not exist", kUndefinedTable);
+      throw DdlRefused("sequence \"" + ds->name.name + "\" does not exist", kUndefinedTable);
     }
     put_op(ops, DdlOp::Kind::Del, sequence_record_key(found->id));
     put_op(ops, DdlOp::Kind::Del, name_entry_key(found->name));
@@ -3078,16 +3105,17 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
     using Target = GrantDdl::Target;
     // The objects, of the kind ON names, in PostgreSQL's words when one is not.
     std::vector<std::uint32_t> objects;
-    for (const auto& name : g->objects) {
+    for (const auto& object : g->objects) {
+      const auto& name = object.name;
       switch (g->target) {
         case Target::Table:
-          if (const auto* t = table(name)) {
+          if (const auto* t = table(object)) {
             objects.push_back(t->id);
-          } else if (const auto* v = view(name)) {
+          } else if (const auto* v = view(object)) {
             objects.push_back(v->id);
-          } else if (index(name).first != nullptr) {
+          } else if (index(object).first != nullptr) {
             throw DdlRefused("\"" + name + "\" is an index", kWrongObjectType);
-          } else if (sequence(name) != nullptr) {
+          } else if (sequence(object) != nullptr) {
             throw DdlRefused("GRANT ON TABLE of sequence \"" + name + "\" is not supported: grant ON SEQUENCE",
                              kFeatureNotSupported);
           } else {
@@ -3095,9 +3123,9 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
           }
           break;
         case Target::Sequence:
-          if (const auto* s = sequence(name)) {
+          if (const auto* s = sequence(object)) {
             objects.push_back(s->id);
-          } else if (names_.contains(name)) {
+          } else if (names_.contains(object)) {
             throw DdlRefused("\"" + name + "\" is not a sequence", kWrongObjectType);
           } else {
             throw DdlRefused("relation \"" + name + "\" does not exist", kUndefinedTable);
@@ -3105,13 +3133,13 @@ auto Catalog::next_version(const Ddl& ddl, const RowSource& rows, std::vector<Dd
           break;
         case Target::Domain:
         case Target::Type:
-          if (const auto* ty = type(name); ty != nullptr && ty->kind == TypeObject::Kind::Shell) {
+          if (const auto* ty = type(object); ty != nullptr && ty->kind == TypeObject::Kind::Shell) {
             throw DdlRefused("type \"" + name + "\" is only a shell", kUndefinedObject);  // nothing may use one
           } else if (ty != nullptr) {
             objects.push_back(ty->id);
-          } else if (g->target == Target::Domain && (table(name) != nullptr || view(name) != nullptr)) {
+          } else if (g->target == Target::Domain && (table(object) != nullptr || view(object) != nullptr)) {
             throw DdlRefused("\"" + name + "\" is not a domain", kWrongObjectType);
-          } else if (table(name) != nullptr || view(name) != nullptr) {
+          } else if (table(object) != nullptr || view(object) != nullptr) {
             throw DdlRefused("GRANT ON TYPE of a table's or view's row type is not supported", kFeatureNotSupported);
           } else {
             throw DdlRefused("type \"" + name + "\" does not exist", kUndefinedObject);

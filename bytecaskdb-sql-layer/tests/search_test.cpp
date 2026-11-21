@@ -103,7 +103,7 @@ auto plan_sql(const Catalog& cat, std::string_view sql, std::map<std::string, st
 
 TEST_CASE("search: a Filter over a Filter is merged by the rewrites, and only then planned", "[sql][search]") {
   sql_test::Fixture f;
-  const auto& t = *f.cat().table("t");
+  const auto& t = *f.cat().table({kPublicSchema, "t"});
   auto two = [&] {
     auto inner = filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0))});
     return project(filter(std::move(inner), {logical::compare(Op::Eq, col(t, "qty"), p(1))}), {col(t, "id")});
@@ -134,10 +134,10 @@ TEST_CASE("search: a Filter over a Filter is merged by the rewrites, and only th
 
 TEST_CASE("search: a shape it does not plan is refused with no plan, never a variant exception", "[sql][search]") {
   sql_test::Fixture f;
-  f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"}, {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
                        {"k"}});
-  const auto& t = *f.cat().table("t");
-  const auto& u = *f.cat().table("u");
+  const auto& t = *f.cat().table({kPublicSchema, "t"});
+  const auto& u = *f.cat().table({kPublicSchema, "u"});
 
   // A conjunct that reads no column stays above the Join pushdown moved the
   // others from.
@@ -188,7 +188,7 @@ TEST_CASE("search: a shape it does not plan is refused with no plan, never a var
 TEST_CASE("rewrite: a conjunct always false makes the input empty, planned as no rows and no reads",
           "[sql][search]") {
   sql_test::Fixture f;
-  const auto& t = *f.cat().table("t");
+  const auto& t = *f.cat().table({kPublicSchema, "t"});
   auto never = [] { return logical::compare(Op::Eq, decimal(1, 0), decimal(2, 0)); };
 
   auto root = project(filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0)), never()}), {col(t, "id")});
@@ -214,9 +214,9 @@ TEST_CASE("rewrite: a conjunct always false makes the input empty, planned as no
   CHECK(!has(del, "bc_delete"));
 
   // A join with an empty side is empty.
-  f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("k", PhysType::I64, false)}, {"k"}});
-  const auto& t2 = *f.cat().table("t");
-  const auto& u = *f.cat().table("u");
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"}, {sql_test::Fixture::col("k", PhysType::I64, false)}, {"k"}});
+  const auto& t2 = *f.cat().table({kPublicSchema, "t"});
+  const auto& u = *f.cat().table({kPublicSchema, "u"});
   auto pair = logical::node(logical::Join{filter(get(t2), {never()}), get(u), {}});
   auto joined = generate(f.cat(), project(std::move(pair), {col(u, "k")}), 0);
   CHECK(joined.objects_read.empty());
@@ -224,7 +224,7 @@ TEST_CASE("rewrite: a conjunct always false makes the input empty, planned as no
 
 TEST_CASE("rewrite: folding compares constants by their SQL type", "[sql][search]") {
   sql_test::Fixture f;
-  const auto& t = *f.cat().table("t");
+  const auto& t = *f.cat().table({kPublicSchema, "t"});
   // The conjuncts left on t's Filter after the rewrites, beside id = $1.
   auto folded = [&](Expr c) -> logical::NodePtr {
     auto root = project(filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0)), std::move(c)}), {col(t, "id")});
@@ -259,7 +259,7 @@ TEST_CASE("rewrite: folding compares constants by their SQL type", "[sql][search
 
 TEST_CASE("rewrite: TRUE and FALSE fold out of AND, OR and NOT", "[sql][search]") {
   sql_test::Fixture f;
-  const auto& t = *f.cat().table("t");
+  const auto& t = *f.cat().table({kPublicSchema, "t"});
   auto b = [](bool v) { return logical::constant(v ? 1 : 0, SqlType{SqlKind::Boolean}); };
   auto id = [&] { return logical::compare(Op::Eq, col(t, "id"), p(0)); };
   auto of = [](Expr::Kind k, std::vector<Expr> args) { return logical::predicate_of(k, std::move(args)); };
@@ -304,13 +304,13 @@ TEST_CASE("rewrite: TRUE and FALSE fold out of AND, OR and NOT", "[sql][search]"
 
 TEST_CASE("search: only an equality conjunct of a join keys the inner side", "[sql][search]") {
   sql_test::Fixture f;
-  f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"}, {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
                        {"k"}});
   // w's key is an INTEGER, its part 4 bytes (below).
-  f.ddl(CreateTableDdl{"w", {ColumnSpec{"k", {SqlKind::Integer}, false, {}}, sql_test::Fixture::col("v", PhysType::I64, true)},
+  f.ddl(CreateTableDdl{{kPublicSchema, "w"}, {ColumnSpec{"k", {SqlKind::Integer}, false, {}}, sql_test::Fixture::col("v", PhysType::I64, true)},
                        {"k"}});
-  const auto& t = *f.cat().table("t");
-  const auto& u = *f.cat().table("u");
+  const auto& t = *f.cat().table({kPublicSchema, "t"});
+  const auto& u = *f.cat().table({kPublicSchema, "u"});
   auto join = [&](std::vector<Expr> on) {
     auto outer = filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0))});
     return project(logical::node(logical::Join{std::move(outer), get(u), std::move(on)}), {col(u, "v")});
@@ -334,7 +334,7 @@ TEST_CASE("search: only an equality conjunct of a join keys the inner side", "[s
   // An INTEGER key's 4-byte part cannot hold every BIGINT: w.k = t.qty is
   // no key of w (keyable) but a filter of its rows, so a t.qty past INTEGER
   // matches nothing rather than fail the statement.
-  const auto& w = *f.cat().table("w");
+  const auto& w = *f.cat().table({kPublicSchema, "w"});
   auto outer = filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0))});
   auto wide = generate(f.cat(),
                        project(logical::node(logical::Join{std::move(outer), get(w),
@@ -347,9 +347,9 @@ TEST_CASE("search: only an equality conjunct of a join keys the inner side", "[s
 
 TEST_CASE("rewrite: an input folded to Empty empties the Filter above it; Filters over a Join merge", "[sql][search]") {
   sql_test::Fixture f;
-  f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("k", PhysType::I64, false)}, {"k"}});
-  const auto& t = *f.cat().table("t");
-  const auto& u = *f.cat().table("u");
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"}, {sql_test::Fixture::col("k", PhysType::I64, false)}, {"k"}});
+  const auto& t = *f.cat().table({kPublicSchema, "t"});
+  const auto& u = *f.cat().table({kPublicSchema, "u"});
   auto never = logical::compare(Op::Eq, decimal(1, 0), decimal(2, 0));
   auto root = project(filter(filter(get(t), {std::move(never)}), {logical::compare(Op::Eq, col(t, "id"), p(0))}),
                       {col(t, "id")});
@@ -370,13 +370,13 @@ TEST_CASE("rewrite: an input folded to Empty empties the Filter above it; Filter
 TEST_CASE("search: costs choose the join order, from the tables' counts", "[sql][search][cost]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"a", {Fixture::col("k", PhysType::I64, false), Fixture::col("x", PhysType::I64, true)}, {"k"}});
-  f.ddl(CreateIndexDdl{"a_x", "a", {{"x"}}});
-  f.ddl(CreateTableDdl{"b", {Fixture::col("k", PhysType::I64, false), Fixture::col("y", PhysType::I64, true)}, {"k"}});
-  f.ddl(CreateIndexDdl{"b_y", "b", {{"y"}}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "a"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("x", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateIndexDdl{"a_x", {kPublicSchema, "a"}, {{"x"}}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "b"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("y", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateIndexDdl{"b_y", {kPublicSchema, "b"}, {{"y"}}});
   const auto& cat = f.cat();
-  const auto a_x = std::to_string(cat.table("a")->indexes[0].id);
-  const auto b_y = std::to_string(cat.table("b")->indexes[0].id);
+  const auto a_x = std::to_string(cat.table({kPublicSchema, "a"})->indexes[0].id);
+  const auto b_y = std::to_string(cat.table({kPublicSchema, "b"})->indexes[0].id);
   // Either table is reached by its index, and either keys the other by k.
   const std::string sql = "SELECT a.k FROM a, b WHERE x = $1 AND y = $2 AND a.k = b.k";
   auto scans = [](const GeneratedPlan& g, const std::string& index) {
@@ -404,7 +404,7 @@ TEST_CASE("search: costs choose the join order, from the tables' counts", "[sql]
 TEST_CASE("search: a table keyed by parameters alone is read once, before the other table's scan",
           "[sql][search][cost]") {
   sql_test::Fixture f;
-  f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"}, {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
                        {"k"}});
   const auto& cat = f.cat();
   const std::string sql = "SELECT v FROM u, t WHERE k = $1 AND name = $2";
@@ -442,15 +442,15 @@ TEST_CASE("search: a table read once is filtered by the join's conjuncts, which 
           "[sql][search][cost]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"u",
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"},
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true),
                         Fixture::col("dv", PhysType::F64, true)},
                        {"k"}});
-  f.ddl(CreateTableDdl{"w",
+  f.ddl(CreateTableDdl{{kPublicSchema, "w"},
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
                         Fixture::col("d", PhysType::F64, true)},
                        {"k"}});
-  f.ddl(CreateIndexDdl{"w_a", "w", {{"a"}}});
+  f.ddl(CreateIndexDdl{"w_a", {kPublicSchema, "w"}, {{"a"}}});
   const auto& cat = f.cat();
   // u by its point lookup, then t's 100 entries under name, each row fetched
   // for the join's conjunct: 1 + 200, and 1 x 100 x 1/10 rows. Under LIMIT 5
@@ -479,13 +479,13 @@ TEST_CASE("search: every join order is planned, a filter on a DOUBLE in any of t
           "[sql][search]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"a",
+  f.ddl(CreateTableDdl{{kPublicSchema, "a"},
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("x", PhysType::I64, true),
                         Fixture::col("z", PhysType::I64, true)},
                        {"k"}});
-  f.ddl(CreateIndexDdl{"a_xz", "a", {{"x"}, {"z"}}});
-  f.ddl(CreateTableDdl{"b", {Fixture::col("k", PhysType::I64, false), Fixture::col("y", PhysType::I64, true)}, {"k"}});
-  f.ddl(CreateIndexDdl{"b_y", "b", {{"y"}}});
+  f.ddl(CreateIndexDdl{"a_xz", {kPublicSchema, "a"}, {{"x"}, {"z"}}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "b"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("y", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateIndexDdl{"b_y", {kPublicSchema, "b"}, {{"y"}}});
   auto refused = [&](std::string_view sql) -> std::string {
     try {
       (void)plan_sql(f.cat(), sql);
@@ -501,15 +501,15 @@ TEST_CASE("search: every join order is planned, a filter on a DOUBLE in any of t
   CHECK(refused("SELECT a.k FROM a, b WHERE b.y = $1 AND b.k = a.z AND a.x = $2 ORDER BY a.k") == "accepted");
   // A filter on a DOUBLE in every plan of both tables: d probed by a.z, the
   // filter on its row.
-  f.ddl(CreateTableDdl{"d", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::F64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "d"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::F64, true)}, {"k"}});
   CHECK(refused("SELECT a.k FROM a, d WHERE a.x = $1 AND d.k = a.z AND d.v < $2") == "accepted");
   // e's index takes the DOUBLE bound, and its full scan leaves it a filter:
   // both are planned.
-  f.ddl(CreateTableDdl{"e",
+  f.ddl(CreateTableDdl{{kPublicSchema, "e"},
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::F64, true),
                         Fixture::col("y", PhysType::I64, true)},
                        {"k"}});
-  f.ddl(CreateIndexDdl{"e_v", "e", {{"v"}}});
+  f.ddl(CreateIndexDdl{"e_v", {kPublicSchema, "e"}, {{"v"}}});
   CHECK(refused("SELECT a.k FROM a, e WHERE a.x = $1 AND e.v < $2 AND e.y = a.z") == "accepted");
   // A join of two scans sorted by both tables' columns: a sorter per table.
   CHECK(refused("SELECT a.k FROM a, b WHERE a.x = $1 AND b.y = $2 AND a.z = b.y ORDER BY b.k, a.k") == "accepted");
@@ -519,11 +519,11 @@ TEST_CASE("search: a join of two loops is sorted by a sorter per loop, read in s
           "[sql][search][cost][hash]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"p",
+  f.ddl(CreateTableDdl{{kPublicSchema, "p"},
                        {Fixture::col("a", PhysType::I64, false), Fixture::col("v", PhysType::I64, true),
                         Fixture::col("w", PhysType::I64, false)},
                        {"a"}});
-  f.ddl(CreateIndexDdl{"p_w", "p", {{"w"}}});
+  f.ddl(CreateIndexDdl{"p_w", {kPublicSchema, "p"}, {{"w"}}});
   const auto& cat = f.cat();
   // No equality between the sides, and neither named by its whole key: a
   // nested loop of two scans, t's under the name and p's under w. Sorted by
@@ -586,14 +586,14 @@ TEST_CASE("search: a plan in the ORDER BY's order is kept, and compared with a c
           "[sql][search][cost]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"o",
+  f.ddl(CreateTableDdl{{kPublicSchema, "o"},
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, false),
                         Fixture::col("b", PhysType::I64, false), Fixture::col("c", PhysType::I64, false)},
                        {"k"}});
-  f.ddl(CreateIndexDdl{"o_ab", "o", {{"a"}, {"b"}}});
-  f.ddl(CreateIndexDdl{"o_ac", "o", {{"a"}, {"c"}}});
+  f.ddl(CreateIndexDdl{"o_ab", {kPublicSchema, "o"}, {{"a"}, {"b"}}});
+  f.ddl(CreateIndexDdl{"o_ac", {kPublicSchema, "o"}, {{"a"}, {"c"}}});
   const auto& cat = f.cat();
-  const auto& o = *cat.table("o");
+  const auto& o = *cat.table({kPublicSchema, "o"});
   const auto ab = "IDX_" + std::to_string(o.indexes[0].id);
   const auto ac = "IDX_" + std::to_string(o.indexes[1].id);
   // Without an order, the longer prefix: o_ab, two parts compared.
@@ -635,11 +635,11 @@ TEST_CASE("search: a plan in the ORDER BY's order is kept, and compared with a c
 TEST_CASE("search: no index gives an ORDER BY expression's order: the plan sorts by its value", "[sql][search][cost]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"o",
+  f.ddl(CreateTableDdl{{kPublicSchema, "o"},
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, false),
                         Fixture::col("b", PhysType::I64, false)},
                        {"k"}});
-  f.ddl(CreateIndexDdl{"o_ab", "o", {{"a"}, {"b"}}});
+  f.ddl(CreateIndexDdl{"o_ab", {kPublicSchema, "o"}, {{"a"}, {"b"}}});
   const auto& cat = f.cat();
   // o_ab gives b's order under a = $1: no sort.
   CHECK_FALSE(has(plan_sql(cat, "SELECT k FROM o WHERE a = $1 ORDER BY b", {{"o", 10'000}}), "bc_sorter"));
@@ -656,10 +656,10 @@ TEST_CASE("search: a point lookup beats a unique index's one entry; a covering s
           "[sql][search][cost]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"w", {Fixture::col("k", PhysType::I64, false), Fixture::col("u", PhysType::I64, false),
+  f.ddl(CreateTableDdl{{kPublicSchema, "w"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("u", PhysType::I64, false),
                              Fixture::col("v", PhysType::I64, true)},
                        {"k"}});
-  f.ddl(CreateIndexDdl{"w_u", "w", {{"u"}}, true});
+  f.ddl(CreateIndexDdl{"w_u", {kPublicSchema, "w"}, {{"u"}}, true});
   const auto& cat = f.cat();
   auto both = plan_sql(cat, "SELECT v FROM w WHERE k = $1 AND u = $2", {{"w", 1000}});
   CHECK(has(both, "bc_get(cx, bc_key_params(cx, TBL_"));
@@ -678,12 +678,12 @@ TEST_CASE("search: search_all returns every plan it costed, cheapest first, the 
           "[sql][search][cost]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"o",
+  f.ddl(CreateTableDdl{{kPublicSchema, "o"},
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, false),
                         Fixture::col("b", PhysType::I64, false)},
                        {"k"}});
-  f.ddl(CreateIndexDdl{"o_a", "o", {{"a"}}});
-  f.ddl(CreateIndexDdl{"o_ab", "o", {{"a"}, {"b"}}});
+  f.ddl(CreateIndexDdl{"o_a", {kPublicSchema, "o"}, {{"a"}}});
+  f.ddl(CreateIndexDdl{"o_ab", {kPublicSchema, "o"}, {{"a"}, {"b"}}});
   const auto& cat = f.cat();
   auto all = [&](std::string_view sql) {
     auto b = bound::bind(ast::parse(sql), cat);
@@ -725,15 +725,15 @@ TEST_CASE("search: a choice point where two ranges of a table cross, its thresho
           "[sql][search][cost][choice]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"c",
+  f.ddl(CreateTableDdl{{kPublicSchema, "c"},
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
                         Fixture::col("b", PhysType::I64, true), Fixture::col("v", PhysType::I64, true)},
                        {"k"}});
-  f.ddl(CreateIndexDdl{"c_a", "c", {{"a"}}});
-  f.ddl(CreateIndexDdl{"c_b", "c", {{"b"}}});
+  f.ddl(CreateIndexDdl{"c_a", {kPublicSchema, "c"}, {{"a"}}});
+  f.ddl(CreateIndexDdl{"c_b", {kPublicSchema, "c"}, {{"b"}}});
   const auto& cat = f.cat();
-  const auto c_a = "IDX_" + std::to_string(cat.table("c")->indexes[0].id);
-  const auto c_b = "IDX_" + std::to_string(cat.table("c")->indexes[1].id);
+  const auto c_a = "IDX_" + std::to_string(cat.table({kPublicSchema, "c"})->indexes[0].id);
+  const auto c_b = "IDX_" + std::to_string(cat.table({kPublicSchema, "c"})->indexes[1].id);
   const std::string sql = "SELECT v FROM c WHERE a = $1 AND b = $2";
 
   // 10,000 rows: each index reaches 1,000 entries and fetches each row,
@@ -763,19 +763,19 @@ TEST_CASE("search: a choice point where two ranges of a table cross, its thresho
 TEST_CASE("search: no choice point where the costs can't cross within the count's range", "[sql][search][cost][choice]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"c",
+  f.ddl(CreateTableDdl{{kPublicSchema, "c"},
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
                         Fixture::col("b", PhysType::I64, true), Fixture::col("v", PhysType::I64, true)},
                        {"k"}});
-  f.ddl(CreateIndexDdl{"c_a", "c", {{"a"}}});
-  f.ddl(CreateIndexDdl{"c_ab", "c", {{"a"}, {"b"}}});
-  f.ddl(CreateIndexDdl{"c_v", "c", {{"v"}}, true});
+  f.ddl(CreateIndexDdl{"c_a", {kPublicSchema, "c"}, {{"a"}}});
+  f.ddl(CreateIndexDdl{"c_ab", {kPublicSchema, "c"}, {{"a"}, {"b"}}});
+  f.ddl(CreateIndexDdl{"c_v", {kPublicSchema, "c"}, {{"v"}}, true});
   const auto& cat = f.cat();
   const std::map<std::string, std::uint64_t> rows{{"c", 10'000}};
   // c_ab's range lies inside c_a's: however many entries it holds, c_a's
   // holds at least as many.
   auto inside = plan_sql(cat, "SELECT v FROM c WHERE a = $1 AND b = $2", rows);
-  CHECK(has(inside, "bc_key_params(cx, IDX_" + std::to_string(cat.table("c")->indexes[1].id) + ", 0, 2)"));
+  CHECK(has(inside, "bc_key_params(cx, IDX_" + std::to_string(cat.table({kPublicSchema, "c"})->indexes[1].id) + ", 0, 2)"));
   CHECK(threshold(inside) == -1);
   // Under LIMIT 1, the first entry ends either scan: neither cost grows
   // with the count.
@@ -791,13 +791,13 @@ TEST_CASE("search: a choice point at a loop a sorter holds reads rows in both pl
           "[sql][search][cost][choice]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"p",
+  f.ddl(CreateTableDdl{{kPublicSchema, "p"},
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true),
                         Fixture::col("w", PhysType::I64, false)},
                        {"k"}});
-  f.ddl(CreateIndexDdl{"p_w", "p", {{"w"}}});
+  f.ddl(CreateIndexDdl{"p_w", {kPublicSchema, "p"}, {{"w"}}});
   const auto& cat = f.cat();
-  const auto p_w = "IDX_" + std::to_string(cat.table("p")->indexes[0].id);
+  const auto p_w = "IDX_" + std::to_string(cat.table({kPublicSchema, "p"})->indexes[0].id);
   // No equality between the sides: t by its key, then p by p_w's range or
   // its primary key's, a choice point between them. p_w holds w and k, all
   // p's columns the statement reads, so it could cover. Read above the sort,
@@ -832,15 +832,15 @@ TEST_CASE("search: a sort holds only the rows read above it; another loop's acce
           "[sql][search][cost]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"p",
+  f.ddl(CreateTableDdl{{kPublicSchema, "p"},
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
                         Fixture::col("v", PhysType::I64, true), Fixture::col("w", PhysType::I64, false)},
                        {"k"}});
   // p_wva holds every column of p the statement reads but v, and does not
   // give ORDER BY p.a under w = $2.
-  f.ddl(CreateIndexDdl{"p_wva", "p", {{"w"}, {"v"}, {"a"}}});
+  f.ddl(CreateIndexDdl{"p_wva", {kPublicSchema, "p"}, {{"w"}, {"v"}, {"a"}}});
   const auto& cat = f.cat();
-  const auto p_wva = "IDX_" + std::to_string(cat.table("p")->indexes[0].id);
+  const auto p_wva = "IDX_" + std::to_string(cat.table({kPublicSchema, "p"})->indexes[0].id);
   const std::map<std::string, std::uint64_t> rows{{"t", 100}, {"p", 100}};
   // The shape of golden/sort_cross_join: a nested loop of two scans, sorted
   // by p's column, only t's read above the sort. One sorter, of t's rows; p
@@ -868,18 +868,18 @@ TEST_CASE("search: a hash join that sorts its probe side reads only that side's 
           "[sql][search][cost][hash]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"u",
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"},
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true),
                         Fixture::col("x", PhysType::I64, true)},
                        {"k"}});
   // u_xv covers u's k, v and x, and does not give ORDER BY u.k under x = $1.
-  f.ddl(CreateIndexDdl{"u_xv", "u", {{"x"}, {"v"}}});
-  f.ddl(CreateTableDdl{"s",
+  f.ddl(CreateIndexDdl{"u_xv", {kPublicSchema, "u"}, {{"x"}, {"v"}}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "s"},
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
                         Fixture::col("b", PhysType::I64, true)},
                        {"k"}});
   const auto& cat = f.cat();
-  const auto u_xv = "IDX_" + std::to_string(cat.table("u")->indexes[0].id);
+  const auto u_xv = "IDX_" + std::to_string(cat.table({kPublicSchema, "u"})->indexes[0].id);
   const std::map<std::string, std::uint64_t> rows{{"t", 100}, {"u", 10'000}};
   // ORDER BY u.k is all the probe side's: u is sorted before it probes,
   // decided before any loop is made to read rows. Its sorter holds u's row,
@@ -897,7 +897,7 @@ TEST_CASE("search: a hash join that sorts its probe side reads only that side's 
   auto two = plan_sql(cat, "SELECT s.k FROM s, u WHERE u.x = $1 AND u.v = s.a AND u.v = s.b ORDER BY u.k",
                       {{"s", 100}, {"u", 10'000}});
   CHECK(has(two, "bc_hash_open"));
-  const auto u_v = "bc_col_null(cx, row, COL_" + std::to_string(cat.table("u")->id) + "_1)";
+  const auto u_v = "bc_col_null(cx, row, COL_" + std::to_string(cat.table({kPublicSchema, "u"})->id) + "_1)";
   const auto first = two.source.find(u_v);
   REQUIRE(first != std::string::npos);
   CHECK(first < two.source.find("bc_sorter_add"));
@@ -907,12 +907,12 @@ TEST_CASE("search: a hash join that sorts its probe side reads only that side's 
 TEST_CASE("search: a table read once carries its choice point under the outer row", "[sql][search][cost][choice]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"c",
+  f.ddl(CreateTableDdl{{kPublicSchema, "c"},
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
                         Fixture::col("b", PhysType::I64, true), Fixture::col("x", PhysType::I64, true)},
                        {"k"}});
-  f.ddl(CreateIndexDdl{"c_a", "c", {{"a"}}});
-  f.ddl(CreateIndexDdl{"c_b", "c", {{"b"}}});
+  f.ddl(CreateIndexDdl{"c_a", {kPublicSchema, "c"}, {{"a"}}});
+  f.ddl(CreateIndexDdl{"c_b", {kPublicSchema, "c"}, {{"b"}}});
   const auto& cat = f.cat();
   // t by its key, then c read once by c_a or c_b, each row fetched for the
   // join's conjunct: 1 + 2 x 1,000, and the count.
@@ -950,7 +950,7 @@ TEST_CASE("search: a table no key reaches is hash joined, or read once per outer
           "[sql][search][cost][hash]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"u", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
   const auto& cat = f.cat();
   const std::string sql = "SELECT u.k FROM t, u WHERE t.name = $1 AND u.v = t.qty";
   // 10 rows of t, 1 under the name, fetched for qty; 100 of u. Reading u once
@@ -986,7 +986,7 @@ TEST_CASE("search: a table no key reaches is hash joined, or read once per outer
 TEST_CASE("search: a hash join builds on the side the counts make smaller", "[sql][search][cost][hash]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"u", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
   const auto& cat = f.cat();
   const std::string sql = "SELECT t.id, u.k FROM t, u WHERE u.v = t.qty";
   // Both tables read in full: the hash table holds the smaller one's rows,
@@ -1028,7 +1028,7 @@ TEST_CASE("search: a hash join builds on the side the counts make smaller", "[sq
 TEST_CASE("search: under LIMIT 0 a plan reads nothing", "[sql][search][hash]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"u", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
   const auto& cat = f.cat();
   // A hash join's build, a sort, a lookup, a count: none runs, and the
   // statement returns no row.
@@ -1052,7 +1052,7 @@ TEST_CASE("search: a hash build that may pass the memory budget is a choice poin
           "[sql][search][cost][hash][memory][choice]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"u", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
   const auto& cat = f.cat();
   const std::string sql = "SELECT u.k FROM t, u WHERE t.name = $1 AND u.v = t.qty";
   RowCounts counts = [](const Table& t) -> std::optional<std::uint64_t> { return t.name == "t" ? 40 : 100; };
@@ -1086,12 +1086,12 @@ TEST_CASE("search: a hash build that may pass the memory budget is a choice poin
 TEST_CASE("search: the planner uses the memory budget", "[sql][search][cost][memory]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"o",
+  f.ddl(CreateTableDdl{{kPublicSchema, "o"},
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, false),
                         Fixture::col("c", PhysType::I64, false)},
                        {"k"}});
-  f.ddl(CreateIndexDdl{"o_c", "o", {{"c"}}});
-  f.ddl(CreateIndexDdl{"o_a", "o", {{"a"}}});
+  f.ddl(CreateIndexDdl{"o_c", {kPublicSchema, "o"}, {{"c"}}});
+  f.ddl(CreateIndexDdl{"o_a", {kPublicSchema, "o"}, {{"a"}}});
   const auto& cat = f.cat();
   auto plan = [&](std::string_view sql, std::uint64_t rows, std::uint64_t budget) {
     RowCounts counts = [rows](const Table& t) -> std::optional<std::uint64_t> {
@@ -1143,14 +1143,14 @@ TEST_CASE("search: a sort of a whole table, compiled while it was small, is chos
           "[sql][search][cost][memory][choice]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"w",
+  f.ddl(CreateTableDdl{{kPublicSchema, "w"},
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("x", PhysType::I64, false),
                         Fixture::col("y", PhysType::I64, true)},
                        {"k"}});
-  f.ddl(CreateIndexDdl{"w_x", "w", {{"x"}}});
+  f.ddl(CreateIndexDdl{"w_x", {kPublicSchema, "w"}, {{"x"}}});
   const auto& cat = f.cat();
-  const auto table = "TBL_" + std::to_string(cat.table("w")->id);
-  const auto index = "IDX_" + std::to_string(cat.table("w")->indexes[0].id);
+  const auto table = "TBL_" + std::to_string(cat.table({kPublicSchema, "w"})->id);
+  const auto index = "IDX_" + std::to_string(cat.table({kPublicSchema, "w"})->indexes[0].id);
   auto plan = [&](std::string_view sql, std::uint64_t rows, std::uint64_t budget) {
     RowCounts counts = [rows](const Table& t) -> std::optional<std::uint64_t> {
       return t.name == "w" ? std::optional{rows} : std::nullopt;
@@ -1191,12 +1191,12 @@ TEST_CASE("search: a choice point between a sort and a covering scan in the orde
           "[sql][search][choice]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"v",
+  f.ddl(CreateTableDdl{{kPublicSchema, "v"},
                        {Fixture::col("id", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
                         Fixture::col("b", PhysType::I64, true)},
                        {"id"}});
-  f.ddl(CreateIndexDdl{"ix_a", "v", {{"a"}}});
-  f.ddl(CreateIndexDdl{"ix_ab", "v", {{"a"}, {"b"}}});
+  f.ddl(CreateIndexDdl{"ix_a", {kPublicSchema, "v"}, {{"a"}}});
+  f.ddl(CreateIndexDdl{"ix_ab", {kPublicSchema, "v"}, {{"a"}, {"b"}}});
   const auto& cat = f.cat();
   const std::string sql = "SELECT a, b FROM v WHERE a = $1 ORDER BY b";
   RowCounts counts = [](const Table& t) -> std::optional<std::uint64_t> {
@@ -1206,7 +1206,7 @@ TEST_CASE("search: a choice point between a sort and a covering scan in the orde
   // in the order and covering. Each alternative is checked (generate_*
   // runs physical::check): the covering scan is in the other branch.
   auto plans = generate_alternatives(bound::bind(ast::parse(sql), cat), cat, sql, counts, 100'000);
-  const auto ix_ab = "IDX_" + std::to_string(cat.table("v")->indexes[1].id);
+  const auto ix_ab = "IDX_" + std::to_string(cat.table({kPublicSchema, "v"})->indexes[1].id);
   auto both = std::ranges::find_if(plans, [&](const GeneratedPlan& g) {
     auto other = g.source.find("} else {");
     return has(g, "if (count0 < ") && other != std::string::npos &&
@@ -1226,13 +1226,13 @@ TEST_CASE("search: an unordered plan is kept at the cost of the plan it becomes,
   sql_test::Fixture f;
   using sql_test::Fixture;
   // w_ab covers w's a, b and k.
-  f.ddl(CreateTableDdl{"w",
+  f.ddl(CreateTableDdl{{kPublicSchema, "w"},
                        {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
                         Fixture::col("b", PhysType::I64, true)},
                        {"k"}});
-  f.ddl(CreateIndexDdl{"w_ab", "w", {{"a"}, {"b"}}});
+  f.ddl(CreateIndexDdl{"w_ab", {kPublicSchema, "w"}, {{"a"}, {"b"}}});
   const auto& cat = f.cat();
-  const auto table = "TBL_" + std::to_string(cat.table("w")->id);
+  const auto table = "TBL_" + std::to_string(cat.table({kPublicSchema, "w"})->id);
   // 2 rows of w, then t by its key. w_ab's range, a = $1, reaches its first
   // entry, 1 covering; the full scan reaches 2, a filtered. Neither gives
   // ORDER BY k, b, so the plan of w is kept, for the join, at the cost it has
@@ -1263,9 +1263,9 @@ TEST_CASE("search: GROUP BY streams groups in an index's order, or holds them in
           "[sql][search][cost][group]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"g", {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+  f.ddl(CreateTableDdl{{kPublicSchema, "g"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
                              Fixture::col("v", PhysType::I64, true)}, {"k"}});
-  f.ddl(CreateIndexDdl{"g_a", "g", {{"a"}}});
+  f.ddl(CreateIndexDdl{"g_a", {kPublicSchema, "g"}, {{"a"}}});
   const auto& cat = f.cat();
   // 1,000 rows. g_a's full scan gives a's groups, covering: 1,000 entries,
   // each group given as the next starts, in locals. The structure over the
@@ -1316,9 +1316,9 @@ TEST_CASE("search: a structure of groups that may pass the memory budget is a ch
           "[sql][search][cost][group][memory][choice]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"g", {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+  f.ddl(CreateTableDdl{{kPublicSchema, "g"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
                              Fixture::col("v", PhysType::I64, true)}, {"k"}});
-  f.ddl(CreateIndexDdl{"g_a", "g", {{"a"}}});
+  f.ddl(CreateIndexDdl{"g_a", {kPublicSchema, "g"}, {{"a"}}});
   const auto& cat = f.cat();
   const std::string sql = "SELECT a, count(*) FROM g WHERE k < $1 GROUP BY a";
   RowCounts counts = [](const Table&) -> std::optional<std::uint64_t> { return 1000; };
@@ -1357,9 +1357,9 @@ TEST_CASE("search: a grouped query over a hash join takes the build's choice by 
           "[sql][search][cost][group][hash][memory][choice]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"t0", {Fixture::col("k", PhysType::I64, false), Fixture::col("c1", PhysType::I64, true),
+  f.ddl(CreateTableDdl{{kPublicSchema, "t0"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("c1", PhysType::I64, true),
                               Fixture::col("c2", PhysType::I64, true)}, {"k"}});
-  f.ddl(CreateTableDdl{"t1", {Fixture::col("k", PhysType::I64, false), Fixture::col("c1", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "t1"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("c1", PhysType::I64, true)}, {"k"}});
   const auto& cat = f.cat();
   RowCounts counts = [](const Table& t) -> std::optional<std::uint64_t> { return t.name == "t0" ? 40 : 100; };
   auto plan = [&](const std::string& sql, std::uint64_t budget) {
@@ -1393,9 +1393,9 @@ TEST_CASE("search: a choice point counts a NULL split of no prefix as its whole 
           "[sql][search][hash][memory][choice]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"t0", {Fixture::col("k", PhysType::I64, false), Fixture::col("c1", PhysType::I64, true)}, {"k"}});
-  f.ddl(CreateTableDdl{"t1", {Fixture::col("k", PhysType::I64, false), Fixture::col("c1", PhysType::I64, true)}, {"k"}});
-  f.ddl(CreateIndexDdl{"t1_c1", "t1", {{"c1"}}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "t0"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("c1", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "t1"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("c1", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateIndexDdl{"t1_c1", {kPublicSchema, "t1"}, {{"c1"}}});
   const auto& cat = f.cat();
   RowCounts counts = [](const Table& t) -> std::optional<std::uint64_t> { return t.name == "t0" ? 40 : 100; };
   // t1_c1 in ORDER BY c1's order, NULLs last: its present values, then its
@@ -1415,9 +1415,9 @@ TEST_CASE("search: a column the GROUP BY's primary key determines is read from t
           "[sql][search][group]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"g", {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+  f.ddl(CreateTableDdl{{kPublicSchema, "g"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
                              Fixture::col("v", PhysType::I64, true)}, {"k"}});
-  f.ddl(CreateIndexDdl{"g_a", "g", {{"a"}}});
+  f.ddl(CreateIndexDdl{"g_a", {kPublicSchema, "g"}, {{"a"}}});
   const auto& cat = f.cat();
   // Grouped by k, the primary key: v is the group's, and the primary key's
   // order streams the groups, which a GROUP BY of k and v would not.
@@ -1439,9 +1439,9 @@ TEST_CASE("search: a stream reads a BOOLEAN key from a covering entry; a structu
           "[sql][search][group]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"b", {Fixture::col("k", PhysType::I64, false), Fixture::col("f", PhysType::Bool, true),
+  f.ddl(CreateTableDdl{{kPublicSchema, "b"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("f", PhysType::Bool, true),
                              Fixture::col("v", PhysType::I64, true)}, {"k"}});
-  f.ddl(CreateIndexDdl{"b_f", "b", {{"f"}}});
+  f.ddl(CreateIndexDdl{"b_f", {kPublicSchema, "b"}, {{"f"}}});
   const auto& cat = f.cat();
   const std::string sql = "SELECT f, count(*) FROM b GROUP BY f";
   RowCounts counts = [](const Table&) -> std::optional<std::uint64_t> { return 1000; };
@@ -1459,9 +1459,9 @@ TEST_CASE("search: with no GROUP BY, no path is built for the groups; the groups
           "[sql][search][cost][group]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"g", {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+  f.ddl(CreateTableDdl{{kPublicSchema, "g"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
                              Fixture::col("v", PhysType::I64, true)}, {"k"}});
-  f.ddl(CreateIndexDdl{"g_a", "g", {{"a"}}});
+  f.ddl(CreateIndexDdl{"g_a", {kPublicSchema, "g"}, {{"a"}}});
   const auto& cat = f.cat();
   RowCounts counts = [](const Table&) -> std::optional<std::uint64_t> { return 1000; };
   auto all = [&](const std::string& sql) {
@@ -1483,9 +1483,9 @@ TEST_CASE("search: a structure's threshold counts its keys', held rows' and dist
           "[sql][search][group][memory]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"g", {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+  f.ddl(CreateTableDdl{{kPublicSchema, "g"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
                              Fixture::col("v", PhysType::I64, true)}, {"k"}});
-  f.ddl(CreateIndexDdl{"g_a", "g", {{"a"}}});
+  f.ddl(CreateIndexDdl{"g_a", {kPublicSchema, "g"}, {{"a"}}});
   const auto& cat = f.cat();
   RowCounts counts = [](const Table&) -> std::optional<std::uint64_t> { return 1000; };
   auto plan = [&](const std::string& sql) {
@@ -1502,9 +1502,9 @@ TEST_CASE("search: COUNT(*), MIN and MAX of one group are answered from the rang
           "[sql][search][group]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"g", {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+  f.ddl(CreateTableDdl{{kPublicSchema, "g"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
                              Fixture::col("v", PhysType::I64, true)}, {"k"}});
-  f.ddl(CreateIndexDdl{"g_a", "g", {{"a"}}});
+  f.ddl(CreateIndexDdl{"g_a", {kPublicSchema, "g"}, {{"a"}}});
   const auto& cat = f.cat();
   auto plan = [&](const std::string& sql) { return plan_sql(cat, sql, {{"g", 1000}}); };
   // MAX the last entry, read as a reverse scan's first; with COUNT(*) and
@@ -1559,8 +1559,8 @@ TEST_CASE("search: a join of three tables is planned in any order the costs choo
           "[sql][search][cost][join]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"u", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
-  f.ddl(CreateTableDdl{"w", {Fixture::col("j", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"j"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "w"}, {Fixture::col("j", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"j"}});
   const auto& cat = f.cat();
   const std::string sql = "SELECT t.id, u.k, w.j FROM t, u, w WHERE t.name = $1 AND u.k = t.qty AND w.j = u.v";
   // t by its index on name, then u and w each by the whole key from the row before it: three loops' worth of
@@ -1590,8 +1590,8 @@ TEST_CASE("search: a chain of left joins is planned in FROM order, each right ta
           "[sql][search][join][outer]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"u", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
-  f.ddl(CreateTableDdl{"w", {Fixture::col("j", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"j"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "w"}, {Fixture::col("j", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"j"}});
   const auto& cat = f.cat();
   const std::string sql = "SELECT t.id, u.k, w.j FROM t LEFT JOIN u ON u.k = t.qty LEFT JOIN w ON w.j = u.v";
   // Every plan the search costed has the same order, and a row of NULLs for each right table.
@@ -1620,8 +1620,8 @@ TEST_CASE("search: a RIGHT JOIN after the first join reads its table first, then
           "[sql][search][join][outer]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"u", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
-  f.ddl(CreateTableDdl{"w", {Fixture::col("j", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"j"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "w"}, {Fixture::col("j", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"j"}});
   const auto& cat = f.cat();
   // t and u, the group, are read under each row of w, u by its own scan though its key is reached: a row of
   // NULLs for each of the two where the group has no row for w's.
@@ -1648,7 +1648,7 @@ TEST_CASE("search: a predicate over the columns of two tables filters the pairs 
           "[sql][search][join]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"u", {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
   const auto& cat = f.cat();
   // NOT (a = b) over t and u: not a key of either, so u is read once per row of t, the pair tested.
   auto g = plan_sql(cat, "SELECT t.id, u.k FROM t JOIN u ON NOT (t.qty = u.v) WHERE t.name = $1");
@@ -1659,8 +1659,8 @@ TEST_CASE("search: a predicate over the columns of two tables filters the pairs 
   auto outer = plan_sql(cat, "SELECT t.id, u.k FROM t LEFT JOIN u ON u.k = t.qty AND (t.id < u.v OR u.v IS NULL)");
   CHECK(has(outer, "bc_null_row("));
   // A predicate over DOUBLE columns of both tables filters the pairs.
-  f.ddl(CreateTableDdl{"d", {Fixture::col("k", PhysType::I64, false), Fixture::col("x", PhysType::F64, true)}, {"k"}});
-  f.ddl(CreateTableDdl{"e", {Fixture::col("k", PhysType::I64, false), Fixture::col("y", PhysType::F64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "d"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("x", PhysType::F64, true)}, {"k"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "e"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("y", PhysType::F64, true)}, {"k"}});
   auto refused = [&](std::string_view sql) {
     try {
       (void)plan_sql(f.cat(), sql);
@@ -1696,7 +1696,7 @@ TEST_CASE("search: a grouped view joined with a table drives the join, costed by
           "[sql][search][join][view]") {
   sql_test::Fixture f;
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"u", {Fixture::col("id", PhysType::I64, false), Fixture::col("qty", PhysType::I64, true)}, {"id"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"}, {Fixture::col("id", PhysType::I64, false), Fixture::col("qty", PhysType::I64, true)}, {"id"}});
   f.ddl(std::get<Ddl>(bound::bind(ast::parse("CREATE VIEW h AS SELECT qty, COUNT(*) AS n FROM t GROUP BY qty"), f.cat()).stmt));
   const auto& cat = f.cat();
   auto counts = [](const Table&) -> std::optional<std::uint64_t> { return 10'000; };
@@ -1734,7 +1734,7 @@ TEST_CASE("search: joins of up to 32 tables are planned, every order tried up to
   sql_test::Fixture f;
   using sql_test::Fixture;
   for (auto i = 0; i < 32; ++i) {
-    f.ddl(CreateTableDdl{"j" + std::to_string(i), {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
+    f.ddl(CreateTableDdl{{kPublicSchema, "j" + std::to_string(i)}, {Fixture::col("k", PhysType::I64, false), Fixture::col("v", PhysType::I64, true)}, {"k"}});
   }
   const auto& cat = f.cat();
   // A chain of `n` tables, j0 joined to j1 by j1's key, and so on: listed from

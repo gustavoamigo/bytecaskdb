@@ -47,7 +47,7 @@ auto col(std::string name, SqlKind k, bool nullable = true, Datum def = {}) -> C
 }
 
 auto create_t() -> CreateTableDdl {
-  return {"t", {col("id", SqlKind::BigInt), col("name", SqlKind::Bytea), col("qty", SqlKind::BigInt)}, {"id"}};
+  return {{kPublicSchema, "t"}, {col("id", SqlKind::BigInt), col("name", SqlKind::Bytea), col("qty", SqlKind::BigInt)}, {"id"}};
 }
 
 auto constant(const std::vector<Catalog::PlanConstant>& cs, std::string_view n) -> std::uint32_t {
@@ -58,7 +58,7 @@ auto constant(const std::vector<Catalog::PlanConstant>& cs, std::string_view n) 
 
 // A row of t: its primary key and its row.
 auto t_row(const Catalog& cat, std::int64_t id, std::string_view name, std::int64_t qty) -> std::pair<Bytes, Bytes> {
-  const auto& t = *cat.table("t");
+  const auto& t = *cat.table({kPublicSchema, "t"});
   RowWriter w{t.layout};
   REQUIRE(w.set_i64(t.column("id")->id, id));
   REQUIRE(w.set_bytes(t.column("name")->id, bytes(name)));
@@ -334,13 +334,13 @@ TEST_CASE("catalog: CHECK constraints are named as PostgreSQL names them and sur
     auto cols = std::vector<ColumnSpec>{col("a", SqlKind::Integer), col("b", SqlKind::Integer)};
     // Named ones first; an unnamed one is table_column_check, or table_check for the table's,
     // then 1, 2… where the name is taken.
-    CreateTableDdl ddl{"c1", cols, {}, {}, {}};
+    CreateTableDdl ddl{{kPublicSchema, "c1"}, cols, {}, {}, {}};
     ddl.checks = {{"", "a > 0", "a"}, {"", "a < b", ""}, {"named", "b > 0", "b"}, {"", "b < 9", "b"}, {"", "b < 10", "b"}};
     (void)live.apply(ddl);
     std::vector<std::string> names;
-    for (const auto& c : live.current()->table("c1")->checks) names.push_back(c.name);
+    for (const auto& c : live.current()->table({kPublicSchema, "c1"})->checks) names.push_back(c.name);
     CHECK(names == std::vector<std::string>{"named", "c1_a_check", "c1_check", "c1_b_check", "c1_b_check1"});
-    ddl.name = "c2";
+    ddl.name = {kPublicSchema, "c2"};
     ddl.checks = {{"x", "a > 0", ""}, {"x", "a > 1", ""}};
     try {
       (void)live.apply(ddl);
@@ -348,11 +348,11 @@ TEST_CASE("catalog: CHECK constraints are named as PostgreSQL names them and sur
     } catch (const DdlRefused& e) {
       CHECK(e.sqlstate() == "42710");
     }
-    CHECK(live.current()->table("c2") == nullptr);
+    CHECK(live.current()->table({kPublicSchema, "c2"}) == nullptr);
   }
   LiveCatalog again{db};
-  REQUIRE(again.current()->table("c1")->checks.size() == 5);
-  CHECK(again.current()->table("c1")->checks[1].expr == "a > 0");
+  REQUIRE(again.current()->table({kPublicSchema, "c1"})->checks.size() == 5);
+  CHECK(again.current()->table({kPublicSchema, "c1"})->checks[1].expr == "a > 0");
   db.close();
 }
 
@@ -413,9 +413,9 @@ TEST_CASE("catalog: a table without a primary key has a hidden row id as its key
   sql_test::TempDir dir{"catalog_row_id"};
   auto db = DB::open(dir.path());
   LiveCatalog live{db};
-  (void)live.apply(CreateTableDdl{"k", {col("a", SqlKind::Integer), col("b", SqlKind::Text)}, {}});
+  (void)live.apply(CreateTableDdl{{kPublicSchema, "k"}, {col("a", SqlKind::Integer), col("b", SqlKind::Text)}, {}});
   auto cat = live.current();  // held: t is in it
-  const auto& t = *cat->table("k");
+  const auto& t = *cat->table({kPublicSchema, "k"});
   const auto* rid = t.row_id();
   REQUIRE(rid != nullptr);
   CHECK(rid->hidden);
@@ -427,7 +427,7 @@ TEST_CASE("catalog: a table without a primary key has a hidden row id as its key
   CHECK(t.column("a")->id == 0);
   // A table with a declared key has none.
   (void)live.apply(create_t());
-  CHECK(live.current()->table("t")->row_id() == nullptr);
+  CHECK(live.current()->table({kPublicSchema, "t"})->row_id() == nullptr);
 
   // The record round-trips the flag.
   auto rec = serialize_table(t);
@@ -476,12 +476,12 @@ TEST_CASE("catalog: row ids start past the greatest the data holds and are never
   {
     auto db = DB::open(dir.path());
     LiveCatalog live{db};
-    (void)live.apply(CreateTableDdl{"a", {col("v", SqlKind::BigInt)}, {}});
-    (void)live.apply(CreateTableDdl{"b", {col("v", SqlKind::BigInt)}, {}});
-    (void)live.apply(CreateTableDdl{"c", {col("v", SqlKind::BigInt)}, {}});
+    (void)live.apply(CreateTableDdl{{kPublicSchema, "a"}, {col("v", SqlKind::BigInt)}, {}});
+    (void)live.apply(CreateTableDdl{{kPublicSchema, "b"}, {col("v", SqlKind::BigInt)}, {}});
+    (void)live.apply(CreateTableDdl{{kPublicSchema, "c"}, {col("v", SqlKind::BigInt)}, {}});
     auto cat = live.current();
-    const auto& a = *cat->table("a");
-    const auto& b = *cat->table("b");
+    const auto& a = *cat->table({kPublicSchema, "a"});
+    const auto& b = *cat->table({kPublicSchema, "b"});
     // An empty table starts at 1; each table counts on its own.
     CHECK(live.next_row_id(a) == 1);
     CHECK(live.next_row_id(a) == 2);
@@ -489,7 +489,7 @@ TEST_CASE("catalog: row ids start past the greatest the data holds and are never
     // neighbouring table's.
     put_row(db, b, 41);
     put_row(db, b, 7);
-    put_row(db, *cat->table("c"), 1000);
+    put_row(db, *cat->table({kPublicSchema, "c"}), 1000);
     CHECK(live.next_row_id(b) == 42);
     // Seeded once: a row written behind the counter's back is not read again.
     put_row(db, a, 500);
@@ -516,9 +516,9 @@ TEST_CASE("catalog: row ids start past the greatest the data holds and are never
   auto db = DB::open(dir.path());
   LiveCatalog live{db};
   auto cat = live.current();
-  CHECK(live.next_row_id(*cat->table("a")) == 501);
-  CHECK(live.next_row_id(*cat->table("b")) == 42);
-  CHECK(live.next_row_id(*cat->table("c")) == 1001);
+  CHECK(live.next_row_id(*cat->table({kPublicSchema, "a"})) == 501);
+  CHECK(live.next_row_id(*cat->table({kPublicSchema, "b"})) == 42);
+  CHECK(live.next_row_id(*cat->table({kPublicSchema, "c"})) == 1001);
 }
 
 TEST_CASE("catalog: counters of the wrong width or past the id ceiling are refused at load", "[sql][catalog]") {
@@ -545,12 +545,12 @@ TEST_CASE("catalog: any name is accepted; plan constants come from ids and never
   sql_test::TempDir dir{"catalog_idents"};
   auto db = DB::open(dir.path());
   LiveCatalog live{db};
-  (void)live.apply(CreateTableDdl{"a-b c", {col("my col", SqlKind::BigInt, false), col("x*/y", SqlKind::BigInt)},
+  (void)live.apply(CreateTableDdl{{kPublicSchema, "a-b c"}, {col("my col", SqlKind::BigInt, false), col("x*/y", SqlKind::BigInt)},
                                   {"my col"}});
   // Table idx with column foo, and an index foo_col: by name both would be
   // IDX_FOO_COL; by id they are COL_<t>_<c> and IDX_<i>.
-  (void)live.apply(CreateTableDdl{"idx", {col("foo", SqlKind::BigInt, false), col("v", SqlKind::BigInt)}, {"foo"}});
-  (void)live.apply(CreateIndexDdl{"foo_col", "idx", {{"v"}}});
+  (void)live.apply(CreateTableDdl{{kPublicSchema, "idx"}, {col("foo", SqlKind::BigInt, false), col("v", SqlKind::BigInt)}, {"foo"}});
+  (void)live.apply(CreateIndexDdl{"foo_col", {kPublicSchema, "idx"}, {{"v"}}});
   auto cat = live.current();
   for (const auto& [id, t] : cat->tables()) {
     auto cs = Catalog::constants(t);
@@ -566,7 +566,7 @@ TEST_CASE("catalog: any name is accepted; plan constants come from ids and never
   }
   // apply returns the version its own DDL published.
   auto v = live.current()->version();
-  CHECK(live.apply(CreateIndexDdl{"idx_v", "idx", {{"v"}}})->version() == v + 1);
+  CHECK(live.apply(CreateIndexDdl{"idx_v", {kPublicSchema, "idx"}, {{"v"}}})->version() == v + 1);
 }
 
 TEST_CASE("catalog: concurrent DDL each returns the version it published", "[sql][catalog]") {
@@ -580,7 +580,7 @@ TEST_CASE("catalog: concurrent DDL each returns the version it published", "[sql
     for (int i = 0; i < kEach;) {
       try {
         seen.push_back(
-            live.apply(CreateTableDdl{std::string{prefix} + std::to_string(i), {col("k", SqlKind::BigInt)}, {"k"}}));
+            live.apply(CreateTableDdl{{kPublicSchema, std::string{prefix} + std::to_string(i)}, {col("k", SqlKind::BigInt)}, {"k"}}));
         ++i;
       } catch (const DdlInProgress&) {
         std::this_thread::yield();
@@ -596,7 +596,7 @@ TEST_CASE("catalog: concurrent DDL each returns the version it published", "[sql
     std::uint64_t last = 0;
     for (std::size_t i = 0; i < seen.size(); ++i) {
       // Its own table is in it, and the versions it saw only grow.
-      CHECK(seen[i]->table(std::string{prefix} + std::to_string(i)) != nullptr);
+      CHECK(seen[i]->table({kPublicSchema, std::string{prefix} + std::to_string(i)}) != nullptr);
       CHECK(seen[i]->version() > last);
       last = seen[i]->version();
     }
@@ -617,13 +617,13 @@ TEST_CASE("catalog: a DDL that finds another in progress fails at once and write
     entered.set_value();
     released.wait();
   });
-  std::jthread first{[&] { (void)live.apply(CreateIndexDdl{"t_by_name", "t", {{"name"}}}); }};
+  std::jthread first{[&] { (void)live.apply(CreateIndexDdl{"t_by_name", {kPublicSchema, "t"}, {{"name"}}}); }};
   entered.get_future().wait();
   // Held mid-commit: the second DDL returns at once, whatever the first
   // takes, and writes nothing.
   auto second = std::async(std::launch::async, [&] {
     try {
-      (void)live.apply(CreateTableDdl{"u", {col("k", SqlKind::BigInt)}, {"k"}});
+      (void)live.apply(CreateTableDdl{{kPublicSchema, "u"}, {col("k", SqlKind::BigInt)}, {"k"}});
       return false;
     } catch (const DdlInProgress&) {
       return true;
@@ -635,8 +635,8 @@ TEST_CASE("catalog: a DDL that finds another in progress fails at once and write
   first.join();
   live.set_commit_hook_for_testing({});
   CHECK(live.current()->version() == 2);
-  CHECK(live.current()->table("u") == nullptr);
-  CHECK(live.current()->index("t_by_name").second != nullptr);
+  CHECK(live.current()->table({kPublicSchema, "u"}) == nullptr);
+  CHECK(live.current()->index({kPublicSchema, "t_by_name"}).second != nullptr);
 }
 
 TEST_CASE("catalog: a reader pinned during a DDL's commit is not blocked and sees the old version", "[sql][catalog]") {
@@ -653,7 +653,7 @@ TEST_CASE("catalog: a reader pinned during a DDL's commit is not blocked and see
     entered.set_value();
     released.wait();
   });
-  std::jthread ddl{[&] { (void)live.apply(CreateIndexDdl{"t_by_name", "t", {{"name"}}}); }};
+  std::jthread ddl{[&] { (void)live.apply(CreateIndexDdl{"t_by_name", {kPublicSchema, "t"}, {{"name"}}}); }};
   entered.get_future().wait();
   // The pin returns without waiting for the commit, on the old version and a
   // snapshot that agrees with it.
@@ -700,20 +700,20 @@ TEST_CASE("catalog: every DDL survives a reopen", "[sql][catalog]") {
   });
   reopen([](DB& db, LiveCatalog& live) {
     auto cat = live.current();  // held: t points into it, across the DDL below
-    const auto& t = *cat->table("t");
+    const auto& t = *cat->table({kPublicSchema, "t"});
     CHECK(t.id == 1);
     CHECK(t.layout_id == 2);
     CHECK_FALSE(t.column("id")->nullable);  // a primary key column is never null
     CHECK(t.column("name")->nullable);
     CHECK(t.column("qty")->sql == SqlType{SqlKind::BigInt});
     // CREATE UNIQUE INDEX with a DESC part, backfilled from the two rows.
-    (void)live.apply(CreateIndexDdl{"t_by_name", "t", {{"name", true}}, true});
+    (void)live.apply(CreateIndexDdl{"t_by_name", {kPublicSchema, "t"}, {{"name", true}}, true});
     CHECK(count_prefix(db, prefix_of(kNsIndex, 3)) == 2);
   });
   reopen([](DB& db, LiveCatalog& live) {
     auto cat = live.current();
     CHECK(cat->version() == 2);
-    const auto& t = *cat->table("t");
+    const auto& t = *cat->table({kPublicSchema, "t"});
     CHECK(t.version == 2);
     const auto* ix = t.index("t_by_name");
     REQUIRE(ix != nullptr);
@@ -727,7 +727,7 @@ TEST_CASE("catalog: every DDL survives a reopen", "[sql][catalog]") {
     REQUIRE(kl->parts.size() == 2);
     CHECK((kl->parts[0].type == PhysType::Bytes && kl->parts[0].nullable && kl->parts[0].desc));
     CHECK_FALSE(kl->parts[1].desc);
-    CHECK(cat->index("t_by_name").first == &t);
+    CHECK(cat->index({kPublicSchema, "t_by_name"}).first == &t);
     // The DESC entry for "bob": the part inverted, then the primary key.
     Bytes key;
     key_put_prefix(key, kNsIndex, 3);
@@ -737,15 +737,15 @@ TEST_CASE("catalog: every DDL survives a reopen", "[sql][catalog]") {
     CHECK(db.get({}, key, out));
     // ADD COLUMN with a default rewrites the rows; positions do not move.
     auto qty_pos = t.layout.find(t.column("qty")->id)->pos;
-    (void)live.apply(AddColumnDdl{"t", col("tag", SqlKind::Integer, false, std::int64_t{7})});
+    (void)live.apply(AddColumnDdl{{kPublicSchema, "t"}, col("tag", SqlKind::Integer, false, std::int64_t{7})});
     auto cat2 = live.current();  // held: t2 points into it
-    const auto& t2 = *cat2->table("t");
+    const auto& t2 = *cat2->table({kPublicSchema, "t"});
     CHECK(t2.layout.find(t2.column("qty")->id)->pos == qty_pos);
     CHECK(t2.layout_id == t.layout_id);
   });
   reopen([](DB& db, LiveCatalog& live) {
     auto cat = live.current();  // held: t points into it
-    const auto& t = *cat->table("t");
+    const auto& t = *cat->table({kPublicSchema, "t"});
     REQUIRE(t.column("tag") != nullptr);
     CHECK(t.column("tag")->id == 3);
     CHECK(t.next_col_id == 4);
@@ -758,17 +758,17 @@ TEST_CASE("catalog: every DDL survives a reopen", "[sql][catalog]") {
     REQUIRE(db.get({}, pk, row));
     CHECK(row_column(row, *t.layout.find(3)).i64() == 7);
     CHECK(row_column(row, *t.layout.find(2)).i64() == 20);
-    (void)live.apply(DropIndexDdl{"t_by_name"});
+    (void)live.apply(DropIndexDdl{{kPublicSchema, "t_by_name"}});
     CHECK(count_prefix(db, prefix_of(kNsIndex, 3)) == 0);
     CHECK_FALSE(db.contains_key({}, name_entry_key("t_by_name")));
   });
   reopen([](DB& db, LiveCatalog& live) {
     auto cat = live.current();
-    CHECK(cat->table("t")->indexes.empty());
+    CHECK(cat->table({kPublicSchema, "t"})->indexes.empty());
     CHECK(cat->key_layout(3) == nullptr);
     CHECK(cat->version() == 4);
-    (void)live.apply(CreateIndexDdl{"t_by_qty", "t", {{"qty"}}});
-    (void)live.apply(DropTableDdl{"t"});
+    (void)live.apply(CreateIndexDdl{"t_by_qty", {kPublicSchema, "t"}, {{"qty"}}});
+    (void)live.apply(DropTableDdl{{kPublicSchema, "t"}});
     // Rows, index entries, the record and both name entries are gone.
     CHECK(count_prefix(db, prefix_of(kNsRow, 1)) == 0);
     CHECK(count_prefix(db, prefix_of(kNsIndex, 4)) == 0);
@@ -782,7 +782,7 @@ TEST_CASE("catalog: every DDL survives a reopen", "[sql][catalog]") {
     CHECK(cat->version() == 6);
     // Ids are not reused: the next table takes 5 and 6.
     (void)live.apply(create_t());
-    CHECK(live.current()->table("t")->id == 5);
+    CHECK(live.current()->table({kPublicSchema, "t"})->id == 5);
   });
 }
 
@@ -796,26 +796,26 @@ TEST_CASE("catalog: refused DDL writes nothing", "[sql][catalog]") {
   auto before = live.current();
 
   CHECK_THROWS_AS(live.apply(create_t()), std::invalid_argument);
-  CHECK_THROWS_AS(live.apply(CreateIndexDdl{"t", "t", {{"qty"}}}), std::invalid_argument);
-  CHECK_THROWS_AS(live.apply(CreateIndexDdl{"i2", "t", {{"nope"}}}), std::invalid_argument);
-  CHECK_THROWS_AS(live.apply(CreateIndexDdl{"i2", "t", {{"qty"}, {"qty"}}}), std::invalid_argument);
-  CHECK_THROWS_AS(live.apply(CreateIndexDdl{"i2", "nope", {{"qty"}}}), std::invalid_argument);
-  CHECK_THROWS_AS(live.apply(DropTableDdl{"nope"}), std::invalid_argument);
-  CHECK_THROWS_AS(live.apply(DropIndexDdl{"t"}), std::invalid_argument);
-  CHECK_THROWS_AS(live.apply(AddColumnDdl{"t", col("qty", SqlKind::BigInt)}), std::invalid_argument);
-  CHECK_THROWS_AS(live.apply(AddColumnDdl{"t", col("x", SqlKind::BigInt, false)}), std::invalid_argument);
-  CHECK_THROWS_AS(live.apply(CreateTableDdl{"u", {col("k", SqlKind::BigInt)}, {"k", "k"}}), std::invalid_argument);
+  CHECK_THROWS_AS(live.apply(CreateIndexDdl{"t", {kPublicSchema, "t"}, {{"qty"}}}), std::invalid_argument);
+  CHECK_THROWS_AS(live.apply(CreateIndexDdl{"i2", {kPublicSchema, "t"}, {{"nope"}}}), std::invalid_argument);
+  CHECK_THROWS_AS(live.apply(CreateIndexDdl{"i2", {kPublicSchema, "t"}, {{"qty"}, {"qty"}}}), std::invalid_argument);
+  CHECK_THROWS_AS(live.apply(CreateIndexDdl{"i2", {kPublicSchema, "nope"}, {{"qty"}}}), std::invalid_argument);
+  CHECK_THROWS_AS(live.apply(DropTableDdl{{kPublicSchema, "nope"}}), std::invalid_argument);
+  CHECK_THROWS_AS(live.apply(DropIndexDdl{{kPublicSchema, "t"}}), std::invalid_argument);
+  CHECK_THROWS_AS(live.apply(AddColumnDdl{{kPublicSchema, "t"}, col("qty", SqlKind::BigInt)}), std::invalid_argument);
+  CHECK_THROWS_AS(live.apply(AddColumnDdl{{kPublicSchema, "t"}, col("x", SqlKind::BigInt, false)}), std::invalid_argument);
+  CHECK_THROWS_AS(live.apply(CreateTableDdl{{kPublicSchema, "u"}, {col("k", SqlKind::BigInt)}, {"k", "k"}}), std::invalid_argument);
   // A unique index over rows that already collide.
   try {
-    (void)live.apply(CreateIndexDdl{"t_u", "t", {{"name"}}, true});
+    (void)live.apply(CreateIndexDdl{"t_u", {kPublicSchema, "t"}, {{"name"}}, true});
     FAIL("a unique index over duplicates must be refused");
   } catch (const ConstraintViolation& e) {
     CHECK(std::string{e.what()}.find("duplicate key") != std::string::npos);
     CHECK(e.detail().constraint == BC_C_UNIQUE);
   }
   // IF EXISTS on nothing is a no-op.
-  CHECK(live.apply(DropTableDdl{"nope", true}) == before);
-  CHECK(live.apply(DropIndexDdl{"nope", true}) == before);
+  CHECK(live.apply(DropTableDdl{{kPublicSchema, "nope"}, true}) == before);
+  CHECK(live.apply(DropIndexDdl{{kPublicSchema, "nope"}, true}) == before);
 
   CHECK(live.current() == before);
   CHECK(count_prefix(db, Bytes{std::byte{kNsIndex}}) == 0);
@@ -841,23 +841,23 @@ TEST_CASE("catalog: CREATE TABLE refuses in PostgreSQL's order", "[sql][catalog]
     return "created";
   };
   // PostgreSQL's code for an existing name, with a column list it accepts.
-  CHECK(state({"t", {col("c", SqlKind::BigInt)}, {"c"}}) == "42P07");
-  CHECK(state({"t", {col("c", SqlKind::BigInt)}, {}}) == "42P07");                          // no key
-  CHECK(state({"t", {col("c", SqlKind::BigInt, true, 1.5)}, {"c"}}) == "42P07");            // a default not of its type
+  CHECK(state({{kPublicSchema, "t"}, {col("c", SqlKind::BigInt)}, {"c"}}) == "42P07");
+  CHECK(state({{kPublicSchema, "t"}, {col("c", SqlKind::BigInt)}, {}}) == "42P07");                          // no key
+  CHECK(state({{kPublicSchema, "t"}, {col("c", SqlKind::BigInt, true, 1.5)}, {"c"}}) == "42P07");            // a default not of its type
   // Its own columns and key, which PostgreSQL checks first.
-  CHECK(state({"t", {col("c", SqlKind::BigInt), col("c", SqlKind::BigInt)}, {"c"}}) == "42701");
-  CHECK(state({"t", {col("c", SqlKind::BigInt)}, {"zz"}}) == "42703");
-  CHECK(state({"t", {col("c", SqlKind::BigInt)}, {"c", "c"}}) == "42701");
+  CHECK(state({{kPublicSchema, "t"}, {col("c", SqlKind::BigInt), col("c", SqlKind::BigInt)}, {"c"}}) == "42701");
+  CHECK(state({{kPublicSchema, "t"}, {col("c", SqlKind::BigInt)}, {"zz"}}) == "42703");
+  CHECK(state({{kPublicSchema, "t"}, {col("c", SqlKind::BigInt)}, {"c", "c"}}) == "42701");
   // No columns: PostgreSQL accepts the list, so a key names a column that is not there (42703), ahead of
   // an existing name too; with no key either, the layer's own rule (a table needs columns) applies after
   // the name check.
-  CHECK(state({"t", {}, {"k"}}) == "42703");
-  CHECK(state({"u", {}, {"k"}}) == "42703");
-  CHECK(state({"t", {}, {}}) == "42P07");
-  CHECK(state({"u", {}, {}}) == "0A000");
+  CHECK(state({{kPublicSchema, "t"}, {}, {"k"}}) == "42703");
+  CHECK(state({{kPublicSchema, "u"}, {}, {"k"}}) == "42703");
+  CHECK(state({{kPublicSchema, "t"}, {}, {}}) == "42P07");
+  CHECK(state({{kPublicSchema, "u"}, {}, {}}) == "0A000");
   // A new name: the layer's own rule, which PostgreSQL does not have; with no key, a row id is the key.
-  CHECK(state({"u", {col("c", SqlKind::BigInt, true, 1.5)}, {"c"}}) == "42804");
-  CHECK(state({"u", {col("c", SqlKind::BigInt)}, {}}) == "created");
+  CHECK(state({{kPublicSchema, "u"}, {col("c", SqlKind::BigInt, true, 1.5)}, {"c"}}) == "42804");
+  CHECK(state({{kPublicSchema, "u"}, {col("c", SqlKind::BigInt)}, {}}) == "created");
 }
 
 TEST_CASE("catalog: UNIQUE constraints are unique indexes of the CREATE TABLE's batch, named as PostgreSQL names them",
@@ -873,7 +873,7 @@ TEST_CASE("catalog: UNIQUE constraints are unique indexes of the CREATE TABLE's 
   auto indexes = [&](std::string_view table) {
     auto cat = live.current();
     std::vector<std::pair<std::string, std::vector<std::uint32_t>>> out;
-    for (const auto& ix : cat->table(table)->indexes) {
+    for (const auto& ix : cat->table({kPublicSchema, std::string{table}})->indexes) {
       CHECK(ix.unique);
       std::vector<std::uint32_t> cols;
       for (const auto& part : ix.parts) cols.push_back(part.col_id);
@@ -884,25 +884,25 @@ TEST_CASE("catalog: UNIQUE constraints are unique indexes of the CREATE TABLE's 
   using Named = std::vector<std::pair<std::string, std::vector<std::uint32_t>>>;
   // a's, then (a, b)'s; a repeated one is the first, and one on the
   // primary key's columns is the key.
-  (void)live.apply(CreateTableDdl{"u1", ints({"k", "a", "b"}), {"k"}, {{"", {"a"}}, {"", {"a", "b"}}, {"", {"a"}}, {"", {"k"}}}});
+  (void)live.apply(CreateTableDdl{{kPublicSchema, "u1"}, ints({"k", "a", "b"}), {"k"}, {{"", {"a"}}, {"", {"a", "b"}}, {"", {"a"}}, {"", {"k"}}}});
   CHECK(indexes("u1") == Named{{"u1_a_key", {1}}, {"u1_a_b_key", {1, 2}}});
   // A first unnamed one takes a repeat's name; column order matters.
-  (void)live.apply(CreateTableDdl{"u2", ints({"a", "b"}), {}, {{"", {"a"}}, {"named", {"a"}}, {"", {"b", "a"}}}});
+  (void)live.apply(CreateTableDdl{{kPublicSchema, "u2"}, ints({"a", "b"}), {}, {{"", {"a"}}, {"named", {"a"}}, {"", {"b", "a"}}}});
   CHECK(indexes("u2") == Named{{"named", {0}}, {"u2_b_a_key", {1, 0}}});
   // A chosen name past every name taken, this statement's too.
-  (void)live.apply(CreateIndexDdl{"u3_a_key", "u1", {{"b"}}});
-  (void)live.apply(CreateTableDdl{"u3", ints({"a", "b"}), {}, {{"u3_a_key1", {"b"}}, {"", {"a"}}}});
+  (void)live.apply(CreateIndexDdl{"u3_a_key", {kPublicSchema, "u1"}, {{"b"}}});
+  (void)live.apply(CreateTableDdl{{kPublicSchema, "u3"}, ints({"a", "b"}), {}, {{"u3_a_key1", {"b"}}, {"", {"a"}}}});
   CHECK(indexes("u3") == Named{{"u3_a_key1", {1}}, {"u3_a_key2", {0}}});
   // Within 63 bytes: the longer part shortened first, clipped to a
   // character.
   auto long_table = std::string(60, 'x');
-  (void)live.apply(CreateTableDdl{long_table, ints({"aaaaaaaaaa"}), {}, {{"", {"aaaaaaaaaa"}}}});
+  (void)live.apply(CreateTableDdl{{kPublicSchema, long_table}, ints({"aaaaaaaaaa"}), {}, {{"", {"aaaaaaaaaa"}}}});
   CHECK(indexes(long_table)[0].first == std::string(48, 'x') + "_aaaaaaaaaa_key");
   auto e = std::string{"\xc3\xa9"};  // é, two bytes
   std::string wide_table, wide_col = "b";
   for (int i = 0; i < 31; ++i) wide_table += e;
   for (int i = 0; i < 20; ++i) wide_col += "\xc3\xbc";  // ü
-  (void)live.apply(CreateTableDdl{wide_table, ints({wide_col}), {}, {{"", {wide_col}}}});
+  (void)live.apply(CreateTableDdl{{kPublicSchema, wide_table}, ints({wide_col}), {}, {{"", {wide_col}}}});
   auto wide = indexes(wide_table)[0].first;
   CHECK(wide.size() <= 63);
   CHECK(wide.substr(0, 28) == wide_table.substr(0, 28));  // 14 é, cut at a character
@@ -918,22 +918,22 @@ TEST_CASE("catalog: UNIQUE constraints are unique indexes of the CREATE TABLE's 
     }
     return "created";
   };
-  CHECK(state({"u1", ints({"a"}), {}, {{"", {"z"}}}}) == "42703");
-  CHECK(state({"u9", ints({"a"}), {}, {{"", {"a", "a"}}}}) == "42701");
-  CHECK(state({"u9", ints({"a"}), {}, {{"u1", {"a"}}}}) == "42P07");
-  CHECK(state({"u9", ints({"a"}), {}, {{"u9", {"a"}}}}) == "42P07");  // its own table's name
-  CHECK(state({"u9", ints({"a", "b"}), {}, {{"", {"a"}}, {"u9_a_key", {"b"}}}}) == "42P07");
+  CHECK(state({{kPublicSchema, "u1"}, ints({"a"}), {}, {{"", {"z"}}}}) == "42703");
+  CHECK(state({{kPublicSchema, "u9"}, ints({"a"}), {}, {{"", {"a", "a"}}}}) == "42701");
+  CHECK(state({{kPublicSchema, "u9"}, ints({"a"}), {}, {{"u1", {"a"}}}}) == "42P07");
+  CHECK(state({{kPublicSchema, "u9"}, ints({"a"}), {}, {{"u9", {"a"}}}}) == "42P07");  // its own table's name
+  CHECK(state({{kPublicSchema, "u9"}, ints({"a", "b"}), {}, {{"", {"a"}}, {"u9_a_key", {"b"}}}}) == "42P07");
   // A refused one writes nothing, its table included.
-  CHECK(live.current()->table("u9") == nullptr);
-  CHECK(live.current()->index("u9_a_key").first == nullptr);
+  CHECK(live.current()->table({kPublicSchema, "u9"}) == nullptr);
+  CHECK(live.current()->index({kPublicSchema, "u9_a_key"}).first == nullptr);
 
   // A duplicate is refused, NULLs are not duplicates, and all of it
   // survives a reopen.
   auto cat = live.current();
-  CHECK(cat->index("u1_a_b_key").first == cat->table("u1"));
+  CHECK(cat->index({kPublicSchema, "u1_a_b_key"}).first == cat->table({kPublicSchema, "u1"}));
   LiveCatalog again{db};
-  CHECK(again.current()->table("u1")->indexes.size() == 3);  // its two constraints and u3_a_key
-  CHECK(again.current()->index("u3_a_key2").first != nullptr);
+  CHECK(again.current()->table({kPublicSchema, "u1"})->indexes.size() == 3);  // its two constraints and u3_a_key
+  CHECK(again.current()->index({kPublicSchema, "u3_a_key2"}).first != nullptr);
 }
 
 TEST_CASE("catalog: a DDL the engine refuses leaves nothing on disk or in memory", "[sql][catalog]") {
@@ -947,9 +947,9 @@ TEST_CASE("catalog: a DDL the engine refuses leaves nothing on disk or in memory
     // The injected failure: a follower refuses the batch at commit, after
     // the DDL was built (the backfill included).
     db.set_mode(Mode::Follower);
-    CHECK_THROWS_AS(live.apply(CreateIndexDdl{"t_by_name", "t", {{"name"}}}), DbFollowerMode);
-    CHECK_THROWS_AS(live.apply(AddColumnDdl{"t", col("x", SqlKind::BigInt, true, std::int64_t{1})}), DbFollowerMode);
-    CHECK_THROWS_AS(live.apply(DropTableDdl{"t"}), DbFollowerMode);
+    CHECK_THROWS_AS(live.apply(CreateIndexDdl{"t_by_name", {kPublicSchema, "t"}, {{"name"}}}), DbFollowerMode);
+    CHECK_THROWS_AS(live.apply(AddColumnDdl{{kPublicSchema, "t"}, col("x", SqlKind::BigInt, true, std::int64_t{1})}), DbFollowerMode);
+    CHECK_THROWS_AS(live.apply(DropTableDdl{{kPublicSchema, "t"}}), DbFollowerMode);
     CHECK(live.current() == before);
     // Pins do not wait on a DDL that failed.
     auto p = live.pin();
@@ -961,13 +961,13 @@ TEST_CASE("catalog: a DDL the engine refuses leaves nothing on disk or in memory
   LiveCatalog live{db};
   auto cat = live.current();
   CHECK(cat->version() == 1);
-  CHECK(cat->table("t")->indexes.empty());
-  CHECK(cat->table("t")->columns.size() == 3);
+  CHECK(cat->table({kPublicSchema, "t"})->indexes.empty());
+  CHECK(cat->table({kPublicSchema, "t"})->columns.size() == 3);
   CHECK(count_prefix(db, Bytes{std::byte{kNsIndex}}) == 0);
   CHECK(count_prefix(db, prefix_of(kNsRow, 1)) == 1);
   // The ids the failed DDL would have taken are free.
-  (void)live.apply(CreateIndexDdl{"t_by_name", "t", {{"name"}}});
-  CHECK(live.current()->table("t")->indexes[0].id == 3);
+  (void)live.apply(CreateIndexDdl{"t_by_name", {kPublicSchema, "t"}, {{"name"}}});
+  CHECK(live.current()->table({kPublicSchema, "t"})->indexes[0].id == 3);
 }
 
 TEST_CASE("catalog: a backfill raced by a write, and two catalogs on one database, conflict", "[sql][catalog]") {
@@ -979,39 +979,39 @@ TEST_CASE("catalog: a backfill raced by a write, and two catalogs on one databas
 
   // A row written between the backfill's snapshot and its commit: the range
   // guard refuses the commit, and nothing is written.
-  auto p = live.prepare(CreateIndexDdl{"t_by_name", "t", {{"name"}}});
+  auto p = live.prepare(CreateIndexDdl{"t_by_name", {kPublicSchema, "t"}, {{"name"}}});
   put_t_row(db, *live.current(), 2, "amy", 20);
   CHECK_FALSE(live.commit(std::move(p)));
-  CHECK(live.current()->table("t")->indexes.empty());
+  CHECK(live.current()->table({kPublicSchema, "t"})->indexes.empty());
   CHECK(count_prefix(db, Bytes{std::byte{kNsIndex}}) == 0);
   // apply retries on a fresh snapshot and indexes both rows.
-  (void)live.apply(CreateIndexDdl{"t_by_name", "t", {{"name"}}});
+  (void)live.apply(CreateIndexDdl{"t_by_name", {kPublicSchema, "t"}, {{"name"}}});
   CHECK(count_prefix(db, prefix_of(kNsIndex, 3)) == 2);
 
   // A DDL without a backfill does not guard the rows.
-  auto q = live.prepare(AddColumnDdl{"t", col("note", SqlKind::Text)});
+  auto q = live.prepare(AddColumnDdl{{kPublicSchema, "t"}, col("note", SqlKind::Text)});
   put_t_row(db, *live.current(), 3, "cy", 30);
   CHECK(live.commit(std::move(q)));
 
   // Two catalogs on one database: the second one's DDL commits first, and
   // the first one's, prepared on the version before, is a conflict.
   LiveCatalog other{db};
-  auto r = live.prepare(CreateTableDdl{"u", {col("k", SqlKind::BigInt)}, {"k"}});
-  (void)other.apply(CreateTableDdl{"v", {col("k", SqlKind::BigInt)}, {"k"}});
+  auto r = live.prepare(CreateTableDdl{{kPublicSchema, "u"}, {col("k", SqlKind::BigInt)}, {"k"}});
+  (void)other.apply(CreateTableDdl{{kPublicSchema, "v"}, {col("k", SqlKind::BigInt)}, {"k"}});
   CHECK_FALSE(live.commit(std::move(r)));
-  CHECK(live.current()->table("u") == nullptr);
+  CHECK(live.current()->table({kPublicSchema, "u"}) == nullptr);
   // The next DDL of the first catalog builds on what the database holds, not
   // on its stale version: it takes fresh ids and leaves v's record alone.
-  auto after = live.apply(CreateTableDdl{"u", {col("k", SqlKind::BigInt)}, {"k"}});
-  REQUIRE(after->table("v") != nullptr);
-  CHECK(after->table("u")->id > after->table("v")->layout_id);
-  { LiveCatalog reread{db}; CHECK(reread.current()->table("v") != nullptr); }
+  auto after = live.apply(CreateTableDdl{{kPublicSchema, "u"}, {col("k", SqlKind::BigInt)}, {"k"}});
+  REQUIRE(after->table({kPublicSchema, "v"}) != nullptr);
+  CHECK(after->table({kPublicSchema, "u"})->id > after->table({kPublicSchema, "v"})->layout_id);
+  { LiveCatalog reread{db}; CHECK(reread.current()->table({kPublicSchema, "v"}) != nullptr); }
 
   // A prepare on a version another DDL of the same catalog replaced is a
   // conflict too, before the engine sees it.
   LiveCatalog fresh{db};
-  auto s1 = fresh.prepare(CreateTableDdl{"w1", {col("k", SqlKind::BigInt)}, {"k"}});
-  auto s2 = fresh.prepare(CreateTableDdl{"w2", {col("k", SqlKind::BigInt)}, {"k"}});
+  auto s1 = fresh.prepare(CreateTableDdl{{kPublicSchema, "w1"}, {col("k", SqlKind::BigInt)}, {"k"}});
+  auto s2 = fresh.prepare(CreateTableDdl{{kPublicSchema, "w2"}, {col("k", SqlKind::BigInt)}, {"k"}});
   CHECK(fresh.commit(std::move(s1)));
   CHECK_FALSE(fresh.commit(std::move(s2)));
 }
@@ -1023,10 +1023,10 @@ TEST_CASE("catalog: two catalogs on one database interleave DDL without reusing 
     LiveCatalog a{db};
     LiveCatalog b{db};
     for (int i = 0; i < 10; ++i) {
-      (void)a.apply(CreateTableDdl{"a" + std::to_string(i), {col("k", SqlKind::BigInt)}, {"k"}});
+      (void)a.apply(CreateTableDdl{{kPublicSchema, "a" + std::to_string(i)}, {col("k", SqlKind::BigInt)}, {"k"}});
       // b's next pin sees a's table: a reader catches up, not only a DDL.
-      CHECK(b.pin().cat->table("a" + std::to_string(i)) != nullptr);
-      (void)b.apply(CreateTableDdl{"b" + std::to_string(i), {col("k", SqlKind::BigInt)}, {"k"}});
+      CHECK(b.pin().cat->table({kPublicSchema, "a" + std::to_string(i)}) != nullptr);
+      (void)b.apply(CreateTableDdl{{kPublicSchema, "b" + std::to_string(i)}, {col("k", SqlKind::BigInt)}, {"k"}});
     }
     db.close();
   }
@@ -1049,12 +1049,12 @@ TEST_CASE("catalog: a backfill past the batch limit is refused before it gathers
   (void)live.apply(create_t());
   for (std::int64_t i = 0; i < 50; ++i) put_t_row(db, *live.current(), i, "name", i);
   live.set_backfill_limit_for_testing(512);  // about 25 index entries
-  CHECK_THROWS_AS(live.apply(CreateIndexDdl{"t_by_name", "t", {{"name"}}}), std::length_error);
-  CHECK_THROWS_AS(live.apply(AddColumnDdl{"t", col("x", SqlKind::BigInt, true, std::int64_t{1})}), std::length_error);
+  CHECK_THROWS_AS(live.apply(CreateIndexDdl{"t_by_name", {kPublicSchema, "t"}, {{"name"}}}), std::length_error);
+  CHECK_THROWS_AS(live.apply(AddColumnDdl{{kPublicSchema, "t"}, col("x", SqlKind::BigInt, true, std::int64_t{1})}), std::length_error);
   CHECK(live.current()->version() == 1);
   CHECK(count_prefix(db, Bytes{std::byte{kNsIndex}}) == 0);
   live.set_backfill_limit_for_testing(LiveCatalog::kMaxBackfillBytes);
-  (void)live.apply(CreateIndexDdl{"t_by_name", "t", {{"name"}}});
+  (void)live.apply(CreateIndexDdl{"t_by_name", {kPublicSchema, "t"}, {{"name"}}});
   CHECK(count_prefix(db, prefix_of(kNsIndex, 3)) == 50);
 }
 
@@ -1070,20 +1070,20 @@ TEST_CASE("catalog: a backfill reads the rows of its RowSource, not the engine's
   MapRows source;
   source.rows.insert(t_row(*cat, 1, "bob", 10));
   source.rows.insert(t_row(*cat, 3, "cy", 30));
-  const auto& t = *cat->table("t");
+  const auto& t = *cat->table({kPublicSchema, "t"});
 
   SECTION("CREATE INDEX indexes the source's rows") {
     std::vector<Catalog::DdlOp> ops;
     auto backfill = false;
-    auto next = cat->next_version(CreateIndexDdl{"t_by_name", "t", {{"name"}}}, source, ops, backfill,
+    auto next = cat->next_version(CreateIndexDdl{"t_by_name", {kPublicSchema, "t"}, {{"name"}}}, source, ops, backfill,
                                   LiveCatalog::kMaxBackfillBytes);
     REQUIRE(next != nullptr);
     CHECK(backfill);
-    const auto& ix = next->table("t")->indexes.at(0);
+    const auto& ix = next->table({kPublicSchema, "t"})->indexes.at(0);
     std::vector<Bytes> want;
     for (const auto& [pk, row] : source.rows) {
       Bytes k;
-      REQUIRE(encode_index_key_from_row(*next->table("t"), ix, row, k));
+      REQUIRE(encode_index_key_from_row(*next->table({kPublicSchema, "t"}), ix, row, k));
       want.push_back(std::move(k));
     }
     CHECK(puts_under(ops, prefix_of(kNsIndex, ix.id)) == want);
@@ -1091,7 +1091,7 @@ TEST_CASE("catalog: a backfill reads the rows of its RowSource, not the engine's
   SECTION("ADD COLUMN … DEFAULT rewrites the source's rows") {
     std::vector<Catalog::DdlOp> ops;
     auto backfill = false;
-    auto next = cat->next_version(AddColumnDdl{"t", col("x", SqlKind::BigInt, true, std::int64_t{7})}, source, ops,
+    auto next = cat->next_version(AddColumnDdl{{kPublicSchema, "t"}, col("x", SqlKind::BigInt, true, std::int64_t{7})}, source, ops,
                                   backfill, LiveCatalog::kMaxBackfillBytes);
     REQUIRE(next != nullptr);
     CHECK(backfill);
@@ -1103,13 +1103,13 @@ TEST_CASE("catalog: a backfill reads the rows of its RowSource, not the engine's
     source.rows.insert(t_row(*cat, 4, "bob", 40));
     std::vector<Catalog::DdlOp> ops;
     auto backfill = false;
-    CHECK_THROWS_AS((void)cat->next_version(CreateIndexDdl{"t_name_u", "t", {{"name"}}, true}, source, ops, backfill,
+    CHECK_THROWS_AS((void)cat->next_version(CreateIndexDdl{"t_name_u", {kPublicSchema, "t"}, {{"name"}}, true}, source, ops, backfill,
                                             LiveCatalog::kMaxBackfillBytes),
                     ConstraintViolation);
   }
   SECTION("an autocommit DDL reads the engine's snapshot") {
-    (void)live.apply(CreateIndexDdl{"t_by_name", "t", {{"name"}}});
-    CHECK(count_prefix(db, prefix_of(kNsIndex, live.current()->table("t")->indexes.at(0).id)) == 2);
+    (void)live.apply(CreateIndexDdl{"t_by_name", {kPublicSchema, "t"}, {{"name"}}});
+    CHECK(count_prefix(db, prefix_of(kNsIndex, live.current()->table({kPublicSchema, "t"})->indexes.at(0).id)) == 2);
   }
 }
 
@@ -1140,8 +1140,8 @@ TEST_CASE("catalog: the constants block a plan needs", "[sql][catalog]") {
   auto db = DB::open(dir.path());
   LiveCatalog live{db};
   (void)live.apply(create_t());
-  auto cat = live.apply(CreateIndexDdl{"t_by_name", "t", {{"name"}}});
-  const auto& t = *cat->table("t");
+  auto cat = live.apply(CreateIndexDdl{"t_by_name", {kPublicSchema, "t"}, {{"name"}}});
+  const auto& t = *cat->table({kPublicSchema, "t"});
   auto cs = Catalog::constants(t);
   CHECK(constant(cs, "TBL_1") == 1);
   CHECK(constant(cs, "IDX_3") == 3);
@@ -1172,49 +1172,49 @@ TEST_CASE("catalog: a view is a record and a name entry, survives a reopen, and 
     auto db = DB::open(dir.path());
     LiveCatalog live{db};
     (void)live.apply(create_t());
-    t_id = live.current()->table("t")->id;
-    (void)live.apply(CreateViewDdl{"v", "CREATE VIEW v AS SELECT id FROM t", {t_id, t_id}, {"id"}});
+    t_id = live.current()->table({kPublicSchema, "t"})->id;
+    (void)live.apply(CreateViewDdl{{kPublicSchema, "v"}, "CREATE VIEW v AS SELECT id FROM t", {t_id, t_id}, {"id"}});
     auto cat = live.current();
-    REQUIRE(cat->view("v") != nullptr);
-    v_id = cat->view("v")->id;
+    REQUIRE(cat->view({kPublicSchema, "v"}) != nullptr);
+    v_id = cat->view({kPublicSchema, "v"})->id;
     CHECK(v_id > t_id);  // one id counter, never reused
-    CHECK(cat->view("v")->definition == "CREATE VIEW v AS SELECT id FROM t");
-    CHECK(cat->view("v")->depends_on == std::vector<std::uint32_t>{t_id});  // each once
-    CHECK(cat->view("v")->columns == std::vector<std::string>{"id"});
-    CHECK(cat->table("v") == nullptr);
-    CHECK(cat->view("t") == nullptr);
+    CHECK(cat->view({kPublicSchema, "v"})->definition == "CREATE VIEW v AS SELECT id FROM t");
+    CHECK(cat->view({kPublicSchema, "v"})->depends_on == std::vector<std::uint32_t>{t_id});  // each once
+    CHECK(cat->view({kPublicSchema, "v"})->columns == std::vector<std::string>{"id"});
+    CHECK(cat->table({kPublicSchema, "v"}) == nullptr);
+    CHECK(cat->view({kPublicSchema, "t"}) == nullptr);
     // A name is one namespace for tables, indexes and views.
-    CHECK(refused(live, CreateViewDdl{"v", "x", {t_id}, {"id"}}) == "42P07");
-    CHECK(refused(live, CreateViewDdl{"t", "x", {t_id}, {"id"}}) == "42P07");
-    CHECK(refused(live, CreateTableDdl{"v", {col("id", SqlKind::BigInt)}, {"id"}}) == "42P07");
-    CHECK(refused(live, CreateViewDdl{"w", "x", {9999}, {"id"}}) == "42P01");  // reads what is not there
+    CHECK(refused(live, CreateViewDdl{{kPublicSchema, "v"}, "x", {t_id}, {"id"}}) == "42P07");
+    CHECK(refused(live, CreateViewDdl{{kPublicSchema, "t"}, "x", {t_id}, {"id"}}) == "42P07");
+    CHECK(refused(live, CreateTableDdl{{kPublicSchema, "v"}, {col("id", SqlKind::BigInt)}, {"id"}}) == "42P07");
+    CHECK(refused(live, CreateViewDdl{{kPublicSchema, "w"}, "x", {9999}, {"id"}}) == "42P01");  // reads what is not there
     // The wrong statement for the object.
-    CHECK(refused(live, DropTableDdl{"v"}) == "42809");
-    CHECK(refused(live, DropViewDdl{"t"}) == "42809");
-    CHECK(refused(live, DropIndexDdl{"v"}) == "42809");
-    CHECK(refused(live, CreateIndexDdl{"i", "v", {{"id"}}}) == "42809");
-    CHECK(refused(live, AddColumnDdl{"v", col("c", SqlKind::BigInt)}) == "42809");
+    CHECK(refused(live, DropTableDdl{{kPublicSchema, "v"}}) == "42809");
+    CHECK(refused(live, DropViewDdl{{kPublicSchema, "t"}}) == "42809");
+    CHECK(refused(live, DropIndexDdl{{kPublicSchema, "v"}}) == "42809");
+    CHECK(refused(live, CreateIndexDdl{"i", {kPublicSchema, "v"}, {{"id"}}}) == "42809");
+    CHECK(refused(live, AddColumnDdl{{kPublicSchema, "v"}, col("c", SqlKind::BigInt)}) == "42809");
     // A table a view reads cannot be dropped; nor a view another reads.
-    CHECK(refused(live, DropTableDdl{"t"}) == "2BP01");
-    (void)live.apply(CreateViewDdl{"w", "CREATE VIEW w AS SELECT id FROM v", {v_id}, {"id"}});
-    CHECK(refused(live, DropViewDdl{"v"}) == "2BP01");
-    CHECK(live.current()->view("v") != nullptr);
+    CHECK(refused(live, DropTableDdl{{kPublicSchema, "t"}}) == "2BP01");
+    (void)live.apply(CreateViewDdl{{kPublicSchema, "w"}, "CREATE VIEW w AS SELECT id FROM v", {v_id}, {"id"}});
+    CHECK(refused(live, DropViewDdl{{kPublicSchema, "v"}}) == "2BP01");
+    CHECK(live.current()->view({kPublicSchema, "v"}) != nullptr);
     db.close();
   }
   {
     auto db = DB::open(dir.path());
     LiveCatalog live{db};
     auto cat = live.current();
-    REQUIRE(cat->view("v") != nullptr);
-    CHECK(cat->view("v")->id == v_id);
-    CHECK(cat->view("w")->depends_on == std::vector<std::uint32_t>{v_id});
+    REQUIRE(cat->view({kPublicSchema, "v"}) != nullptr);
+    CHECK(cat->view({kPublicSchema, "v"})->id == v_id);
+    CHECK(cat->view({kPublicSchema, "w"})->depends_on == std::vector<std::uint32_t>{v_id});
     CHECK(count_prefix(db, view_record_key(v_id)) == 1);
-    (void)live.apply(DropViewDdl{"w"});
-    (void)live.apply(DropViewDdl{"v"});
+    (void)live.apply(DropViewDdl{{kPublicSchema, "w"}});
+    (void)live.apply(DropViewDdl{{kPublicSchema, "v"}});
     CHECK(count_prefix(db, view_record_key(v_id)) == 0);
-    CHECK(live.apply(DropViewDdl{"v", true}) == live.current());  // IF EXISTS of nothing: no new version
-    CHECK(refused(live, DropViewDdl{"v"}) == "42P01");
-    (void)live.apply(DropTableDdl{"t"});  // nothing reads it now
+    CHECK(live.apply(DropViewDdl{{kPublicSchema, "v"}, true}) == live.current());  // IF EXISTS of nothing: no new version
+    CHECK(refused(live, DropViewDdl{{kPublicSchema, "v"}}) == "42P01");
+    (void)live.apply(DropTableDdl{{kPublicSchema, "t"}});  // nothing reads it now
     db.close();
   }
   {
@@ -1235,8 +1235,8 @@ TEST_CASE("catalog: a view's record and name entry must agree at load, and a dam
     auto db = DB::open(dir.path());
     LiveCatalog live{db};
     (void)live.apply(create_t());
-    (void)live.apply(CreateViewDdl{"v", "CREATE VIEW v AS SELECT id FROM t", {live.current()->table("t")->id}, {"id"}});
-    v_id = live.current()->view("v")->id;
+    (void)live.apply(CreateViewDdl{{kPublicSchema, "v"}, "CREATE VIEW v AS SELECT id FROM t", {live.current()->table({kPublicSchema, "t"})->id}, {"id"}});
+    v_id = live.current()->view({kPublicSchema, "v"})->id;
     Bytes v;
     REQUIRE(db.snapshot().get({}, view_record_key(v_id), v));
     record = v;
@@ -1289,7 +1289,7 @@ TEST_CASE("catalog: a view's record and name entry must agree at load, and a dam
     auto db = DB::open(dir.path());
     db.put({}, name_entry_key("v"), Bytes{std::byte{3}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{static_cast<unsigned char>(v_id)}});
     LiveCatalog ok{db};  // consistent again
-    CHECK(ok.current()->view("v") != nullptr);
+    CHECK(ok.current()->view({kPublicSchema, "v"}) != nullptr);
     db.close();
   }
 }
@@ -1303,19 +1303,25 @@ auto neword_args() -> std::vector<ProcedureArg> {
 }
 
 auto create_p(std::string name = "p", bool replace = false, std::string body = "BEGIN END") -> CreateProcedureDdl {
-  return {std::move(name), "CREATE PROCEDURE p(...) LANGUAGE plpgsql AS $$" + body + "$$", replace, neword_args()};
+  return {{kPublicSchema, std::move(name)}, "CREATE PROCEDURE p(...) LANGUAGE plpgsql AS $$" + body + "$$", replace, neword_args()};
 }
 
 }  // namespace
 
 namespace {
+// Each object a name in public.
+auto in_public(std::vector<std::string> names) -> std::vector<QualifiedName> {
+  std::vector<QualifiedName> out;
+  for (auto& n : names) out.push_back({kPublicSchema, std::move(n)});
+  return out;
+}
 auto grant(std::vector<std::string> objects, std::vector<std::string> grantees, std::vector<GrantDdl::Privilege> privileges = {},
            bool option = false) -> GrantDdl {
-  return GrantDdl{true, option, std::move(privileges), std::move(objects), std::move(grantees), std::nullopt};
+  return GrantDdl{true, option, std::move(privileges), in_public(std::move(objects)), std::move(grantees), std::nullopt};
 }
 auto revoke(std::vector<std::string> objects, std::vector<std::string> grantees, std::vector<GrantDdl::Privilege> privileges = {},
             bool option_only = false) -> GrantDdl {
-  return GrantDdl{false, option_only, std::move(privileges), std::move(objects), std::move(grantees), std::nullopt};
+  return GrantDdl{false, option_only, std::move(privileges), in_public(std::move(objects)), std::move(grantees), std::nullopt};
 }
 auto refused_state(LiveCatalog& live, const Ddl& ddl) -> std::string {
   try {
@@ -1327,6 +1333,39 @@ auto refused_state(LiveCatalog& live, const Ddl& ddl) -> std::string {
 }
 }  // namespace
 
+TEST_CASE("catalog: lookups are keyed by (schema, name), and a DDL naming a schema but public is refused",
+          "[sql][catalog][schemas]") {
+  sql_test::TempDir dir{"catalog_schemas"};
+  auto db = DB::open(dir.path());
+  LiveCatalog live{db};
+  (void)live.apply(create_t());
+  (void)live.apply(CreateIndexDdl{"t_by_name", {kPublicSchema, "t"}, {{"name"}}});
+  (void)live.apply(CreateTypeDdl{{kPublicSchema, "ty"}});
+  (void)live.apply(CreateSequenceDdl{{kPublicSchema, "sq"}});
+  auto cat = live.current();
+  REQUIRE(cat->table({kPublicSchema, "t"}) != nullptr);
+  constexpr std::uint32_t kOther = 7;  // no schema exists but public (stage 1a)
+  CHECK(cat->table({kOther, "t"}) == nullptr);
+  CHECK(cat->index({kOther, "t_by_name"}).second == nullptr);
+  CHECK(cat->index({kPublicSchema, "t_by_name"}).second != nullptr);
+  CHECK(cat->type({kOther, "ty"}) == nullptr);
+  CHECK(cat->sequence({kOther, "sq"}) == nullptr);
+  // Only the Catalog API can name another schema: refused, nothing written,
+  // never created in public instead.
+  auto version = cat->version();
+  CHECK(refused_state(live, CreateTableDdl{{kOther, "u"}, {col("id", SqlKind::BigInt)}, {"id"}}) == "3F000");
+  CHECK(refused_state(live, DropTableDdl{{kOther, "t"}}) == "3F000");
+  CHECK(refused_state(live, CreateIndexDdl{"t_by_qty", {kOther, "t"}, {{"qty"}}}) == "3F000");
+  CHECK(refused_state(live, CreateTypeDdl{{kOther, "ty2"}}) == "3F000");
+  GrantDdl g;
+  g.objects = {{kPublicSchema, "t"}, {kOther, "t"}};
+  g.grantees = {""};
+  CHECK(refused_state(live, Ddl{g}) == "3F000");
+  CHECK(live.current()->version() == version);
+  CHECK(live.current()->table({kPublicSchema, "u"}) == nullptr);
+  CHECK(live.current()->table({kPublicSchema, "t"}) != nullptr);
+}
+
 TEST_CASE("catalog: roles and privileges are records of their own, survive a reopen, and go with their objects",
           "[sql][catalog][roles]") {
   sql_test::TempDir dir{"catalog_roles"};
@@ -1336,7 +1375,7 @@ TEST_CASE("catalog: roles and privileges are records of their own, survive a reo
     auto db = DB::open(dir.path());
     LiveCatalog live{db};
     (void)live.apply(create_t());
-    t_id = live.current()->table("t")->id;
+    t_id = live.current()->table({kPublicSchema, "t"})->id;
     (void)live.apply(CreateRoleDdl{"r1"});
     (void)live.apply(CreateRoleDdl{"r2"});
     r1 = live.current()->role("r1")->id;
@@ -1366,8 +1405,8 @@ TEST_CASE("catalog: roles and privileges are records of their own, survive a reo
     (void)live.apply(grant({"t"}, {"r1", ""}, {{"all", {}}}));
     (void)live.apply(grant({"t", "t"}, {"r2"}, {{"select", {"qty"}}, {"update", {"qty", "name"}}}, true));
     auto acl = live.current()->acl(t_id);
-    auto qty = live.current()->table("t")->column("qty")->id;
-    auto name = live.current()->table("t")->column("name")->id;
+    auto qty = live.current()->table({kPublicSchema, "t"})->column("qty")->id;
+    auto name = live.current()->table({kPublicSchema, "t"})->column("name")->id;
     CHECK(std::vector<AclEntry>(acl.begin(), acl.end()) ==
           std::vector<AclEntry>{{r2, name, pv::kUpdate, pv::kUpdate, kBootstrapRole},
                                 {r2, qty, pv::kSelect | pv::kUpdate, pv::kSelect | pv::kUpdate, kBootstrapRole},
@@ -1398,7 +1437,7 @@ TEST_CASE("catalog: roles and privileges are records of their own, survive a reo
     CHECK(cat->roles().size() == 3);
     CHECK(cat->acl(t_id).size() == 2);
     // A drop takes the object's privileges with it, and frees the role.
-    (void)live.apply(DropTableDdl{"t"});
+    (void)live.apply(DropTableDdl{{kPublicSchema, "t"}});
     CHECK(live.current()->acls().empty());
     CHECK(!db.snapshot().contains_key({}, acl_record_key(t_id)));
     (void)live.apply(DropRoleDdl{{"r1", "r2", "t"}});
@@ -1420,7 +1459,7 @@ TEST_CASE("catalog: a role's record and name entry, and a privileges record, mus
     (void)live.apply(CreateRoleDdl{"r"});
     (void)live.apply(grant({"t"}, {"r"}, {{"select", {"qty"}}, {"insert", {}}}, true));
     (void)live.apply(grant({"t"}, {""}, {{"select", {"qty"}}, {"insert", {}}}));
-    t_id = live.current()->table("t")->id;
+    t_id = live.current()->table({kPublicSchema, "t"})->id;
     r_id = live.current()->role("r")->id;
     REQUIRE(db.snapshot().get({}, role_record_key(r_id), role_record));
     REQUIRE(db.snapshot().get({}, role_name_key("r"), role_entry));
@@ -1514,21 +1553,21 @@ TEST_CASE("catalog: domains, shell types and sequences are records of their name
     (void)live.apply(create_t());
     (void)live.apply(CreateRoleDdl{"r"});
     // The type namespace holds domains, shell types and every table's and view's row type.
-    (void)live.apply(CreateDomainDdl{"d", SqlType{SqlKind::Integer}});
-    CHECK(refused_state(live, CreateDomainDdl{"d", SqlType{SqlKind::Integer}}) == "42710");
-    CHECK(refused_state(live, CreateDomainDdl{"t", SqlType{SqlKind::Integer}}) == "42710");
-    CHECK(refused_state(live, CreateTypeDdl{"t"}) == "42710");
-    CHECK(refused_state(live, CreateTableDdl{"d", {col("a", SqlKind::BigInt)}, {"a"}}) == "42710");
-    (void)live.apply(CreateTypeDdl{"sh"});
-    CHECK(refused_state(live, CreateTypeDdl{"sh"}) == "42710");
+    (void)live.apply(CreateDomainDdl{{kPublicSchema, "d"}, SqlType{SqlKind::Integer}});
+    CHECK(refused_state(live, CreateDomainDdl{{kPublicSchema, "d"}, SqlType{SqlKind::Integer}}) == "42710");
+    CHECK(refused_state(live, CreateDomainDdl{{kPublicSchema, "t"}, SqlType{SqlKind::Integer}}) == "42710");
+    CHECK(refused_state(live, CreateTypeDdl{{kPublicSchema, "t"}}) == "42710");
+    CHECK(refused_state(live, CreateTableDdl{{kPublicSchema, "d"}, {col("a", SqlKind::BigInt)}, {"a"}}) == "42710");
+    (void)live.apply(CreateTypeDdl{{kPublicSchema, "sh"}});
+    CHECK(refused_state(live, CreateTypeDdl{{kPublicSchema, "sh"}}) == "42710");
     // A sequence is a relation, with no row type.
-    (void)live.apply(CreateSequenceDdl{"s"});
-    CHECK(refused_state(live, CreateSequenceDdl{"t"}) == "42P07");
-    CHECK(refused_state(live, CreateTableDdl{"s", {col("a", SqlKind::BigInt)}, {"a"}}) == "42P07");
-    CHECK(refused_state(live, CreateSequenceDdl{"s", true}).empty());
-    (void)live.apply(CreateDomainDdl{"s", SqlType{SqlKind::Text}});
-    d_id = live.current()->type("d")->id;
-    s_id = live.current()->sequence("s")->id;
+    (void)live.apply(CreateSequenceDdl{{kPublicSchema, "s"}});
+    CHECK(refused_state(live, CreateSequenceDdl{{kPublicSchema, "t"}}) == "42P07");
+    CHECK(refused_state(live, CreateTableDdl{{kPublicSchema, "s"}, {col("a", SqlKind::BigInt)}, {"a"}}) == "42P07");
+    CHECK(refused_state(live, CreateSequenceDdl{{kPublicSchema, "s"}, true}).empty());
+    (void)live.apply(CreateDomainDdl{{kPublicSchema, "s"}, SqlType{SqlKind::Text}});
+    d_id = live.current()->type({kPublicSchema, "d"})->id;
+    s_id = live.current()->sequence({kPublicSchema, "s"})->id;
     // Grants by the kind ON names: USAGE of a domain; USAGE, SELECT, UPDATE of a sequence.
     CHECK(refused_state(live, on(grant({"d"}, {"r"}, {{"select", {}}}), GrantDdl::Target::Domain)) == "0LP01");
     CHECK(refused_state(live, on(grant({"s"}, {"r"}, {{"insert", {}}}), GrantDdl::Target::Sequence)) == "0LP01");
@@ -1542,32 +1581,32 @@ TEST_CASE("catalog: domains, shell types and sequences are records of their name
     CHECK(live.current()->acl(s_id).front().privileges == (privilege::kSelect | privilege::kUsage));
     CHECK(refused_state(live, DropRoleDdl{{"r"}}) == "2BP01");
     // The wrong drop for the kind.
-    CHECK(refused_state(live, DropTableDdl{"s"}) == "42809");
-    CHECK(refused_state(live, DropSequenceDdl{"t"}) == "42809");
-    CHECK(refused_state(live, DropTypeDdl{"sh", true}) == "42809");  // DROP DOMAIN of a shell type
-    CHECK(refused_state(live, DropTypeDdl{"nope", true}) == "42704");
-    CHECK(refused_state(live, DropSequenceDdl{"nope"}) == "42P01");
+    CHECK(refused_state(live, DropTableDdl{{kPublicSchema, "s"}}) == "42809");
+    CHECK(refused_state(live, DropSequenceDdl{{kPublicSchema, "t"}}) == "42809");
+    CHECK(refused_state(live, DropTypeDdl{{kPublicSchema, "sh"}, true}) == "42809");  // DROP DOMAIN of a shell type
+    CHECK(refused_state(live, DropTypeDdl{{kPublicSchema, "nope"}, true}) == "42704");
+    CHECK(refused_state(live, DropSequenceDdl{{kPublicSchema, "nope"}}) == "42P01");
     db.close();
   }
   {
     auto db = DB::open(dir.path());
     LiveCatalog live{db};
     auto cat = live.current();
-    REQUIRE(cat->type("d") != nullptr);
-    CHECK(cat->type("d")->kind == TypeObject::Kind::Domain);
-    CHECK(cat->type("d")->base == SqlType{SqlKind::Integer});
-    CHECK(cat->type("sh")->kind == TypeObject::Kind::Shell);
-    CHECK(cat->sequence("s")->id == s_id);
+    REQUIRE(cat->type({kPublicSchema, "d"}) != nullptr);
+    CHECK(cat->type({kPublicSchema, "d"})->kind == TypeObject::Kind::Domain);
+    CHECK(cat->type({kPublicSchema, "d"})->base == SqlType{SqlKind::Integer});
+    CHECK(cat->type({kPublicSchema, "sh"})->kind == TypeObject::Kind::Shell);
+    CHECK(cat->sequence({kPublicSchema, "s"})->id == s_id);
     CHECK(cat->acl(s_id).size() == 1);
     // CREATE DOMAIN fills a shell type in, under its id.
-    auto sh = cat->type("sh")->id;
-    (void)live.apply(CreateDomainDdl{"sh", SqlType{SqlKind::BigInt}});
-    CHECK(live.current()->type("sh")->id == sh);
-    CHECK(live.current()->type("sh")->kind == TypeObject::Kind::Domain);
+    auto sh = cat->type({kPublicSchema, "sh"})->id;
+    (void)live.apply(CreateDomainDdl{{kPublicSchema, "sh"}, SqlType{SqlKind::BigInt}});
+    CHECK(live.current()->type({kPublicSchema, "sh"})->id == sh);
+    CHECK(live.current()->type({kPublicSchema, "sh"})->kind == TypeObject::Kind::Domain);
     // Drops take the grants with them.
-    (void)live.apply(DropTypeDdl{"d", true});
-    (void)live.apply(DropSequenceDdl{"s"});
-    (void)live.apply(DropTypeDdl{"sh", false});
+    (void)live.apply(DropTypeDdl{{kPublicSchema, "d"}, true});
+    (void)live.apply(DropSequenceDdl{{kPublicSchema, "s"}});
+    (void)live.apply(DropTypeDdl{{kPublicSchema, "sh"}, false});
     CHECK(live.current()->acls().empty());
     (void)live.apply(DropRoleDdl{{"r"}});
     CHECK(!db.snapshot().contains_key({}, type_record_key(d_id)));
@@ -1584,10 +1623,10 @@ TEST_CASE("catalog: a type's and a sequence's records and name entries must agre
   {
     auto db = DB::open(dir.path());
     LiveCatalog live{db};
-    (void)live.apply(CreateDomainDdl{"d", SqlType{SqlKind::Decimal, 0, 10, 2}});
-    (void)live.apply(CreateSequenceDdl{"s"});
-    d_id = live.current()->type("d")->id;
-    s_id = live.current()->sequence("s")->id;
+    (void)live.apply(CreateDomainDdl{{kPublicSchema, "d"}, SqlType{SqlKind::Decimal, 0, 10, 2}});
+    (void)live.apply(CreateSequenceDdl{{kPublicSchema, "s"}});
+    d_id = live.current()->type({kPublicSchema, "d"})->id;
+    s_id = live.current()->sequence({kPublicSchema, "s"})->id;
     REQUIRE(db.snapshot().get({}, type_record_key(d_id), domain));
     REQUIRE(db.snapshot().get({}, type_name_key("d"), domain_entry));
     REQUIRE(db.snapshot().get({}, sequence_record_key(s_id), seq));
@@ -1650,7 +1689,7 @@ TEST_CASE("catalog: a type's and a sequence's records and name entries must agre
   restore();
   auto db = DB::open(dir.path());
   LiveCatalog live{db};
-  CHECK(live.current()->type("d")->base == SqlType{SqlKind::Decimal, 0, 10, 2});
+  CHECK(live.current()->type({kPublicSchema, "d"})->base == SqlType{SqlKind::Decimal, 0, 10, 2});
   db.close();
 }
 
@@ -1670,21 +1709,21 @@ TEST_CASE("catalog: a procedure is a record and a name entry of its own namespac
     auto db = DB::open(dir.path());
     LiveCatalog live{db};
     (void)live.apply(create_t());
-    auto t_id = live.current()->table("t")->id;
+    auto t_id = live.current()->table({kPublicSchema, "t"})->id;
     (void)live.apply(create_p());
     auto cat = live.current();
-    REQUIRE(cat->procedure("p") != nullptr);
-    p_id = cat->procedure("p")->id;
+    REQUIRE(cat->procedure({kPublicSchema, "p"}) != nullptr);
+    p_id = cat->procedure({kPublicSchema, "p"})->id;
     CHECK(p_id > t_id);  // one id counter
-    CHECK(cat->procedure("p")->args == neword_args());
-    CHECK(cat->procedure("p")->definition == create_p().definition);
+    CHECK(cat->procedure({kPublicSchema, "p"})->args == neword_args());
+    CHECK(cat->procedure({kPublicSchema, "p"})->definition == create_p().definition);
     // A namespace of its own: a procedure and a table may share a name.
     (void)live.apply(create_p("t"));
-    CHECK(live.current()->table("t") != nullptr);
-    CHECK(live.current()->procedure("t") != nullptr);
-    (void)live.apply(CreateTableDdl{"p", {col("id", SqlKind::BigInt)}, {"id"}});
-    CHECK(refused(live, DropTableDdl{"t"}).empty());  // no dependency recorded: nothing refuses the drop
-    CHECK(live.current()->procedure("t") != nullptr);
+    CHECK(live.current()->table({kPublicSchema, "t"}) != nullptr);
+    CHECK(live.current()->procedure({kPublicSchema, "t"}) != nullptr);
+    (void)live.apply(CreateTableDdl{{kPublicSchema, "p"}, {col("id", SqlKind::BigInt)}, {"id"}});
+    CHECK(refused(live, DropTableDdl{{kPublicSchema, "t"}}).empty());  // no dependency recorded: nothing refuses the drop
+    CHECK(live.current()->procedure({kPublicSchema, "t"}) != nullptr);
     // One procedure per name: no overloading, and OR REPLACE keeps the arguments.
     CHECK(refused(live, create_p()) == "42723");
     auto other = create_p("p", true);
@@ -1696,38 +1735,38 @@ TEST_CASE("catalog: a procedure is a record and a name entry of its own namespac
     auto twice = create_p("q");
     twice.args[1].name = "w_id";
     CHECK(refused(live, twice) == "42P13");
-    CHECK(live.current()->procedure("q") == nullptr);
+    CHECK(live.current()->procedure({kPublicSchema, "q"}) == nullptr);
     (void)live.apply(create_p("p", true, "BEGIN NULL; END"));
-    CHECK(live.current()->procedure("p")->id == p_id);  // replaced in place
-    CHECK(live.current()->procedure("p")->definition.find("NULL") != std::string::npos);
+    CHECK(live.current()->procedure({kPublicSchema, "p"})->id == p_id);  // replaced in place
+    CHECK(live.current()->procedure({kPublicSchema, "p"})->definition.find("NULL") != std::string::npos);
     (void)live.apply(create_p("r", true));  // OR REPLACE of nothing creates it
-    CHECK(live.current()->procedure("r") != nullptr);
+    CHECK(live.current()->procedure({kPublicSchema, "r"}) != nullptr);
     db.close();
   }
   {
     auto db = DB::open(dir.path());
     LiveCatalog live{db};
     auto cat = live.current();
-    REQUIRE(cat->procedure("p") != nullptr);
-    CHECK(cat->procedure("p")->id == p_id);
-    CHECK(cat->procedure("p")->args == neword_args());
-    CHECK(cat->procedure("p")->definition.find("NULL") != std::string::npos);
+    REQUIRE(cat->procedure({kPublicSchema, "p"}) != nullptr);
+    CHECK(cat->procedure({kPublicSchema, "p"})->id == p_id);
+    CHECK(cat->procedure({kPublicSchema, "p"})->args == neword_args());
+    CHECK(cat->procedure({kPublicSchema, "p"})->definition.find("NULL") != std::string::npos);
     CHECK(cat->procedures().size() == 3);
     // A DROP's argument list names the input arguments, or all of them; modifiers
     // are not compared, and VARCHAR is TEXT.
     using Types = std::vector<SqlType>;
-    CHECK(refused(live, DropProcedureDdl{"p", Types{SqlType{SqlKind::BigInt}, SqlType{SqlKind::Text}}}) == "42883");
-    CHECK(refused(live, DropProcedureDdl{"p", Types{SqlType{SqlKind::Integer}}}) == "42883");
-    CHECK(live.apply(DropProcedureDdl{"p", Types{SqlType{SqlKind::Integer}}, true}) == live.current());  // IF EXISTS: no-op
-    (void)live.apply(DropProcedureDdl{"p", Types{SqlType{SqlKind::Integer}, SqlType{SqlKind::Text}}});
+    CHECK(refused(live, DropProcedureDdl{{kPublicSchema, "p"}, Types{SqlType{SqlKind::BigInt}, SqlType{SqlKind::Text}}}) == "42883");
+    CHECK(refused(live, DropProcedureDdl{{kPublicSchema, "p"}, Types{SqlType{SqlKind::Integer}}}) == "42883");
+    CHECK(live.apply(DropProcedureDdl{{kPublicSchema, "p"}, Types{SqlType{SqlKind::Integer}}, true}) == live.current());  // IF EXISTS: no-op
+    (void)live.apply(DropProcedureDdl{{kPublicSchema, "p"}, Types{SqlType{SqlKind::Integer}, SqlType{SqlKind::Text}}});
     CHECK(count_prefix(db, procedure_record_key(p_id)) == 0);
     CHECK(count_prefix(db, procedure_name_key("p")) == 0);
-    (void)live.apply(DropProcedureDdl{"t", Types{SqlType{SqlKind::Integer}, SqlType{SqlKind::Varchar, 3},
+    (void)live.apply(DropProcedureDdl{{kPublicSchema, "t"}, Types{SqlType{SqlKind::Integer}, SqlType{SqlKind::Varchar, 3},
                                                  SqlType{SqlKind::Decimal, 0, 5, 0}}});
-    (void)live.apply(DropProcedureDdl{"r"});
-    CHECK(refused(live, DropProcedureDdl{"r"}) == "42883");
-    CHECK(live.apply(DropProcedureDdl{"r", std::nullopt, true}) == live.current());
-    CHECK(live.current()->table("p") != nullptr);  // the table of that name stays
+    (void)live.apply(DropProcedureDdl{{kPublicSchema, "r"}});
+    CHECK(refused(live, DropProcedureDdl{{kPublicSchema, "r"}}) == "42883");
+    CHECK(live.apply(DropProcedureDdl{{kPublicSchema, "r"}, std::nullopt, true}) == live.current());
+    CHECK(live.current()->table({kPublicSchema, "p"}) != nullptr);  // the table of that name stays
     db.close();
   }
   {
@@ -1736,7 +1775,7 @@ TEST_CASE("catalog: a procedure is a record and a name entry of its own namespac
     CHECK(live.current()->procedures().empty());
     // Dropped and created again: another object.
     (void)live.apply(create_p());
-    CHECK(live.current()->procedure("p")->id > p_id);
+    CHECK(live.current()->procedure({kPublicSchema, "p"})->id > p_id);
     db.close();
   }
 }
@@ -1750,7 +1789,7 @@ TEST_CASE("catalog: a procedure's record and name entry must agree at load, and 
     auto db = DB::open(dir.path());
     LiveCatalog live{db};
     (void)live.apply(create_p());
-    p_id = live.current()->procedure("p")->id;
+    p_id = live.current()->procedure({kPublicSchema, "p"})->id;
     REQUIRE(db.snapshot().get({}, procedure_record_key(p_id), record));
     REQUIRE(db.snapshot().get({}, procedure_name_key("p"), entry));
     db.close();
@@ -1811,7 +1850,7 @@ TEST_CASE("catalog: a procedure's record and name entry must agree at load, and 
   {
     auto db = DB::open(dir.path());
     LiveCatalog ok{db};  // consistent again
-    CHECK(ok.current()->procedure("p") != nullptr);
+    CHECK(ok.current()->procedure({kPublicSchema, "p"}) != nullptr);
     db.close();
   }
 }

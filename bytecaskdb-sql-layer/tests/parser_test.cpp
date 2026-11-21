@@ -13,6 +13,9 @@
 
 import bytecask.sql.parser;
 
+using bytecask::sql::kPublicSchema;
+using bytecask::sql::QualifiedName;
+
 using namespace bytecask::sql::ast;
 
 namespace {
@@ -30,7 +33,7 @@ auto rejected_at(std::string_view sql) -> std::int32_t {
 TEST_CASE("parser: the seven statements of the prototype", "[sql][parser]") {
   {
     auto s = std::get<CreateTable>(parse("CREATE TABLE t (id BIGINT PRIMARY KEY, name BYTEA, qty BIGINT)"));
-    CHECK(s.table == "t");
+    CHECK(s.table == QualifiedName{kPublicSchema, "t"});
     REQUIRE(s.columns.size() == 3);
     CHECK(s.columns[0].name == "id");
     CHECK(s.columns[0].type == "int8");  // libpg_query canonicalises BIGINT
@@ -41,13 +44,13 @@ TEST_CASE("parser: the seven statements of the prototype", "[sql][parser]") {
   {
     auto s = std::get<CreateIndex>(parse("CREATE INDEX t_by_name ON t (name)"));
     CHECK(s.index == "t_by_name");
-    CHECK(s.table == "t");
+    CHECK(s.table == QualifiedName{kPublicSchema, "t"});
     REQUIRE(s.columns.size() == 1);
     CHECK(s.columns[0].name == "name");
   }
   {
     auto s = std::get<Insert>(parse("INSERT INTO t VALUES ($1, $2, $3)"));
-    CHECK(s.table == "t");
+    CHECK(s.table == QualifiedName{kPublicSchema, "t"});
     CHECK(s.columns.empty());
     REQUIRE(s.rows.size() == 1);
     REQUIRE(s.rows[0].size() == 3);
@@ -88,7 +91,7 @@ TEST_CASE("parser: the seven statements of the prototype", "[sql][parser]") {
   }
   {
     auto s = std::get<Delete>(parse("DELETE FROM t WHERE id = $1"));
-    CHECK(s.table == "t");
+    CHECK(s.table == QualifiedName{kPublicSchema, "t"});
     REQUIRE(s.where.size() == 1);
   }
 }
@@ -99,10 +102,10 @@ TEST_CASE("parser: REFERENCES and FOREIGN KEY, NO ACTION or RESTRICT only, in th
                                        "ON UPDATE RESTRICT)"));
   REQUIRE(t.foreign_keys.size() == 3);
   const auto& f = t.foreign_keys;
-  CHECK((f[0].name.empty() && f[0].columns == std::vector<std::string>{"a"} && f[0].table == "p" &&
+  CHECK((f[0].name.empty() && f[0].columns == std::vector<std::string>{"a"} && f[0].table == QualifiedName{kPublicSchema, "p"} &&
          f[0].ref_columns == std::vector<std::string>{"x"}));
   CHECK((f[1].name == "bp" && f[1].columns == std::vector<std::string>{"b"} && f[1].ref_columns.empty()));
-  CHECK((f[2].name == "ab" && f[2].columns == std::vector<std::string>{"a", "b"} && f[2].table == "q" &&
+  CHECK((f[2].name == "ab" && f[2].columns == std::vector<std::string>{"a", "b"} && f[2].table == QualifiedName{kPublicSchema, "q"} &&
          f[2].ref_columns == std::vector<std::string>{"y", "x"}));
   CHECK(t.columns[0].references.empty());  // moved to the table's list
   for (auto sql : {"CREATE TABLE c (a INT REFERENCES p ON DELETE CASCADE)", "CREATE TABLE c (a INT REFERENCES p ON UPDATE SET NULL)",
@@ -119,7 +122,7 @@ TEST_CASE("parser: subqueries as values, EXISTS, IN and ANY, SOME or ALL", "[sql
                                     "EXISTS (SELECT 1 FROM u) AND id IN (SELECT a FROM u) AND id NOT IN (SELECT a FROM u) "
                                     "AND id < ALL (SELECT a FROM u) AND id <> SOME (SELECT a FROM u)"));
   REQUIRE(sel.targets[0].kind == Expr::Kind::Subquery);
-  CHECK(sel.targets[0].subquery->from[0].table == "u");
+  CHECK(sel.targets[0].subquery->from[0].table == QualifiedName{kPublicSchema, "u"});
   REQUIRE(sel.where.size() == 6);
   CHECK(sel.where[0].rhs.kind == Expr::Kind::Subquery);
   CHECK(sel.where[1].kind == Compare::Kind::Exists);
@@ -353,11 +356,11 @@ TEST_CASE("parser: the stage-1 DDL forms", "[sql][parser][catalog]") {
     CHECK_FALSE(s.columns[1].desc);
     CHECK_FALSE(s.columns[2].desc);
   }
-  CHECK(std::get<DropTable>(parse("DROP TABLE t")).table == "t");
+  CHECK(std::get<DropTable>(parse("DROP TABLE t")).table == QualifiedName{kPublicSchema, "t"});
   CHECK(std::get<DropTable>(parse("DROP TABLE IF EXISTS t")).if_exists);
-  CHECK(std::get<DropIndex>(parse("DROP INDEX IF EXISTS i")).index == "i");
+  CHECK(std::get<DropIndex>(parse("DROP INDEX IF EXISTS i")).index == QualifiedName{kPublicSchema, "i"});
   auto a = std::get<AddColumn>(parse("ALTER TABLE t ADD COLUMN c BIGINT DEFAULT 10000000000"));
-  CHECK(a.table == "t");
+  CHECK(a.table == QualifiedName{kPublicSchema, "t"});
   CHECK(a.column.name == "c");
   CHECK(a.column.default_value->kind == Literal::Kind::Integer);  // past 32 bits: PostgreSQL's Float node
   CHECK(a.column.default_value->text == "10000000000");
@@ -366,13 +369,13 @@ TEST_CASE("parser: the stage-1 DDL forms", "[sql][parser][catalog]") {
 TEST_CASE("parser: CREATE VIEW and DROP VIEW", "[sql][parser][view]") {
   const std::string text = "CREATE VIEW v (x, y) AS SELECT a, b FROM t WHERE a > 1";
   auto v = std::get<CreateView>(parse(text));
-  CHECK(v.view == "v");
+  CHECK(v.view == QualifiedName{kPublicSchema, "v"});
   CHECK(v.columns == std::vector<std::string>{"x", "y"});
-  CHECK(v.query.from[0].table == "t");
+  CHECK(v.query.from[0].table == QualifiedName{kPublicSchema, "t"});
   CHECK(v.query.targets.size() == 2);
   CHECK(v.definition == text);  // what the catalog stores and parses again
   CHECK(std::get<CreateView>(parse("CREATE VIEW v AS SELECT 1")).columns.empty());
-  CHECK(std::get<DropView>(parse("DROP VIEW v")).view == "v");
+  CHECK(std::get<DropView>(parse("DROP VIEW v")).view == QualifiedName{kPublicSchema, "v"});
   CHECK(std::get<DropView>(parse("DROP VIEW IF EXISTS v")).if_exists);
   // Updatable views, and what only a stored definition could change, are not supported.
   CHECK_THROWS_AS(parse("CREATE VIEW v AS SELECT a FROM t WITH CHECK OPTION"), SqlError);
@@ -394,8 +397,8 @@ TEST_CASE("parser: UNION, INTERSECT and EXCEPT, their ALL and precedence", "[sql
   REQUIRE(s.set != nullptr);
   CHECK(s.set->kind == Kind::Union);
   CHECK_FALSE(s.set->all);
-  CHECK(s.set->left.from[0].table == "t");
-  CHECK(s.set->right.from[0].table == "u");
+  CHECK(s.set->left.from[0].table == QualifiedName{kPublicSchema, "t"});
+  CHECK(s.set->right.from[0].table == QualifiedName{kPublicSchema, "u"});
   CHECK(s.targets.empty());
   CHECK(top("SELECT a FROM t UNION ALL SELECT b FROM u").set->all);
   CHECK_FALSE(top("SELECT a FROM t UNION DISTINCT SELECT b FROM u").set->all);
@@ -454,15 +457,15 @@ TEST_CASE("parser: SELECT … FOR UPDATE, and no other locking clause", "[sql][p
 TEST_CASE("parser: two tables, qualified columns and integer literals", "[sql][parser]") {
   auto j = std::get<Select>(parse("SELECT t.id, qty FROM t, u WHERE t.id = $1 AND k = $2"));
   REQUIRE(j.from.size() == 2);
-  CHECK(j.from[0].table == "t");
-  CHECK(j.from[1].table == "u");
+  CHECK(j.from[0].table == QualifiedName{kPublicSchema, "t"});
+  CHECK(j.from[1].table == QualifiedName{kPublicSchema, "u"});
   CHECK(j.targets[0].table == "t");
   CHECK(j.targets[1].table.empty());
   REQUIRE(j.where.size() == 2);
   CHECK(j.where[0].lhs.table == "t");
   // JOIN … ON: the ON conjuncts come first, then the WHERE's.
   auto on = std::get<Select>(parse("SELECT id FROM t JOIN u ON k = $1 WHERE id = $2"));
-  CHECK(on.from[1].table == "u");
+  CHECK(on.from[1].table == QualifiedName{kPublicSchema, "u"});
   REQUIRE(on.where.size() == 2);
   CHECK(on.where[0].lhs.column == "k");
   CHECK(on.where[0].on == 1);
@@ -563,7 +566,7 @@ TEST_CASE("parser: an inner join in parentheses or after a comma is flattened, e
   // a JOIN (b JOIN c ON …) ON …: three items; the inner ON sees b and c, the outer one all three.
   auto nested = std::get<Select>(parse("SELECT 1 FROM a JOIN (b JOIN c ON b.k = c.k) ON a.k = b.k"));
   REQUIRE(nested.from.size() == 3);
-  CHECK(nested.from[2].table == "c");
+  CHECK(nested.from[2].table == QualifiedName{kPublicSchema, "c"});
   REQUIRE(nested.where.size() == 2);
   CHECK(nested.where[0].on == 2);
   CHECK(nested.where[0].on_from == 1);
@@ -734,7 +737,7 @@ TEST_CASE("parser: DECLARE, FETCH, MOVE and CLOSE", "[sql][parser][cursor]") {
   }
 
   SECTION("DELETE FROM ONLY ( t ) is the tree of DELETE FROM t") {
-    CHECK(std::get<Delete>(parse("DELETE FROM ONLY ( t )")).table == "t");
+    CHECK(std::get<Delete>(parse("DELETE FROM ONLY ( t )")).table == QualifiedName{kPublicSchema, "t"});
   }
 }
 
@@ -758,7 +761,7 @@ TEST_CASE("parser: CREATE PROCEDURE reads its signature and checks its body's PL
       "CREATE OR REPLACE PROCEDURE neword(no_w_id INTEGER, INOUT no_c_last VARCHAR(16), OUT total NUMERIC(12, 2), "
       "IN tstamp TIMESTAMP) LANGUAGE plpgsql AS $$ DECLARE x INT := 1; BEGIN SELECT 1 INTO x; END $$"};
   auto p = std::get<CreateProcedure>(parse(sql));
-  CHECK(p.procedure == "neword");
+  CHECK(p.procedure == QualifiedName{kPublicSchema, "neword"});
   CHECK(p.replace);
   CHECK(p.definition == sql);
   REQUIRE(p.args.size() == 4);
@@ -794,7 +797,7 @@ TEST_CASE("parser: CREATE PROCEDURE reads its signature and checks its body's PL
 
 TEST_CASE("parser: DROP PROCEDURE with or without an argument list", "[sql][parser][procedure]") {
   auto d = std::get<DropProcedure>(parse("DROP PROCEDURE p"));
-  CHECK((d.procedure == "p" && !d.arg_types && !d.if_exists));
+  CHECK((d.procedure == QualifiedName{kPublicSchema, "p"} && !d.arg_types && !d.if_exists));
   d = std::get<DropProcedure>(parse("DROP PROCEDURE IF EXISTS p()"));
   CHECK((d.if_exists && d.arg_types && d.arg_types->empty()));
   // An argument marked OUT is left out, as PostgreSQL leaves it out.
@@ -833,7 +836,7 @@ TEST_CASE("parser: a procedure body the layer does not run is refused at CREATE"
 TEST_CASE("parser: CALL is read apart from the statements, its arguments as expressions", "[sql][parser][procedure]") {
   auto c = parse_call("call neword(1, 2, 0.0, '', TO_TIMESTAMP('20261103120000','YYYYMMDDHH24MISS')::timestamp without time zone)");
   REQUIRE(c);
-  CHECK(c->procedure == "neword");
+  CHECK(c->procedure == QualifiedName{kPublicSchema, "neword"});
   REQUIRE(c->args.size() == 5);
   CHECK(c->args[4].kind == Expr::Kind::Cast);
   CHECK(c->args[4].rhs->kind == Expr::Kind::Func);
@@ -876,17 +879,17 @@ TEST_CASE("parser: CREATE TABLE AS and SELECT … INTO read as one statement, re
   {
     auto s = std::get<CreateTableAs>(parse("CREATE TABLE IF NOT EXISTS t (x, y) AS SELECT a, b FROM u WITH NO DATA"));
     CHECK(s.form == CreateTableAs::Form::CreateTableAs);
-    CHECK(s.table == "t");
+    CHECK(s.table == QualifiedName{kPublicSchema, "t"});
     CHECK(s.columns == std::vector<std::string>{"x", "y"});
     CHECK(s.if_not_exists);
     CHECK_FALSE(s.with_data);
     REQUIRE(s.query.from.size() == 1);
-    CHECK(s.query.from[0].table == "u");
+    CHECK(s.query.from[0].table == QualifiedName{kPublicSchema, "u"});
   }
   {
     auto s = std::get<CreateTableAs>(parse("SELECT a INTO t FROM u WHERE a = 1"));
     CHECK(s.form == CreateTableAs::Form::SelectInto);
-    CHECK(s.table == "t");
+    CHECK(s.table == QualifiedName{kPublicSchema, "t"});
     CHECK(s.with_data);
     CHECK(s.query.where.size() == 1);
     CHECK(std::holds_alternative<CreateTableAs>(parse("SELECT a INTO TABLE t FROM u")));
@@ -924,7 +927,7 @@ TEST_CASE("parser: INSERT … SELECT reads a query in place of VALUES", "[sql][p
   CHECK(s.columns == std::vector<std::string>{"a", "b"});
   REQUIRE(s.query);
   REQUIRE(s.query->targets.size() == 2);
-  CHECK(s.query->from[0].table == "u");
+  CHECK(s.query->from[0].table == QualifiedName{kPublicSchema, "u"});
   CHECK(s.returning.size() == 1);
   auto u = std::get<Insert>(parse("INSERT INTO t SELECT x FROM u UNION SELECT 1"));
   REQUIRE(u.query);

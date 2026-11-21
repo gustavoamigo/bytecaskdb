@@ -143,7 +143,7 @@ TEST_CASE("embedded API: IF NOT EXISTS and IF EXISTS skip a DDL with PostgreSQL'
   // The name taken: nothing changes, the definition is not read (a column twice is no error).
   CHECK(notice("CREATE TABLE IF NOT EXISTS t (a INTEGER, a INTEGER)") ==
         std::pair{std::string{"42P07"}, std::string{"relation \"t\" already exists, skipping"}});
-  CHECK(db->catalog()->table("t")->columns.size() == 2);
+  CHECK(db->catalog()->table({kPublicSchema, "t"})->columns.size() == 2);
   CHECK(db->execute("SELECT id, v FROM t").rows.size() == 1);
   CHECK(notice("DROP TABLE IF EXISTS nope") ==
         std::pair{std::string{"00000"}, std::string{"table \"nope\" does not exist, skipping"}});
@@ -177,7 +177,7 @@ TEST_CASE("embedded API: CREATE ROLE, GRANT and REVOKE are DDL kept in the catal
     CHECK(db->execute("DROP DOMAIN IF EXISTS d").notices.at(0).message == "type \"d\" does not exist, skipping");
     (void)db->execute("CREATE ROLE r");
     (void)db->execute("GRANT SELECT, UPDATE (v) ON t TO r, PUBLIC");
-    const auto* t = db->catalog()->table("t");
+    const auto* t = db->catalog()->table({kPublicSchema, "t"});
     CHECK(db->catalog()->acl(t->id).size() == 4);  // per grantee, the table's and the column's
     // Every session is the superuser: nothing is denied.
     (void)db->execute("INSERT INTO t VALUES (1, 2)");
@@ -193,7 +193,7 @@ TEST_CASE("embedded API: CREATE ROLE, GRANT and REVOKE are DDL kept in the catal
     auto db = Database::open(dir.path());
     REQUIRE(db->catalog()->role("r") != nullptr);
     (void)db->execute("REVOKE ALL ON t FROM r, PUBLIC");
-    CHECK(db->catalog()->acl(db->catalog()->table("t")->id).empty());
+    CHECK(db->catalog()->acl(db->catalog()->table({kPublicSchema, "t"})->id).empty());
     CHECK(db->execute("DROP ROLE r").notices.empty());
     CHECK(db->catalog()->roles().empty());
     db->close();
@@ -512,7 +512,7 @@ TEST_CASE("embedded API: a unique index refuses duplicates, treats nulls as dist
   auto db = Database::open(dir.path());
   (void)db->execute("CREATE TABLE c (id BIGINT PRIMARY KEY, email BYTEA, w BIGINT)");
   (void)db->execute("CREATE UNIQUE INDEX c_email ON c (email)");
-  auto ix_id = db->catalog()->index("c_email").second->id;
+  auto ix_id = db->catalog()->index({kPublicSchema, "c_email"}).second->id;
   constexpr auto kIns = "INSERT INTO c VALUES ($1, $2, $3)";
   constexpr auto kSetEmail = "UPDATE c SET email = $2 WHERE id = $1";
   constexpr auto kByEmail = "SELECT id FROM c WHERE email >= $1 AND email < $2";
@@ -548,7 +548,7 @@ TEST_CASE("embedded API: a unique index refuses duplicates, treats nulls as dist
   // duplicate it would hold: BC_C_UNIQUE with the table's id (23505).
   (void)db->execute(kIns, {i(8), bytes("q"), i(1)});
   (void)db->execute(kIns, {i(9), bytes("r"), i(1)});
-  auto table_id = db->catalog()->table("c")->id;
+  auto table_id = db->catalog()->table({kPublicSchema, "c"})->id;
   try {
     (void)db->execute("CREATE UNIQUE INDEX c_w ON c (w)");
     FAIL("a unique index over duplicates was created");
@@ -557,11 +557,11 @@ TEST_CASE("embedded API: a unique index refuses duplicates, treats nulls as dist
     CHECK(e.constraint()->constraint == BC_C_UNIQUE);
     CHECK(e.constraint()->object_id == table_id);  // the index never existed: its id is the next DDL's
   }
-  CHECK(db->catalog()->index("c_w").second == nullptr);
+  CHECK(db->catalog()->index({kPublicSchema, "c_w"}).second == nullptr);
   db->close();
 
   auto again = Database::open(dir.path());
-  CHECK(again->catalog()->index("c_email").second->unique);
+  CHECK(again->catalog()->index({kPublicSchema, "c_email"}).second->unique);
   try {
     (void)again->execute(kIns, {i(10), bytes("b"), i(0)});
     FAIL("the unique index must survive a reopen");
@@ -682,7 +682,7 @@ TEST_CASE("embedded API: table_rows reads a table in key order; errors carry the
   sql_test::TempDir dir{"api_table_rows"};
   auto db = Database::open(dir.path());
   (void)db->execute("CREATE TABLE t (a BIGINT, b TEXT, c VARCHAR(4) NOT NULL DEFAULT 'x', PRIMARY KEY (a, b))");
-  auto table_id = db->catalog()->table("t")->id;
+  auto table_id = db->catalog()->table({kPublicSchema, "t"})->id;
   constexpr auto kIns = "INSERT INTO t (a, b) VALUES ($1, $2)";
   CHECK(db->execute(kIns, {i(2), bytes("a")}).affected == 1);
   CHECK(db->execute(kIns, {i(1), bytes("z")}).affected == 1);
@@ -770,7 +770,7 @@ TEST_CASE("embedded API: table_rows reads a table in key order; errors carry the
   CHECK(third->execute("INSERT INTO p VALUES ($1, $2)", {i(1), i(5)}).affected == 1);
   (void)third->execute("ALTER TABLE p ADD COLUMN c BIGINT");
   auto third_cat = third->catalog();  // held: p_table points into it
-  const auto* p_table = third_cat->table("p");
+  const auto* p_table = third_cat->table({kPublicSchema, "p"});
   auto p_id = p_table->id;
   auto c_id = p_table->column("c")->id;
   CHECK(third->table_rows("p").rows == Grid{{i(1), i(5), kNull}});
@@ -935,7 +935,7 @@ TEST_CASE("embedded API: a stored column that does not decode is BC_E_CORRUPT, n
     (void)db->execute("ALTER TABLE p ADD COLUMN c BIGINT");
     (void)db->execute("ALTER TABLE p ADD COLUMN d TEXT");
     auto cat = db->catalog();  // held: p points into it
-    const auto* p = cat->table("p");
+    const auto* p = cat->table({kPublicSchema, "p"});
     p_id = p->id;
     c_id = p->column("c")->id;
     d_id = p->column("d")->id;
@@ -1001,7 +1001,7 @@ TEST_CASE("embedded API: values outside their declared type, an omitted NOT NULL
   (void)db->execute(
       "CREATE TABLE r (k BIGINT PRIMARY KEY, s SMALLINT, n INTEGER, v VARCHAR(3), f REAL, d NUMERIC(4, 2), "
       "m BIGINT NOT NULL DEFAULT 0, z BIGINT NOT NULL)");
-  auto table_id = db->catalog()->table("r")->id;
+  auto table_id = db->catalog()->table({kPublicSchema, "r"})->id;
   constexpr auto kIns = "INSERT INTO r (k, s, n, v, f, d, z) VALUES ($1, $2, $3, $4, $5, $6, $7)";
   auto row = [&](std::int64_t k) { return std::vector<Value>{i(k), kNull, kNull, kNull, kNull, kNull, i(0)}; };
   auto refusal = [&](std::string_view sql, const std::vector<Value>& params) -> std::pair<std::uint32_t, std::string> {
@@ -1127,7 +1127,7 @@ TEST_CASE("embedded API: values outside their declared type, an omitted NOT NULL
   // DATE, TIMESTAMP and TIME: PostgreSQL's ranges, in days and microseconds
   // from 1970. TIME includes 24:00:00.
   (void)db->execute("CREATE TABLE tm (k BIGINT PRIMARY KEY, t TIME, d DATE, ts TIMESTAMP)");
-  auto tm_id = db->catalog()->table("tm")->id;
+  auto tm_id = db->catalog()->table({kPublicSchema, "tm"})->id;
   constexpr auto kInsTm = "INSERT INTO tm VALUES ($1, $2, $3, $4)";
   constexpr std::int64_t kDay = 86'400'000'000;
   constexpr std::int64_t kMinDate = -2'440'588;      // 4714-11-24 BC
@@ -1206,7 +1206,7 @@ TEST_CASE("embedded API: values outside their declared type, an omitted NOT NULL
   // One PRIMARY KEY a table; two are refused, not merged into a composite key.
   CHECK_THROWS_AS(db->execute("CREATE TABLE two (a BIGINT PRIMARY KEY, b BIGINT PRIMARY KEY)"), ast::SqlError);
   CHECK_THROWS_AS(db->execute("CREATE TABLE two (a BIGINT PRIMARY KEY, b BIGINT, PRIMARY KEY (b))"), ast::SqlError);
-  CHECK(db->catalog()->table("two") == nullptr);
+  CHECK(db->catalog()->table({kPublicSchema, "two"}) == nullptr);
 
   // A statement that conflicts on every retry is told from an error with the
   // same code (BC_CONFLICT and BC_E_IO are both 1), end to end: every commit
@@ -1348,11 +1348,11 @@ TEST_CASE("embedded API: a DDL is bound at execute, against the catalog it runs 
   CHECK(state([&] { (void)db->execute("CREATE VIEW v AS SELECT nope FROM t"); }) == "42703");
   CHECK(state([&] { (void)db->prepare("GRANT SELECT ON t TO nobody"); }) == "ran");
   CHECK(state([&] { (void)db->execute("GRANT SELECT ON t TO nobody"); }) == "42704");
-  CHECK(db->catalog()->view("v") == nullptr);
+  CHECK(db->catalog()->view({kPublicSchema, "v"}) == nullptr);
   // Bound where it runs: the table it names, created after the prepare, is found.
   (void)db->execute("CREATE TABLE u (k BIGINT PRIMARY KEY, a BIGINT)");
   (void)db->execute(index, {});
-  CHECK(db->catalog()->index("u_a").second != nullptr);
+  CHECK(db->catalog()->index({kPublicSchema, "u_a"}).second != nullptr);
   // A query's binder error is still thrown at prepare, and nothing is cached.
   const auto plans = db->cached_plans();
   CHECK(state([&] { (void)db->prepare("SELECT a FROM w"); }) == "42P01");
@@ -4070,7 +4070,7 @@ TEST_CASE("embedded API: CREATE and DROP PROCEDURE are DDL, kept in the catalog 
     CHECK(db->prepare(neword).command() == Command::CreateProcedure);
     CHECK(db->prepare("DROP PROCEDURE neword").command() == Command::DropProcedure);
     CHECK(state(*db, neword) == "ran");  // the table it names need not exist
-    CHECK(db->catalog()->procedure("neword")->definition == neword);
+    CHECK(db->catalog()->procedure({kPublicSchema, "neword"})->definition == neword);
     CHECK(state(*db, neword) == "42723");
     CHECK(state(*db, "CREATE PROCEDURE p(a INT, a INT) LANGUAGE plpgsql AS $$ BEGIN END $$") == "42P13");
     CHECK(state(*db, "CREATE PROCEDURE p(a NUMERIC) LANGUAGE plpgsql AS $$ BEGIN END $$") == "0A000");  // no precision: a column's type only
@@ -4084,19 +4084,19 @@ TEST_CASE("embedded API: CREATE and DROP PROCEDURE are DDL, kept in the catalog 
       (void)txn.execute("DROP PROCEDURE neword");  // DDL of the transaction: rolled back with it
       CHECK(txn.procedure("neword") == nullptr);
       txn.rollback();
-      CHECK(db->catalog()->procedure("neword") != nullptr);
+      CHECK(db->catalog()->procedure({kPublicSchema, "neword"}) != nullptr);
     }
   }
   {
     auto db = Database::open(dir.path());
-    REQUIRE(db->catalog()->procedure("neword") != nullptr);
+    REQUIRE(db->catalog()->procedure({kPublicSchema, "neword"}) != nullptr);
     CHECK(state(*db, "DROP PROCEDURE neword(TEXT)") == "42883");
     CHECK(state(*db, "DROP PROCEDURE IF EXISTS neword(TEXT)") == "ran");
     CHECK(state(*db, "DROP PROCEDURE neword(INTEGER, VARCHAR, NUMERIC)") == "ran");  // every argument's type
-    CHECK(db->catalog()->procedure("neword") == nullptr);
+    CHECK(db->catalog()->procedure({kPublicSchema, "neword"}) == nullptr);
     CHECK(state(*db, "DROP PROCEDURE neword") == "42883");
     CHECK(state(*db, "DROP PROCEDURE IF EXISTS neword") == "ran");
-    CHECK(db->catalog()->table("neword") != nullptr);
+    CHECK(db->catalog()->table({kPublicSchema, "neword"}) != nullptr);
   }
 }
 
@@ -4597,7 +4597,7 @@ TEST_CASE("embedded API: CREATE TABLE AS and SELECT … INTO make a table of a q
     auto r = db->execute("CREATE TABLE c1 AS SELECT * FROM src");
     CHECK(r.affected == 2);
     CHECK(r.notices.empty());
-    const auto* t = db->catalog()->table("c1");
+    const auto* t = db->catalog()->table({kPublicSchema, "c1"});
     REQUIRE(t != nullptr);
     REQUIRE(t->columns.size() == 7);  // and the hidden row id
     CHECK(t->columns[0].sql == SqlType{SqlKind::Integer});
@@ -4610,7 +4610,7 @@ TEST_CASE("embedded API: CREATE TABLE AS and SELECT … INTO make a table of a q
     // is named now.
     (void)db->execute("CREATE TABLE c9 AS SELECT COALESCE(c, c) AS x, CASE WHEN a = 1 THEN d ELSE d END AS y, "
                       "COALESCE(c, 'z') AS z, now() FROM src");
-    const auto* t9 = db->catalog()->table("c9");
+    const auto* t9 = db->catalog()->table({kPublicSchema, "c9"});
     REQUIRE(t9 != nullptr);
     CHECK(t9->columns[0].sql == SqlType{SqlKind::Varchar, 5});
     CHECK(t9->columns[1].sql == SqlType{SqlKind::Char, 3});
@@ -4674,12 +4674,12 @@ TEST_CASE("embedded API: CREATE TABLE AS and SELECT … INTO make a table of a q
     CHECK(state(*db, "CREATE TABLE c8 AS SELECT 1.5") == "0A000");
     CHECK(state(*db, "CREATE TABLE c8 AS SELECT AVG(a) FROM src") == "0A000");
     CHECK(state(*db, "CREATE TABLE c8 AS SELECT") == "0A000");
-    CHECK(db->catalog()->table("c8") == nullptr);
+    CHECK(db->catalog()->table({kPublicSchema, "c8"}) == nullptr);
     // In a transaction too (tests/api_txn_ddl_test.cpp): rolled back, nothing.
     auto txn = db->begin();
     CHECK(txn.execute("SELECT 1 AS x INTO c8").affected == 1);
     txn.rollback();
-    CHECK(db->catalog()->table("c8") == nullptr);
+    CHECK(db->catalog()->table({kPublicSchema, "c8"}) == nullptr);
     db->close();
   }
   {
@@ -4723,7 +4723,7 @@ TEST_CASE("embedded API: CREATE TABLE AS writes its table and rows in one batch,
     std::size_t rows_seen = 0;
     db->live_catalog_for_testing().set_commit_hook_for_testing([&] {
       std::thread reader{[&] {
-        seen = db->catalog()->table("c") == nullptr && db->catalog()->version() == version ? "absent" : "present";
+        seen = db->catalog()->table({kPublicSchema, "c"}) == nullptr && db->catalog()->version() == version ? "absent" : "present";
         rows_seen = row_keys(db->engine_for_testing());
       }};
       reader.join();
@@ -4751,7 +4751,7 @@ TEST_CASE("embedded API: CREATE TABLE AS writes its table and rows in one batch,
       CHECK(sqlstate(e) == "54000");
     }
     db->live_catalog_for_testing().set_backfill_limit_for_testing(LiveCatalog::kMaxBackfillBytes);
-    CHECK(db->catalog()->table("d") == nullptr);
+    CHECK(db->catalog()->table({kPublicSchema, "d"}) == nullptr);
     CHECK(db->catalog()->version() == version + 1);
     db->close();
   }
@@ -4765,9 +4765,9 @@ TEST_CASE("embedded API: CREATE TABLE AS writes its table and rows in one batch,
     } catch (const ExecError& e) {
       CHECK(sqlstate(e) == "54000");
     }
-    CHECK(db->catalog()->table("d") == nullptr);
+    CHECK(db->catalog()->table({kPublicSchema, "d"}) == nullptr);
     CHECK(db->execute("SELECT COUNT(*) FROM c").rows == Grid{{i(50)}});  // after a reopen
-    CHECK(db->catalog()->table("crashed") == nullptr);
+    CHECK(db->catalog()->table({kPublicSchema, "crashed"}) == nullptr);
     CHECK(row_keys(db->engine_for_testing()) == 100);
     db->close();
   }

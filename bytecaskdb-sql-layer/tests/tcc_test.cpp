@@ -66,9 +66,9 @@ TEST_CASE("tcc: a plan reaching outside the plan API does not link", "[sql][tcc]
 TEST_CASE("tcc: a unique insert raced by another commit conflicts, and its retry reports the duplicate",
           "[sql][tcc][catalog]") {
   sql_test::Fixture f;
-  f.ddl(CreateTableDdl{"c", {sql_test::Fixture::col("id", PhysType::I64, false),
+  f.ddl(CreateTableDdl{{kPublicSchema, "c"}, {sql_test::Fixture::col("id", PhysType::I64, false),
                              sql_test::Fixture::col("email", PhysType::Bytes, true)}, {"id"}});
-  f.ddl(CreateIndexDdl{"c_email", "c", {{"email"}}, true});
+  f.ddl(CreateIndexDdl{"c_email", {kPublicSchema, "c"}, {{"email"}}, true});
   constexpr std::string_view kSql = "INSERT INTO c VALUES ($1, $2)";
   auto gen = generate_plan(bound::bind(ast::parse(kSql), f.cat()), f.cat(), kSql);
   auto code = TccPlan::compile(gen.source);
@@ -91,16 +91,16 @@ TEST_CASE("tcc: a unique insert raced by another commit conflicts, and its retry
   // On a fresh snapshot the check sees the duplicate and raises: final, not retried.
   CHECK(bc_execute(f.cx, code->fn(), &ref, &pa, {}, false, 3) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
-  CHECK(bc_error_detail(f.cx) == ((std::uint32_t{BC_C_UNIQUE} << 24) | f.cat().index("c_email").second->id));
+  CHECK(bc_error_detail(f.cx) == ((std::uint32_t{BC_C_UNIQUE} << 24) | f.cat().index({kPublicSchema, "c_email"}).second->id));
   bc_ctx_free(other);
 }
 
 TEST_CASE("tcc: an insert whose last retry conflicts on a key a racing commit took reports the duplicate",
           "[sql][tcc][catalog]") {
   sql_test::Fixture f;
-  f.ddl(CreateTableDdl{"c", {sql_test::Fixture::col("id", PhysType::I64, false),
+  f.ddl(CreateTableDdl{{kPublicSchema, "c"}, {sql_test::Fixture::col("id", PhysType::I64, false),
                              sql_test::Fixture::col("email", PhysType::Bytes, true)}, {"id"}});
-  f.ddl(CreateIndexDdl{"c_email", "c", {{"email"}}, true});
+  f.ddl(CreateIndexDdl{"c_email", {kPublicSchema, "c"}, {{"email"}}, true});
   constexpr std::string_view kSql = "INSERT INTO c VALUES ($1, $2)";
   auto gen = generate_plan(bound::bind(ast::parse(kSql), f.cat()), f.cat(), kSql);
   auto code = TccPlan::compile(gen.source);
@@ -117,7 +117,7 @@ TEST_CASE("tcc: an insert whose last retry conflicts on a key a racing commit to
   bc_ctx_before_commit_for_testing(f.cx, [&] { CHECK(bc_execute(other, code->fn(), &ref, &pb, {}, false, 0) == BC_COMMITTED); });
   CHECK(bc_execute(f.cx, code->fn(), &ref, &pa, {}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_CONSTRAINT);
-  CHECK(bc_error_detail(f.cx) == ((std::uint32_t{BC_C_UNIQUE} << 24) | f.cat().index("c_email").second->id));
+  CHECK(bc_error_detail(f.cx) == ((std::uint32_t{BC_C_UNIQUE} << 24) | f.cat().index({kPublicSchema, "c_email"}).second->id));
   bc_ctx_before_commit_for_testing(f.cx, {});
   bc_ctx_free(other);
 }

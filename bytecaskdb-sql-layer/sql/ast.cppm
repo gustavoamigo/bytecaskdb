@@ -24,6 +24,7 @@ module;
 export module bytecask.sql.ast;
 
 export import bytecask.sql.sqlstate;
+export import bytecask.sql.names;
 
 export namespace bytecask::sql::ast {
 
@@ -233,7 +234,7 @@ struct OrderItem {
 struct ForeignKeyAst {
   std::string name;
   std::vector<std::string> columns;
-  std::string table;
+  QualifiedName table;
   std::vector<std::string> ref_columns;
   std::int32_t pos{-1};
 };
@@ -276,7 +277,7 @@ struct UniqueAst {
 };
 
 struct CreateTable {
-  std::string table;
+  QualifiedName table;
   std::vector<ColumnDefAst> columns;
   std::vector<std::string> pk;  // a table-level PRIMARY KEY (…)
   std::int32_t pos{-1};
@@ -296,27 +297,27 @@ struct IndexColumnAst {
 
 struct CreateIndex {
   std::string index;
-  std::string table;
+  QualifiedName table;  // the index's own name is in its table's schema
   std::vector<IndexColumnAst> columns;
   bool unique{false};
   std::int32_t pos{-1};
 };
 
 struct DropTable {
-  std::string table;
+  QualifiedName table;
   bool if_exists{false};
   std::int32_t pos{-1};
 };
 
 struct DropIndex {
-  std::string index;
+  QualifiedName index;
   bool if_exists{false};
   std::int32_t pos{-1};
 };
 
 // ALTER TABLE … ADD COLUMN, the one ALTER TABLE form in scope.
 struct AddColumn {
-  std::string table;
+  QualifiedName table;
   ColumnDefAst column;
   std::int32_t pos{-1};
 };
@@ -328,7 +329,7 @@ struct Assignment {
 };
 
 struct Insert {
-  std::string table;
+  QualifiedName table;
   std::vector<std::string> columns;  // empty: every column, in order
   std::vector<std::vector<Expr>> rows;  // VALUES' rows, each of one length; none with a query
   std::int32_t pos{-1};
@@ -360,7 +361,7 @@ enum class JoinKind { Inner, Left, Right, Full };
 // columns the two sides share by =, each named alone as one column;
 // `using_alias` names them too: USING (…) AS alias.
 struct FromItem {
-  std::string table;
+  QualifiedName table;
   // The name the query gives the item. The parser has rewritten every
   // qualifier that names an alias to its table, so the alias stays only for a
   // query that names one table twice, where it tells the two apart.
@@ -395,7 +396,7 @@ struct FromItem {
   [[nodiscard]] auto name() const -> const std::string&;
 };
 
-auto FromItem::name() const -> const std::string& { return alias.empty() ? table : alias; }
+auto FromItem::name() const -> const std::string& { return alias.empty() ? table.name : alias; }
 
 struct Select {
   std::vector<Expr> targets;
@@ -473,7 +474,7 @@ struct SetOperation {
 }
 
 struct Update {
-  std::string table;
+  QualifiedName table;
   std::vector<Assignment> set;
   std::vector<Compare> where;
   std::int32_t pos{-1};
@@ -482,7 +483,7 @@ struct Update {
 };
 
 struct Delete {
-  std::string table;
+  QualifiedName table;
   std::vector<Compare> where;
   std::int32_t pos{-1};
   std::string current_of;  // WHERE CURRENT OF name: the cursor, and `where` is empty
@@ -492,7 +493,7 @@ struct Delete {
 // CREATE VIEW name [(columns)] AS query. `query` is the SELECT as written;
 // the catalog stores the statement's text and parses it again at each use.
 struct CreateView {
-  std::string view;
+  QualifiedName view;
   std::vector<std::string> columns;  // the view's column names, empty: the query's own
   Select query;
   std::int32_t pos{-1};
@@ -506,7 +507,7 @@ struct CreateView {
 struct CreateTableAs {
   enum class Form { CreateTableAs, SelectInto };
   Form form{Form::CreateTableAs};
-  std::string table;
+  QualifiedName table;
   std::vector<std::string> columns;  // the table's column names, empty: the query's own
   Select query;
   bool with_data{true};
@@ -515,7 +516,7 @@ struct CreateTableAs {
 };
 
 struct DropView {
-  std::string view;
+  QualifiedName view;
   bool if_exists{false};
   std::int32_t pos{-1};
 };
@@ -531,7 +532,7 @@ struct ProcedureArgAst {
 };
 
 struct CreateProcedure {
-  std::string procedure;
+  QualifiedName procedure;
   bool replace{false};
   std::vector<ProcedureArgAst> args;
   std::int32_t pos{-1};
@@ -542,7 +543,7 @@ struct CreateProcedure {
 // when no list was written, and holds each type's name and modifiers
 // otherwise (a ColumnDefAst with no name).
 struct DropProcedure {
-  std::string procedure;
+  QualifiedName procedure;
   std::optional<std::vector<ColumnDefAst>> arg_types;
   bool if_exists{false};
   std::int32_t pos{-1};
@@ -574,21 +575,21 @@ struct PrivilegeAst {
 // CREATE DOMAIN name [AS] type, with no constraint, DEFAULT or COLLATE yet.
 // Stored, and granted on; not yet a column's type.
 struct CreateDomain {
-  std::string domain;
+  QualifiedName domain;
   ColumnDefAst base;  // its type, as a column's
   std::int32_t pos{-1};
 };
 
 // CREATE TYPE name: a shell type, which nothing can use, as in PostgreSQL.
 struct CreateType {
-  std::string type;
+  QualifiedName type;
   std::int32_t pos{-1};
 };
 
 // CREATE SEQUENCE [IF NOT EXISTS] name, with no option yet. Stored, and
 // granted on; nextval and the rest are not built.
 struct CreateSequence {
-  std::string sequence;
+  QualifiedName sequence;
   bool if_not_exists{false};
   std::int32_t pos{-1};
 };
@@ -598,7 +599,7 @@ struct CreateSequence {
 struct DropTypeOrSequence {
   enum class Kind { Domain, Type, Sequence };
   Kind kind{Kind::Domain};
-  std::string name;
+  QualifiedName name;
   bool if_exists{false};
   std::int32_t pos{-1};
 };
@@ -609,7 +610,7 @@ struct Grant {
   bool grant{true};                      // false: REVOKE
   bool grant_option{false};              // GRANT … WITH GRANT OPTION, REVOKE GRANT OPTION FOR …
   std::vector<PrivilegeAst> privileges;  // empty: ALL PRIVILEGES
-  std::vector<std::string> objects;
+  std::vector<QualifiedName> objects;
   std::vector<std::string> grantees;     // "" is PUBLIC
   std::optional<std::string> grantor;    // GRANTED BY a role named; nullopt for none or the current user
   std::int32_t pos{-1};
@@ -667,7 +668,7 @@ struct SavepointStatement {
 // it runs BEGIN. Each argument is an expression of constants, bound against
 // the procedure's argument types when it runs.
 struct Call {
-  std::string procedure;
+  QualifiedName procedure;
   std::vector<Expr> args;
   std::int32_t pos{-1};
 };

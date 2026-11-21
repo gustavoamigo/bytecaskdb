@@ -23,6 +23,9 @@
 
 import bytecask.sql.tests.fixture;
 
+using bytecask::sql::kPublicSchema;
+using bytecask::sql::QualifiedName;
+
 using namespace sql_test;
 using bytecask::sql::Bytes;
 using bytecask::sql::kCursorEntryBytes;
@@ -288,19 +291,19 @@ TEST_CASE("plan API: bc_ctx_run checks what a plan depends on, not a catalog ver
   // ADD COLUMN keeps the plan; the new column takes its default in rows the
   // plan writes, without the plan naming it.
   auto v = f.cat().version();
-  f.ddl(bytecask::sql::AddColumnDdl{"t", {"tag", {bytecask::sql::SqlKind::BigInt}, true, std::int64_t{7}}});
+  f.ddl(bytecask::sql::AddColumnDdl{{kPublicSchema, "t"}, {"tag", {bytecask::sql::SqlKind::BigInt}, true, std::int64_t{7}}});
   CHECK(f.cat().version() == v + 1);
   CHECK(run_with(ok) == BC_COMMITTED);
   Bytes key, row;
   bytecask::sql::key_put_prefix(key, bytecask::sql::kNsRow, kTbl);
   REQUIRE(bytecask::sql::key_put_i64(key, 2, {PhysType::I64}));
   REQUIRE(f.db->get({}, key, row));
-  const auto& t2 = *f.cat().table("t");
+  const auto& t2 = *f.cat().table({kPublicSchema, "t"});
   CHECK(bytecask::sql::row_column(row, *t2.layout.find(t2.column("tag")->id)).i64() == 7);
 
   // CREATE INDEX keeps the write plan, which maintains the new index.
-  f.ddl(bytecask::sql::CreateIndexDdl{"t_by_qty", "t", {{"qty"}}});
-  const auto by_qty = f.cat().index("t_by_qty").second->id;
+  f.ddl(bytecask::sql::CreateIndexDdl{"t_by_qty", {kPublicSchema, "t"}, {{"qty"}}});
+  const auto by_qty = f.cat().index({kPublicSchema, "t_by_qty"}).second->id;
   CHECK(count_entries(*f.db, bytecask::sql::kNsIndex, by_qty) == 2);  // the backfill
   ps = params({std::int64_t{3}, bytes("c"), std::int64_t{7}});
   CHECK(run_with(ok) == BC_COMMITTED);
@@ -312,7 +315,7 @@ TEST_CASE("plan API: bc_ctx_run checks what a plan depends on, not a catalog ver
   auto none = params({});
   CHECK(bc_execute(f.cx, scan_index, &scan_ref, &none, {}, false, 0) == BC_COMMITTED);
   CHECK(bc_ctx_affected(f.cx) == 1 + 2 + 3);
-  f.ddl(bytecask::sql::DropIndexDdl{"t_by_name"});
+  f.ddl(bytecask::sql::DropIndexDdl{{kPublicSchema, "t_by_name"}});
   ps = params({std::int64_t{4}, bytes("d"), std::int64_t{8}});
   CHECK(run_with(ok) == BC_COMMITTED);
   CHECK(bc_execute(f.cx, scan_index, &scan_ref, &none, {}, false, 0) == BC_FAILED);
@@ -335,7 +338,7 @@ TEST_CASE("plan API: bc_ctx_check verifies a reference as bc_ctx_run does, and r
   CHECK(bc_execute(f.cx, scan_index, &ref, &none, {}, false, 0) == BC_COMMITTED);
   // A plan a DDL made incompatible: false, with the detail that asks for a
   // recompile.
-  f.ddl(bytecask::sql::DropIndexDdl{"t_by_name"});
+  f.ddl(bytecask::sql::DropIndexDdl{{kPublicSchema, "t_by_name"}});
   bc_ctx_begin(f.cx, &none, {});
   CHECK_FALSE(bc_ctx_check(f.cx, &ref));
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
@@ -413,8 +416,8 @@ TEST_CASE("plan API: a plan names only the objects its reference declares", "[sq
   // The table dropped and created again under its name: a new id, so the
   // reference that declares the old one is incompatible, a recompilable
   // refusal.
-  f.ddl(bytecask::sql::DropTableDdl{"t"});
-  f.ddl(bytecask::sql::CreateTableDdl{"t", {Fixture::col("id", PhysType::I64, false)}, {"id"}});
+  f.ddl(bytecask::sql::DropTableDdl{{kPublicSchema, "t"}});
+  f.ddl(bytecask::sql::CreateTableDdl{{kPublicSchema, "t"}, {Fixture::col("id", PhysType::I64, false)}, {"id"}});
   CHECK(bc_execute(f.cx, insert_one, &r3, &one, {}, false, 0) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_LAYOUT);
   CHECK(bc_error_detail(f.cx) == BC_L_INCOMPATIBLE);
@@ -432,7 +435,7 @@ TEST_CASE("plan API: a context holds a catalog version only while it executes", 
   CHECK(bc_ctx_commit(f.cx, false) == BC_COMMITTED);
   bc_ctx_reset(f.cx);
   CHECK(seen.use_count() == 1);
-  f.ddl(bytecask::sql::AddColumnDdl{"t", {"x", {bytecask::sql::SqlKind::BigInt}, true, {}}});
+  f.ddl(bytecask::sql::AddColumnDdl{{kPublicSchema, "t"}, {"x", {bytecask::sql::SqlKind::BigInt}, true, {}}});
   CHECK(seen.expired());  // superseded, and no idle context keeps it
 }
 
@@ -446,7 +449,7 @@ TEST_CASE("plan API: a write committed across a DDL on its table is a conflict",
   bc_ctx_begin(f.cx, &ps, {});
   bc_ctx_run(f.cx, insert_plan_ok, &ref);
   REQUIRE(bc_error(f.cx) == BC_OK);
-  f.ddl(bytecask::sql::CreateIndexDdl{"t_by_qty", "t", {{"qty"}}});
+  f.ddl(bytecask::sql::CreateIndexDdl{"t_by_qty", {kPublicSchema, "t"}, {{"qty"}}});
   CHECK(bc_ctx_commit(f.cx, false) == BC_CONFLICT);
   bc_ctx_reset(f.cx);
   Bytes key, out;
@@ -455,10 +458,10 @@ TEST_CASE("plan API: a write committed across a DDL on its table is a conflict",
   CHECK_FALSE(f.db->get({}, key, out));
 
   // A DDL on another table does not conflict.
-  f.ddl(bytecask::sql::CreateTableDdl{"other", {Fixture::col("k", PhysType::I64, false)}, {"k"}});
+  f.ddl(bytecask::sql::CreateTableDdl{{kPublicSchema, "other"}, {Fixture::col("k", PhysType::I64, false)}, {"k"}});
   bc_ctx_begin(f.cx, &ps, {});
   bc_ctx_run(f.cx, insert_plan_ok, &ref);
-  f.ddl(bytecask::sql::AddColumnDdl{"other", {"x", {bytecask::sql::SqlKind::Text}, true, {}}});
+  f.ddl(bytecask::sql::AddColumnDdl{{kPublicSchema, "other"}, {"x", {bytecask::sql::SqlKind::Text}, true, {}}});
   CHECK(bc_ctx_commit(f.cx, false) == BC_COMMITTED);
   bc_ctx_reset(f.cx);
   CHECK(f.db->get({}, key, out));
@@ -545,7 +548,7 @@ TEST_CASE("plan API: an aggregate's groups, keyed by a column, and the range che
   CHECK(run(f, stale_col_key, {}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
   // A group key is not an engine key: a value past the key ceiling groups.
-  f.ddl(bytecask::sql::CreateTableDdl{"w", {Fixture::col("id", PhysType::I64, false), Fixture::col("b", PhysType::Bytes, true)}, {"id"}});
+  f.ddl(bytecask::sql::CreateTableDdl{{kPublicSchema, "w"}, {Fixture::col("id", PhysType::I64, false), Fixture::col("b", PhysType::Bytes, true)}, {"id"}});
   const std::string wide(70000, 'x');
   for (std::int64_t id = 1; id <= 3; ++id) REQUIRE(run(f, insert_wide, {id, bytes(wide)}) == BC_COMMITTED);
   CHECK(run(f, count_distinct_wide, {}) == BC_COMMITTED);
@@ -1007,7 +1010,7 @@ auto pk_capacity(Fixture& f, BytesView row) -> std::size_t {
 TEST_CASE("plan API: each item of an insert's write set is charged to the statement budget as it is added",
           "[sql][algebra][memory]") {
   Fixture f;
-  f.ddl(bytecask::sql::CreateIndexDdl{"t_by_qty", "t", {{"qty"}}, true});
+  f.ddl(bytecask::sql::CreateIndexDdl{"t_by_qty", {kPublicSchema, "t"}, {{"qty"}}, true});
   REQUIRE(index_count(f) == 2);
   held_around.clear();
   REQUIRE(run(f, probed_insert, {std::int64_t{1}, bytes("alice"), std::int64_t{5}}) == BC_COMMITTED);

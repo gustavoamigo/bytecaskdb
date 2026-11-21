@@ -27,6 +27,9 @@
 
 import bytecask.sql.tests.fixture;
 
+using bytecask::sql::kPublicSchema;
+using bytecask::sql::QualifiedName;
+
 using namespace sql_test;
 using bytecask::sql::Bytes;
 using bytecask::sql::PhysType;
@@ -284,11 +287,11 @@ TEST_CASE("plan API: a raised constraint error is final: no retry, nothing commi
 namespace {
 void create_m(Fixture& f) {
   f.ddl(bytecask::sql::CreateTableDdl{
-      "m", {Fixture::col("k", PhysType::I64, false), Fixture::col("x", PhysType::F64, true), Fixture::col("b", PhysType::Bool, true)},
+      {kPublicSchema, "m"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("x", PhysType::F64, true), Fixture::col("b", PhysType::Bool, true)},
       {"k"}});
-  f.ddl(bytecask::sql::CreateIndexDdl{"m_by_x", "m", {{"x"}}});
-  REQUIRE(f.cat().table("m")->id == kM);
-  REQUIRE(f.cat().index("m_by_x").second->id == kMByX);
+  f.ddl(bytecask::sql::CreateIndexDdl{"m_by_x", {kPublicSchema, "m"}, {{"x"}}});
+  REQUIRE(f.cat().table({kPublicSchema, "m"})->id == kM);
+  REQUIRE(f.cat().index({kPublicSchema, "m_by_x"}).second->id == kMByX);
 }
 
 // INSERT INTO m VALUES ($1, $2, $3); the runtime writes the m_by_x entry.
@@ -726,7 +729,7 @@ TEST_CASE("plan API: count_range, del_range and the guards reach the engine", "[
   CHECK(run(f, del_foreign_bound, {bytes("n")}) == BC_FAILED);
   CHECK(bc_error(f.cx) == BC_E_HANDLE);
   CHECK(value(f, count_all, {std::int64_t{100}}) == 5);
-  REQUIRE(f.cat().table("t") != nullptr);
+  REQUIRE(f.cat().table({kPublicSchema, "t"}) != nullptr);
 
   // The rows go with their index entries.
   CHECK(run(f, del_pk_range, {std::int64_t{2}, std::int64_t{4}}) == BC_COMMITTED);
@@ -765,7 +768,7 @@ TEST_CASE("plan API: bc_del_range's empty bounds are its table's start and end",
   CHECK(count_entries(*f.db, bytecask::sql::kNsIndex, kIdx) == 1);
   Bytes out;
   CHECK(f.db->get({}, pk_of(3), out));
-  REQUIRE(f.cat().table("t") != nullptr);  // the catalog sorts before the table
+  REQUIRE(f.cat().table({kPublicSchema, "t"}) != nullptr);  // the catalog sorts before the table
 }
 
 namespace {
@@ -1055,8 +1058,8 @@ TEST_CASE("plan API: a present column the row does not hold is BC_E_CORRUPT, nev
           "[sql][algebra]") {
   Fixture f;
   seed_t(f);
-  f.ddl(bytecask::sql::AddColumnDdl{"t", {"x", {bytecask::sql::SqlKind::BigInt}, true, {}}});
-  f.ddl(bytecask::sql::AddColumnDdl{"t", {"y", {bytecask::sql::SqlKind::Text}, true, {}}});
+  f.ddl(bytecask::sql::AddColumnDdl{{kPublicSchema, "t"}, {"x", {bytecask::sql::SqlKind::BigInt}, true, {}}});
+  f.ddl(bytecask::sql::AddColumnDdl{{kPublicSchema, "t"}, {"y", {bytecask::sql::SqlKind::Text}, true, {}}});
   REQUIRE(f.cat().table(kTbl)->column("x")->id == kXAdded);
   REQUIRE(f.cat().table(kTbl)->column("y")->id == kYAdded);
   // Row 1 predates x and y: both read as NULL.
@@ -1109,11 +1112,11 @@ void two_b_bytes(bc_ctx* cx) { bc_col_bytes(cx, get_two(cx), g_two_b); }
 TEST_CASE("plan API: a variable column whose var_end entries are out of order is BC_E_CORRUPT", "[sql][algebra]") {
   Fixture f;
   f.ddl(bytecask::sql::CreateTableDdl{
-      "two", {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::Bytes, true),
+      {kPublicSchema, "two"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::Bytes, true),
               Fixture::col("b", PhysType::Bytes, true)},
       {"k"}});
   auto cat = f.live->current();  // held: two points into it
-  const auto& two = *cat->table("two");
+  const auto& two = *cat->table({kPublicSchema, "two"});
   g_two = two.id;
   g_two_b = two.column("b")->id;
   bytecask::sql::RowWriter w{two.layout};
@@ -1165,15 +1168,15 @@ TEST_CASE("plan API: an integer past its key part's width is no key: bc_key_fits
           "[sql][algebra]") {
   Fixture f;
   f.ddl(bytecask::sql::CreateTableDdl{
-      "narrow", {bytecask::sql::ColumnSpec{"k", {bytecask::sql::SqlKind::Integer}, false, {}}}, {"k"}});
+      {kPublicSchema, "narrow"}, {bytecask::sql::ColumnSpec{"k", {bytecask::sql::SqlKind::Integer}, false, {}}}, {"k"}});
   auto cat = f.live->current();
-  g_narrow = cat->table("narrow")->id;
+  g_narrow = cat->table({kPublicSchema, "narrow"})->id;
   // 2^32 + 5 would be 5 cut to 4 bytes: a row keyed 5 must not be found.
-  bytecask::sql::RowWriter w{cat->table("narrow")->layout};
-  REQUIRE(w.set_i64(cat->table("narrow")->column("k")->id, 5));
+  bytecask::sql::RowWriter w{cat->table({kPublicSchema, "narrow"})->layout};
+  REQUIRE(w.set_i64(cat->table({kPublicSchema, "narrow"})->column("k")->id, 5));
   Bytes row, key;
   REQUIRE(w.finish(row));
-  REQUIRE(bytecask::sql::encode_pk_from_row(*cat->table("narrow"), row, key));
+  REQUIRE(bytecask::sql::encode_pk_from_row(*cat->table({kPublicSchema, "narrow"}), row, key));
   CHECK(key.size() == bytecask::sql::kKeyPrefixBytes + 4);
   f.db->put({}, key, row);
   const auto past = (std::int64_t{1} << 32) + 5;

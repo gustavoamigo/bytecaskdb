@@ -104,10 +104,10 @@ auto n32(std::size_t n) -> std::uint32_t { return static_cast<std::uint32_t>(n);
 
 auto make_ref(const Catalog& cat, const RefSpec& s) -> std::unique_ptr<Ref> {
   auto r = std::make_unique<Ref>();
-  for (const auto& name : s.read) r->read.push_back(cat.table(name)->id);
-  for (const auto& name : s.written) r->written.push_back(cat.table(name)->id);
+  for (const auto& name : s.read) r->read.push_back(cat.table({kPublicSchema, name})->id);
+  for (const auto& name : s.written) r->written.push_back(cat.table({kPublicSchema, name})->id);
   for (const auto& [tn, cn] : s.cols) {
-    const auto* t = cat.table(tn);
+    const auto* t = cat.table({kPublicSchema, tn});
     const auto* c = t->column(cn);
     r->cols.push_back({t->id, c->id, static_cast<std::uint8_t>(c->type)});
   }
@@ -126,7 +126,7 @@ auto make_ref(const Catalog& cat, const RefSpec& s) -> std::unique_ptr<Ref> {
 
 auto all_columns(const Catalog& cat, std::string_view table) -> std::vector<std::pair<std::string, std::string>> {
   std::vector<std::pair<std::string, std::string>> out;
-  for (const auto& c : cat.table(table)->columns) out.emplace_back(std::string{table}, c.name);
+  for (const auto& c : cat.table({kPublicSchema, std::string{table}})->columns) out.emplace_back(std::string{table}, c.name);
   return out;
 }
 
@@ -236,7 +236,7 @@ void print_record_bytes(const Catalog& cat) {
   constexpr std::size_t kFraming = 19;
   std::printf("record bytes (key + value + %zu framing), every column present:\n", kFraming);
   auto record = [&](std::string_view name) {
-    const auto& t = *cat.table(name);
+    const auto& t = *cat.table({kPublicSchema, std::string{name}});
     RowWriter rw{t.layout};
     for (const auto& c : t.columns) {
       switch (c.type) {
@@ -425,7 +425,7 @@ int main() {
     auto cat = live.current();
     print_record_bytes(*cat);
     // One warehouse row, written straight to the engine.
-    const auto& w = *cat->table("warehouse");
+    const auto& w = *cat->table({kPublicSchema, "warehouse"});
     g_warehouse = w.id;
     g_wtax = w.column("w_tax")->id;
     {
@@ -438,7 +438,7 @@ int main() {
       db.put({}, key, row);
     }
     // One customer row, likewise.
-    const auto& cust = *cat->table("customer");
+    const auto& cust = *cat->table({kPublicSchema, "customer"});
     g_customer = cust.id;
     g_balance = cust.column("c_balance")->id;
     g_texts = {cust.column("c_first")->id, cust.column("c_middle")->id, cust.column("c_last")->id,

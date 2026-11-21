@@ -171,11 +171,11 @@ TEST_CASE("codegen: UPDATE and DELETE write each row their key reaches, and coun
 
 TEST_CASE("codegen: MIN from the first entry past the NULLs, or a loop; SUM by a loop", "[sql][codegen]") {
   sql_test::Fixture f;
-  f.ddl(CreateTableDdl{"m",
+  f.ddl(CreateTableDdl{{kPublicSchema, "m"},
                        {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("g", PhysType::I64, false),
                         sql_test::Fixture::col("x", PhysType::I64, true)},
                        {"k"}});
-  f.ddl(CreateIndexDdl{"m_gx", "m", {{"g"}, {"x"}}});
+  f.ddl(CreateIndexDdl{"m_gx", {kPublicSchema, "m"}, {{"g"}, {"x"}}});
   // x is the ASC part after the prefix: the scan starts past its NULLs, and
   // its first entry is the least value, read into a local.
   auto first = generate(f.cat(), "SELECT min(x) FROM m WHERE g = $1").source;
@@ -262,9 +262,9 @@ TEST_CASE("codegen: a DOUBLE result column is read from the row, never the index
   // The key encoding writes -0.0 as 0.0 and every NaN as one NaN: a covering
   // read would return a value the row does not hold.
   sql_test::Fixture f;
-  f.ddl(CreateTableDdl{"dd", {sql_test::Fixture::col("id", PhysType::I64, false), sql_test::Fixture::col("d", PhysType::F64, true)},
+  f.ddl(CreateTableDdl{{kPublicSchema, "dd"}, {sql_test::Fixture::col("id", PhysType::I64, false), sql_test::Fixture::col("d", PhysType::F64, true)},
                        {"id"}});
-  f.ddl(CreateIndexDdl{"dd_d", "dd", {{"d"}}});
+  f.ddl(CreateIndexDdl{"dd_d", {kPublicSchema, "dd"}, {{"d"}}});
   auto by_d = generate(f.cat(), "SELECT d FROM dd WHERE d >= $1");
   CHECK(by_d.source.find("bc_view row = bc_scan_row(cx, c);") != std::string::npos);
   CHECK(by_d.source.find("bc_emit_key_part") == std::string::npos);
@@ -274,7 +274,7 @@ TEST_CASE("codegen: a DOUBLE result column is read from the row, never the index
 
 TEST_CASE("codegen: a composite key from parameters out of order takes the builder", "[sql][codegen]") {
   sql_test::Fixture f;
-  f.ddl(CreateTableDdl{"p", {sql_test::Fixture::col("a", PhysType::I64, false), sql_test::Fixture::col("b", PhysType::I64, false),
+  f.ddl(CreateTableDdl{{kPublicSchema, "p"}, {sql_test::Fixture::col("a", PhysType::I64, false), sql_test::Fixture::col("b", PhysType::I64, false),
                              sql_test::Fixture::col("v", PhysType::I64, true)},
                        {"a", "b"}});
   auto in_order = generate(f.cat(), "SELECT v FROM p WHERE a = $1 AND b = $2").source;
@@ -288,11 +288,11 @@ TEST_CASE("codegen: a composite key from parameters out of order takes the build
 TEST_CASE("codegen: what the planner refuses, with its message, and what it sorts", "[sql][codegen]") {
   sql_test::Fixture f;
   // o: an index whose second part is a nullable DESC part.
-  f.ddl(CreateTableDdl{"o",
+  f.ddl(CreateTableDdl{{kPublicSchema, "o"},
                        {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("a", PhysType::I64, false),
                         sql_test::Fixture::col("b", PhysType::I64, true), sql_test::Fixture::col("c", PhysType::I64, true)},
                        {"k"}});
-  f.ddl(CreateIndexDdl{"o_ab", "o", {{"a"}, {"b", true}, {"c"}}});
+  f.ddl(CreateIndexDdl{"o_ab", {kPublicSchema, "o"}, {{"a"}, {"b", true}, {"c"}}});
   auto refusal = [&](std::string_view sql) -> std::string {
     try {
       (void)generate(f.cat(), sql);
@@ -318,7 +318,7 @@ TEST_CASE("codegen: what the planner refuses, with its message, and what it sort
   CHECK_FALSE(sorts("SELECT k FROM o WHERE a = $1 ORDER BY b DESC NULLS LAST, c NULLS FIRST"));
   // A filter on a DOUBLE or REAL column compares the row's value in
   // PostgreSQL's float8 order, NaN and -0.0 included.
-  f.ddl(CreateTableDdl{"fd", {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("d", PhysType::F64, true)},
+  f.ddl(CreateTableDdl{{kPublicSchema, "fd"}, {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("d", PhysType::F64, true)},
                        {"k"}});
   CHECK(refusal("SELECT k FROM fd WHERE k = $1 AND d < $2") == "accepted");
   CHECK(generate(f.cat(), "SELECT k FROM fd WHERE k = $1 AND d < $2").source.find("bc_cmp_f64(bc_col_f64(cx, row, COL_") !=
@@ -328,7 +328,7 @@ TEST_CASE("codegen: what the planner refuses, with its message, and what it sort
   CHECK(generate(f.cat(), "SELECT k FROM fd WHERE d < k").source.find("bc_cmp_f64(bc_col_f64(cx, row, COL_") != std::string::npos);
   CHECK(generate(f.cat(), "SELECT k FROM fd WHERE d < k").source.find(", (double)(bc_col_i64(cx, row, COL_") != std::string::npos);
   // $n + k bounds a range on a key, but compared by = it is a filter: it names no key.
-  f.ddl(CreateTableDdl{"ik", {{"k", {SqlKind::Integer}, false, {}}}, {"k"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "ik"}, {{"k", {SqlKind::Integer}, false, {}}}, {"k"}});
   CHECK(refusal("SELECT k FROM ik WHERE k >= $1 + 1") == "accepted");
   CHECK(generate(f.cat(), "SELECT k FROM ik WHERE k = $1 + 1").source.find("bc_empty(cx);\n  bc_cursor c = bc_scan_open(cx, TBL_") !=
         std::string::npos);
@@ -349,7 +349,7 @@ TEST_CASE("codegen: FOR UPDATE guards the key of every row it returns, read from
 
 TEST_CASE("codegen: a join is of two point lookups, in FROM order", "[sql][codegen]") {
   sql_test::Fixture f;
-  f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"}, {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
                        {"k"}});
   auto j = generate(f.cat(), "SELECT v, qty FROM u JOIN t ON id = $2 WHERE k = $1");
   CHECK(j.objects_read == std::vector<std::uint32_t>{1, 4});
@@ -413,9 +413,9 @@ TEST_CASE("codegen: a join is of two point lookups, in FROM order", "[sql][codeg
   // FROM order would leave x.f = y.f a filter of the pairs, each y row
   // compared with every x row; the other order keys x by it, for less.
   using sql_test::Fixture;
-  f.ddl(CreateTableDdl{"x", {Fixture::col("f", PhysType::F64, false), Fixture::col("c", PhysType::I64, true)}, {"f"}});
-  f.ddl(CreateIndexDdl{"x_by_c", "x", {{"c"}}});
-  f.ddl(CreateTableDdl{"y", {Fixture::col("yk", PhysType::I64, false), Fixture::col("yf", PhysType::F64, true)}, {"yk"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "x"}, {Fixture::col("f", PhysType::F64, false), Fixture::col("c", PhysType::I64, true)}, {"f"}});
+  f.ddl(CreateIndexDdl{"x_by_c", {kPublicSchema, "x"}, {{"c"}}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "y"}, {Fixture::col("yk", PhysType::I64, false), Fixture::col("yf", PhysType::F64, true)}, {"yk"}});
   auto other = generate(f.cat(), "SELECT c FROM x, y WHERE c = $1 AND yk = $2 AND f = yf");
   CHECK(other.source.find("bc_scan_open(cx, TBL_9, lo, lo, BC_SCAN_PREFIX);") != std::string::npos);
   CHECK(other.source.find("bc_key_f64(cx, k0, bc_col_f64(cx, row, COL_9_1));") != std::string::npos);
@@ -424,7 +424,7 @@ TEST_CASE("codegen: a join is of two point lookups, in FROM order", "[sql][codeg
   CHECK(generate(f.cat(), "SELECT c FROM x, y WHERE c = $1 AND yk = $2 AND f = yf AND yf = $3").source.find("bc_cmp_f64(") !=
         std::string::npos);
   // A long outer value makes an inner key no row has: that outer row joins nothing.
-  f.ddl(CreateTableDdl{"s", {Fixture::col("sk", PhysType::Bytes, false)}, {"sk"}});
+  f.ddl(CreateTableDdl{{kPublicSchema, "s"}, {Fixture::col("sk", PhysType::Bytes, false)}, {"sk"}});
   auto by_bytes = generate(f.cat(), "SELECT id FROM t, s WHERE name >= $1 AND sk = name");
   auto fits = by_bytes.source.find("if (!bc_key_fits(cx, k0)) continue;");
   auto get = by_bytes.source.find("bc_view row1 = bc_get(cx, bc_key_end(cx, k0), &found1);");
@@ -436,7 +436,7 @@ TEST_CASE("codegen: a join is of two point lookups, in FROM order", "[sql][codeg
 
 TEST_CASE("codegen: a subquery is a function of its own, run first into its parameters", "[sql][codegen]") {
   sql_test::Fixture f;
-  f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"}, {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
                        {"k"}});
   auto has = [](const GeneratedPlan& p, std::string_view s) { return p.source.find(s) != std::string::npos; };
   // A scalar subquery keys t's lookup: its value is a parameter, set first.
@@ -461,7 +461,7 @@ TEST_CASE("codegen: a subquery is a function of its own, run first into its para
 
 TEST_CASE("codegen: a correlated subquery runs at its conjunct, for the row in hand", "[sql][codegen]") {
   sql_test::Fixture f;
-  f.ddl(CreateTableDdl{"u", {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
+  f.ddl(CreateTableDdl{{kPublicSchema, "u"}, {sql_test::Fixture::col("k", PhysType::I64, false), sql_test::Fixture::col("v", PhysType::I64, true)},
                        {"k"}});
   auto has = [](const GeneratedPlan& p, std::string_view s) { return p.source.find(s) != std::string::npos; };
   // The outer column is parameter 2, after $1 and $2; the subquery keys its
@@ -532,6 +532,6 @@ TEST_CASE("codegen: a derived relation binds each of its query's groups to local
   CHECK(plan.source.find("if (d0_n1 || bc_param_null(cx, 0) || !(d0_v1 > bc_param_i64(cx, 0))) continue;") != std::string::npos);
   CHECK(plan.source.find("} while (0);") != std::string::npos);
   // It reads the view's table, as the view's query does.
-  CHECK(plan.objects_read == std::vector<std::uint32_t>{cat.table("t")->id});
+  CHECK(plan.objects_read == std::vector<std::uint32_t>{cat.table({kPublicSchema, "t"})->id});
   CHECK_FALSE(plan.resumable);
 }

@@ -57,7 +57,7 @@ void check_schema(const Catalog& cat) {
   CHECK(cat.tables().size() == 9);
   for (const auto& [name, e] : expected()) {
     INFO(name);
-    const auto* t = cat.table(name);
+    const auto* t = cat.table({kPublicSchema, name});
     REQUIRE(t != nullptr);
     CHECK(t->columns.size() == e.columns);
     CHECK(names(*t, t->pk_col_ids) == e.pk);
@@ -72,7 +72,7 @@ void check_schema(const Catalog& cat) {
     CHECK(names(*t, parts) == e.unique_index);
   }
   // A sample of the types, as declared.
-  const auto& c = *cat.table("customer");
+  const auto& c = *cat.table({kPublicSchema, "customer"});
   CHECK(c.column("c_balance")->sql == SqlType{SqlKind::Decimal, 0, 12, 2});
   CHECK(c.column("c_discount")->sql == SqlType{SqlKind::Decimal, 0, 4, 4});
   CHECK(c.column("c_data")->sql == SqlType{SqlKind::Varchar, 500});

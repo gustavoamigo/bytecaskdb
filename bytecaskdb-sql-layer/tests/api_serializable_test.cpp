@@ -1332,8 +1332,8 @@ TEST_CASE("serializable: 54000 at every recording site: each bound below a state
           "write, with no read past the bound",
           "[sql][serializable][memory]") {
   Fixture f;
-  f.ddl(bytecask::sql::CreateIndexDdl{"t_by_qty", "t", {{"qty"}}, true});
-  const auto by_qty = f.cat().index("t_by_qty").second->id;
+  f.ddl(bytecask::sql::CreateIndexDdl{"t_by_qty", {kPublicSchema, "t"}, {{"qty"}}, true});
+  const auto by_qty = f.cat().index({kPublicSchema, "t_by_qty"}).second->id;
   for (std::int64_t id = 1; id <= 6; ++id) {
     REQUIRE(autocommit(f, f.cx, insert_qty_t, {id, id * 10}) == BC_COMMITTED);
   }

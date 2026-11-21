@@ -46,9 +46,10 @@ struct Fixture {
     live = std::make_unique<bytecask::sql::LiveCatalog>(*db);
     if (create) {
       using bytecask::sql::PhysType;
+      using bytecask::sql::kPublicSchema;
       ddl(bytecask::sql::CreateTableDdl{
-          "t", {col("id", PhysType::I64, false), col("name", PhysType::Bytes, true), col("qty", PhysType::I64, true)}, {"id"}});
-      ddl(bytecask::sql::CreateIndexDdl{"t_by_name", "t", {{"name"}}});
+          {kPublicSchema, "t"}, {col("id", PhysType::I64, false), col("name", PhysType::Bytes, true), col("qty", PhysType::I64, true)}, {"id"}});
+      ddl(bytecask::sql::CreateIndexDdl{"t_by_name", {kPublicSchema, "t"}, {{"name"}}});
     }
     bdb = {db.get()};
     bcat = {live.get()};

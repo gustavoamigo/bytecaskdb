@@ -76,7 +76,7 @@ auto index_entries(Database& db, std::uint32_t index_id) -> std::size_t {
 }
 
 auto index_id(Database& db, std::string_view name) -> std::uint32_t {
-  const auto [table, ix] = db.catalog()->index(name);
+  const auto [table, ix] = db.catalog()->index({kPublicSchema, std::string{name}});
   REQUIRE(ix != nullptr);
   return ix->id;
 }
@@ -218,11 +218,11 @@ TEST_CASE("txn DDL: ROLLBACK TO undoes the DDL since the savepoint, RELEASE keep
   CHECK(state([&] { (void)t.execute("SELECT k FROM z2"); }) == "42P01");
   t.rollback_to("b");
   CHECK(t.commit() == CommitOutcome::Committed);
-  CHECK(db->catalog()->table("x") == nullptr);
-  CHECK(db->catalog()->table("y") != nullptr);
-  CHECK(db->catalog()->table("z1") != nullptr);
-  CHECK(db->catalog()->table("z2") == nullptr);
-  CHECK(db->catalog()->index("t_a").second == nullptr);
+  CHECK(db->catalog()->table({kPublicSchema, "x"}) == nullptr);
+  CHECK(db->catalog()->table({kPublicSchema, "y"}) != nullptr);
+  CHECK(db->catalog()->table({kPublicSchema, "z1"}) != nullptr);
+  CHECK(db->catalog()->table({kPublicSchema, "z2"}) == nullptr);
+  CHECK(db->catalog()->index({kPublicSchema, "t_a"}).second == nullptr);
   CHECK(db->execute("SELECT k FROM y").rows == Grid{{i(1)}});
   CHECK(names(db->execute("SELECT * FROM t")) == Names{"k", "a"});
 }
@@ -254,7 +254,7 @@ TEST_CASE("txn DDL: an abort that restores the catalog stops index maintenance f
     (void)t.execute(insert, {i(2), i(20)});
     CHECK(t.commit() == CommitOutcome::Committed);
   }
-  CHECK(db->catalog()->index("i").second == nullptr);
+  CHECK(db->catalog()->index({kPublicSchema, "i"}).second == nullptr);
   CHECK(index_entries(*db, ix) == 0);
   CHECK(db->execute("SELECT a FROM t WHERE k = 2").rows == Grid{{i(20)}});
 }
@@ -528,7 +528,7 @@ TEST_CASE("txn DDL: the second of two DDL commits fails, and the loser writes no
       (void)t1.execute(ddl);
       (void)db->execute("INSERT INTO t VALUES (100, 1)");
       CHECK(state([&] { (void)t1.commit(); }) == "40001");
-      CHECK(db->catalog()->index("t_a").second == nullptr);
+      CHECK(db->catalog()->index({kPublicSchema, "t_a"}).second == nullptr);
       CHECK(names(db->execute("SELECT * FROM t")) == Names{"k", "a"});
       (void)db->execute("DELETE FROM t WHERE k = 100");
     }
@@ -538,7 +538,7 @@ TEST_CASE("txn DDL: the second of two DDL commits fails, and the loser writes no
     (void)t1.execute("DROP INDEX t_a");
     (void)db->execute("INSERT INTO t VALUES (100, 1)");
     CHECK(state([&] { (void)t1.commit(); }) == "40001");
-    CHECK(db->catalog()->index("t_a").second != nullptr);
+    CHECK(db->catalog()->index({kPublicSchema, "t_a"}).second != nullptr);
     CHECK(index_entries(*db, index_id(*db, "t_a")) == 2);
   }
   SECTION("ADD COLUMN with no default and CREATE VIEW do not depend on the rows: T1 commits") {
@@ -603,7 +603,7 @@ TEST_CASE("txn DDL: the second of two DDL commits fails, and the loser writes no
     (void)db->execute("CREATE TABLE other (k BIGINT PRIMARY KEY)");
     db->live_catalog_for_testing().set_commit_hook_for_testing({});
     CHECK(outcome == "40001");
-    CHECK(db->catalog()->table("x") == nullptr);
+    CHECK(db->catalog()->table({kPublicSchema, "x"}) == nullptr);
   }
 }
 
@@ -627,7 +627,7 @@ TEST_CASE("txn DDL: a transaction that ran DDL is 40001 at its next statement on
   t.rollback_to("before");
   CHECK(t.execute("SELECT k FROM t ORDER BY k").rows == Grid{{i(1)}, {i(2)}});
   CHECK(t.commit() == CommitOutcome::Committed);
-  CHECK(db->catalog()->table("x") == nullptr);
+  CHECK(db->catalog()->table({kPublicSchema, "x"}) == nullptr);
   CHECK(db->execute("SELECT k FROM t ORDER BY k").rows == Grid{{i(1)}, {i(2)}});
   // Without a savepoint, the doomed 40001 aborts it, and COMMIT rolls it back.
   auto u = db->begin();
@@ -651,7 +651,7 @@ TEST_CASE("txn DDL: a first statement that is a DDL re-pins; a later DDL at a st
     (void)t.execute("CREATE TABLE x (k BIGINT PRIMARY KEY)");
     CHECK(raced == 2);
     CHECK(t.commit() == CommitOutcome::Committed);
-    CHECK(db->catalog()->table("x") != nullptr);
+    CHECK(db->catalog()->table({kPublicSchema, "x"}) != nullptr);
   }
   db->after_txn_pin_for_testing({});
   auto t = db->begin();
@@ -675,7 +675,7 @@ TEST_CASE("txn DDL: a conflict with a DDL published since is 40001; with none, a
     (void)t2.execute("INSERT INTO y VALUES (1)");
     CHECK(t1.commit() == CommitOutcome::Committed);
     CHECK(state([&] { (void)t2.commit(); }) == "40001");
-    CHECK(db->catalog()->table("y") == nullptr);
+    CHECK(db->catalog()->table({kPublicSchema, "y"}) == nullptr);
   }
   {
     // No DDL published since: the key a concurrent insert took is a duplicate.
@@ -684,7 +684,7 @@ TEST_CASE("txn DDL: a conflict with a DDL published since is 40001; with none, a
     (void)t.execute("INSERT INTO t VALUES (5, 50)");
     (void)db->execute("INSERT INTO t VALUES (5, 55)");
     CHECK(state([&] { (void)t.commit(); }) == "23505");
-    CHECK(db->catalog()->table("z") == nullptr);
+    CHECK(db->catalog()->table({kPublicSchema, "z"}) == nullptr);
     CHECK(db->execute("SELECT a FROM t WHERE k = 5").rows == Grid{{i(55)}});
   }
 }
@@ -754,7 +754,7 @@ TEST_CASE("txn DDL: max_bytes bounds a transaction's DDL; Catalog::estimated_byt
   }
   // The estimate: the base, then each table, column, index and object's constant and its names.
   auto cat = db->catalog();
-  const auto* table = cat->table("t");
+  const auto* table = cat->table({kPublicSchema, "t"});
   REQUIRE(table != nullptr);
   std::uint64_t expected = Catalog::kEstimateBase + Catalog::kEstimateTable + table->name.size();
   for (const auto& c : table->columns) expected += Catalog::kEstimateColumn + c.name.size();
@@ -790,7 +790,7 @@ TEST_CASE("txn DDL: a commit that may have reached the engine is 08007; reopened
     }
     // Both or neither: the table, its index and rows, and the other table's row.
     auto db = Database::open(dir.path());
-    const auto has = db->catalog()->table("x") != nullptr;
+    const auto has = db->catalog()->table({kPublicSchema, "x"}) != nullptr;
     if (outcome == "ok") CHECK(has);
     if (outcome != "ok" && outcome != "08007") CHECK_FALSE(has);
     CHECK(db->execute("SELECT k FROM t WHERE k = 2").rows.size() == (has ? 1u : 0u));
@@ -817,7 +817,7 @@ TEST_CASE("txn DDL: reopened after a commit held at the engine, applied or faile
       std::string seen;
       db->live_catalog_for_testing().set_commit_hook_for_testing([&] {
         // Mid-commit: no other session sees the table yet.
-        std::thread reader{[&] { seen = db->catalog()->table("x") == nullptr ? "absent" : "present"; }};
+        std::thread reader{[&] { seen = db->catalog()->table({kPublicSchema, "x"}) == nullptr ? "absent" : "present"; }};
         reader.join();
         if (fail) throw std::runtime_error{"crash"};
       });
@@ -827,7 +827,7 @@ TEST_CASE("txn DDL: reopened after a commit held at the engine, applied or faile
       CHECK(seen == "absent");
     }
     auto db = Database::open(dir.path());
-    CHECK((db->catalog()->table("x") != nullptr) == !fail);
+    CHECK((db->catalog()->table({kPublicSchema, "x"}) != nullptr) == !fail);
     CHECK(db->execute("SELECT k FROM t WHERE k = 2").rows.size() == (fail ? 0u : 1u));
     if (!fail) CHECK(db->execute("SELECT k FROM x").rows == Grid{{i(1)}});
   }
@@ -884,8 +884,8 @@ TEST_CASE("txn DDL: an allocation failure in a DDL step, a compile after it, ROL
       }
       CHECK(t.commit() == CommitOutcome::Committed);
       // Undo what the run committed, for the next allocation.
-      if (db->catalog()->index("t_a").second != nullptr) (void)db->execute("DROP INDEX t_a");
-      if (db->catalog()->table("t")->column("c") != nullptr) {
+      if (db->catalog()->index({kPublicSchema, "t_a"}).second != nullptr) (void)db->execute("DROP INDEX t_a");
+      if (db->catalog()->table({kPublicSchema, "t"})->column("c") != nullptr) {
         (void)db->execute("DROP TABLE t");
         (void)db->execute("CREATE TABLE t (k BIGINT PRIMARY KEY, a BIGINT)");
         for (std::int64_t k = 1; k <= 20; ++k) (void)db->execute("INSERT INTO t VALUES ($1, $1)", {i(k)});
@@ -921,7 +921,7 @@ TEST_CASE("txn DDL: an allocation failure in a DDL step, a compile after it, ROL
       INFO("allocation " << nth << ": " << outcome);
       if (commit) {
         // Committed whole or not at all.
-        const auto has = db->catalog()->table("x") != nullptr;
+        const auto has = db->catalog()->table({kPublicSchema, "x"}) != nullptr;
         CHECK(has == (outcome == "ok"));
         if (has) {
           CHECK(db->execute("SELECT k FROM x").rows == Grid{{i(1)}});
@@ -968,8 +968,8 @@ TEST_CASE("txn DDL: CREATE TABLE AS reads the transaction's view; ROLLBACK leave
       CHECK(t.commit() == CommitOutcome::Committed);
     } else {
       t.rollback();
-      CHECK(db->catalog()->table("c") == nullptr);
-      CHECK(db->catalog()->table("s") == nullptr);
+      CHECK(db->catalog()->table({kPublicSchema, "c"}) == nullptr);
+      CHECK(db->catalog()->table({kPublicSchema, "s"}) == nullptr);
     }
   }
   CHECK(db->execute("SELECT k, a FROM c ORDER BY k").rows == Grid{{i(1), i(10)}, {i(2), i(20)}, {i(3), i(30)}});
