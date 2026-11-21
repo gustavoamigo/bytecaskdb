@@ -323,6 +323,7 @@ struct Insert {
 
 
 struct SetOperation;
+struct Select;
 
 // How a FROM item joins the ones before it: LEFT keeps every row of the
 // items before it, RIGHT every row of the item (two items only), each joined
@@ -346,6 +347,12 @@ struct FromItem {
   std::vector<std::string> using_columns;
   bool natural{false};
   std::string using_alias;
+  // A grouped view read as a relation of its own (docs/frontend_design.md,
+  // *Views*): its query, expanded to base tables and without its ORDER BY,
+  // whose rows the item's are; `table` is the view's name and
+  // `column_aliases` its column names. Null for a table or a view merged into
+  // the query.
+  std::shared_ptr<const Select> derived;
 
   // What a column of the item is qualified by.
   [[nodiscard]] auto name() const -> const std::string&;

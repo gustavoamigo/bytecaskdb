@@ -668,3 +668,43 @@ TEST_CASE("physical: check refuses a grouped aggregate codegen can't print", "[s
   refused(dependent({}, {name}, true), "a dependent column of one group of every row");
   refused(dependent({kId, name}, {name}, false), "a dependent column that is a key");
 }
+
+TEST_CASE("physical: a derived relation is its query's groups, read by a grouped aggregate alone", "[sql][physical]") {
+  using Kind = logical::Expr::Kind;
+  const auto big = SqlType{SqlKind::BigInt};
+  const auto d = Table::kDerivedBase;
+  const logical::ColumnRef dk{d, 0, PhysType::I64, true};
+  const logical::ColumnRef dn{d, 1, PhysType::I64, false};
+  auto count = logical::expr(Kind::Aggregate, big);
+  count.fn = logical::Expr::Fn::Count;
+  // The view's query: SELECT id, COUNT(*) FROM t GROUP BY id, over a scan.
+  auto groups = [&] {
+    auto rows = node(scan({}, physical::Range{}));
+    auto g = node(physical::GroupAggregate{std::move(rows), {kId}, {count}, false, {}});
+    return node(physical::GroupEmit{std::move(g), {logical::column(kId, big), count}});
+  };
+  auto sum = logical::expr(Kind::Aggregate, big);
+  sum.fn = logical::Expr::Fn::Sum;
+  sum.args.push_back(logical::column(dk, big));
+  // SELECT SUM(k) FROM v WHERE n > $0: the outer query's one group, streamed.
+  auto outer = [&](physical::NodePtr input, std::vector<logical::ColumnRef> columns) {
+    auto rows = node(physical::Derived{std::move(input), d, std::move(columns)});
+    rows = node(physical::Filter{std::move(rows), {logical::compare(ast::Compare::Op::Gt, logical::column(dn, big), p(0))}});
+    auto g = node(physical::GroupAggregate{std::move(rows), {}, {sum}, true, {}});
+    return node(physical::GroupEmit{std::move(g), {sum}});
+  };
+  CHECK(refusal(plan(outer(groups(), {dk, dn}), {})).empty());
+  // Its columns are its query's outputs, in order and of their types.
+  refused(plan(outer(groups(), {dk}), {}), "other columns than its query gives");
+  refused(plan(outer(groups(), {dn, dk}), {}), "not its query's output");
+  refused(plan(outer(emit(get({p(0)})), {dk}), {0}), "not a GroupEmit's");
+  // No row holds it: nothing emits, sorts or keeps a row of it.
+  refused(plan(emit(node(physical::Derived{groups(), d, {dk, dn}}), {dk}), {}), "rows emitted from a derived relation");
+  const logical::ColumnRef text{d, 0, PhysType::Bytes, true};
+  auto by_text = node(physical::GroupAggregate{node(physical::Derived{groups(), d, {dk, dn}}), {text}, {count}, false, {}});
+  refused(plan(node(physical::GroupEmit{std::move(by_text), {count}}), {}), "holds a row of a derived relation");
+  // A BOOLEAN key of a derived relation takes a slot, as an integer does.
+  const logical::ColumnRef flag{d, 2, PhysType::Bool, true};
+  CHECK(physical::group_layout({flag}, {}).key_slot[0].has_value());
+  CHECK_FALSE(physical::group_layout({{1, 4, PhysType::Bool, true}}, {}).key_slot[0].has_value());
+}

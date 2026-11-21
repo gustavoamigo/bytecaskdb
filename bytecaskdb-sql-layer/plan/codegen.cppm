@@ -216,9 +216,9 @@ public:
     line(s.empty() ? "{" : s + " {");
     ++depth_;
   }
-  void close() {
+  void close(const std::string& tail = "") {
     --depth_;
-    line("}");
+    line("}" + tail);
   }
   void otherwise() {
     --depth_;
@@ -339,6 +339,27 @@ private:
   std::set<std::tuple<std::uint32_t, std::uint32_t, PhysType>> cols_;
   std::set<std::uint32_t> reads_;
 };
+
+// A value of type t as C: its zero, and the type of a local that holds it.
+auto zero(PhysType t) -> std::string {
+  switch (t) {
+    case PhysType::I64: return "INT64_C(0)";
+    case PhysType::F64: return "0.0";
+    case PhysType::Bool: return "false";
+    case PhysType::Bytes: return "bc_empty(cx)";
+  }
+  return "INT64_C(0)";
+}
+
+auto c_type(PhysType t) -> std::string {
+  switch (t) {
+    case PhysType::I64: return "int64_t";
+    case PhysType::F64: return "double";
+    case PhysType::Bool: return "bool";
+    case PhysType::Bytes: return "bc_view";
+  }
+  return "int64_t";
+}
 
 auto param(PhysType t, std::uint32_t n) -> std::string {
   return "bc_param_" + suffix(t) + "(cx, " + std::to_string(n) + ")";
@@ -620,6 +641,7 @@ private:
     bool for_update{false};
     std::string cursor{"c"};  // a covering scan's
     bool looped{false};       // bound by a loop: a scan's, or a hash join's over the rows it holds
+    bool derived{false};      // a derived relation's group: its columns are the locals <row>_v<col>, NULL while <row>_n<col>
   };
 
   // Whether the root is under LIMIT 0: rows or groups emitted under it, or
@@ -657,7 +679,7 @@ private:
           } else if constexpr (std::is_same_v<T, physical::IndexJoin>) {
             return loops(*op.outer);
           } else if constexpr (std::is_same_v<T, physical::NestedLoop> || std::is_same_v<T, physical::HashJoin> ||
-                               std::is_same_v<T, physical::Choice>) {
+                               std::is_same_v<T, physical::Choice> || std::is_same_v<T, physical::Derived>) {
             return true;
           } else if constexpr (requires { op.input; }) {
             return loops(*op.input);
@@ -676,11 +698,15 @@ private:
   // A column of the row in hand, or of the entry a covering scan's cursor is
   // on: never a DOUBLE (physical::check).
   auto read_col(const ColumnRef& c) -> std::string {
-    if (const auto& b = binding(c.table); b.covering) return "bc_key_part_" + suffix(c.type) + "(cx, " + key_part(b, c);
+    const auto& b = binding(c.table);
+    if (b.derived) return b.row + "_v" + std::to_string(c.col);
+    if (b.covering) return "bc_key_part_" + suffix(c.type) + "(cx, " + key_part(b, c);
     return "bc_col_" + suffix(c.type) + "(cx, " + row_of(c) + ", " + w_.col(c) + ")";
   }
   auto col_null(const ColumnRef& c) -> std::string {
-    if (const auto& b = binding(c.table); b.covering) return "bc_key_part_null(cx, " + key_part(b, c);
+    const auto& b = binding(c.table);
+    if (b.derived) return b.row + "_n" + std::to_string(c.col);
+    if (b.covering) return "bc_key_part_null(cx, " + key_part(b, c);
     return "bc_col_null(cx, " + row_of(c) + ", " + w_.col(c) + ")";
   }
   // "<object>, bc_scan_key(cx, c), <part>)": the arguments that name c's part
@@ -2115,8 +2141,10 @@ private:
       }
       if (g.op->streamed) return {c.nullable ? local("kn", g, j) : "", local("kv", g, j)};
       auto slot = std::to_string(*g.layout.key_slot[j]);
-      return {c.nullable ? "bc_agg_null(cx, " + g.handle + ", " + slot + ")" : "",
-              "bc_agg_i64(cx, " + g.handle + ", " + slot + ")"};
+      auto value = "bc_agg_i64(cx, " + g.handle + ", " + slot + ")";
+      // A derived relation's BOOLEAN, held as 0 or 1 (group_layout).
+      if (c.type == PhysType::Bool) value = "(" + value + " != 0)";
+      return {c.nullable ? "bc_agg_null(cx, " + g.handle + ", " + slot + ")" : "", value};
     }
     auto j = agg_index(g, e);
     auto count = e.fn == Expr::Fn::Count;
@@ -2137,6 +2165,26 @@ private:
     return out + " || !(" + compare_text(lhs.type, lhs.type, c.op, value, param(lhs.phys(), rhs.param)) + ")";
   }
 
+  // An AVG of the group in hand: whether it is NULL, its sum and its count,
+  // as C.
+  struct Average {
+    std::string is_null, sum, count;
+  };
+  auto average(const Expr& e) const -> Average {
+    const auto& g = *group_;
+    auto j = agg_index(g, e);
+    if (g.op->streamed) return {"!" + local("xs", g, j), local("x", g, j), local("xc", g, j)};
+    auto slot = g.layout.agg_slot[j];
+    return {"bc_agg_null(cx, " + g.handle + ", " + std::to_string(slot) + ")",
+            std::string{folds_f64(e) ? "bc_agg_f64" : "bc_agg_i64"} + "(cx, " + g.handle + ", " + std::to_string(slot) + ")",
+            "bc_agg_i64(cx, " + g.handle + ", " + std::to_string(slot + 1) + ")"};
+  }
+
+  // PostgreSQL's float8 average: the sum over the count.
+  static auto float_average(const std::string& sum, const std::string& count) -> std::string {
+    return sum + " / bc_i64_to_f64(" + count + ")";
+  }
+
   // One output of the group in hand: a key, an aggregate, or an AVG's sum
   // and count, NULL as NULL.
   void emit_group(const Expr& e) {
@@ -2148,25 +2196,13 @@ private:
       }
     }
     if (e.kind == Expr::Kind::Aggregate && e.fn == Expr::Fn::Avg) {
-      auto j = agg_index(g, e);
-      std::string is_null, sum, count;
-      if (g.op->streamed) {
-        is_null = "!" + local("xs", g, j);
-        sum = local("x", g, j);
-        count = local("xc", g, j);
-      } else {
-        auto slot = g.layout.agg_slot[j];
-        is_null = "bc_agg_null(cx, " + g.handle + ", " + std::to_string(slot) + ")";
-        sum = std::string{folds_f64(e) ? "bc_agg_f64" : "bc_agg_i64"} + "(cx, " + g.handle + ", " + std::to_string(slot) + ")";
-        count = "bc_agg_i64(cx, " + g.handle + ", " + std::to_string(slot + 1) + ")";
-      }
+      auto [is_null, sum, count] = average(e);
       w_.open("if (" + is_null + ")");
       w_.line("bc_emit_null(cx);");
       if (!folds_f64(e)) w_.line("bc_emit_null(cx);");
       w_.otherwise();
       if (folds_f64(e)) {
-        // PostgreSQL's float8 average: the sum over the count.
-        w_.line("bc_emit_f64(cx, " + sum + " / bc_i64_to_f64(" + count + "));");
+        w_.line("bc_emit_f64(cx, " + float_average(sum, count) + ");");
       } else {
         w_.line("bc_emit_i64(cx, " + sum + ");");
         w_.line("bc_emit_i64(cx, " + count + ");");
@@ -2190,10 +2226,10 @@ private:
 
   // The part of sort key `k` a column of the row in hand gives, ascending,
   // NULL first: a group key's, or a distinct value's. From a covering scan's
-  // entry, its key part, an I64.
+  // entry, its key part, an I64; of a derived relation, its local.
   void sort_key_part(const std::string& k, const ColumnRef& c) {
     const auto& b = binding(c.table);
-    if (!b.covering) {
+    if (!b.covering && !b.derived) {
       w_.line("bc_sort_key_col(cx, " + k + ", " + b.row + ", " + w_.col(c) + ", BC_SORT_ASC, BC_SORT_NULLS_FIRST);");
       return;
     }
@@ -2581,6 +2617,55 @@ private:
     });
   }
 
+  // A derived relation's rows (docs/planner_design.md, *Derived
+  // relations*): its query's plan printed in place, a block of its own, and
+  // for each group it gives, where a GroupEmit would emit it, each output
+  // bound to the locals d<i>_v<j> and d<i>_n<j> (its NULL, its value the
+  // type's zero then); then k, the plan above, on them, inside `do { … }
+  // while (0)` so a miss (`continue`) leaves it for the next group, wherever
+  // the query gives the group: in its loop over groups, in its input's loop,
+  // or after it. The statement's LIMIT counts the groups above, never the
+  // query's: limit_ is reset to the arm's own around it. Today no Limit's
+  // counter reaches here (a structure clears it before its input, and a
+  // stream over a derived relation is of one group, which a Limit does not
+  // loop over); the reset keeps that true of a stream that groups.
+  void produce(const physical::Derived& d, const Consume& k) {
+    const auto& e = std::get<physical::GroupEmit>(d.input->op);
+    const auto name = "d" + std::to_string(derived_++);
+    auto limit = std::exchange(limit_, base_limit_);
+    w_.open("");
+    produce(*e.input, [&] {
+      for (std::size_t j = 0; j < e.outputs.size(); ++j) {
+        const auto& o = e.outputs[j];
+        const auto n = name + "_n" + std::to_string(j);
+        const auto v = name + "_v" + std::to_string(j);
+        const auto type = d.columns[j].type;
+        std::string is_null, value;
+        if (o.kind == Expr::Kind::Aggregate && o.fn == Expr::Fn::Avg) {
+          auto [avg_null, sum, count] = average(o);  // of a DOUBLE: physical::check
+          is_null = avg_null;
+          value = float_average(sum, count);
+        } else {
+          std::tie(is_null, value) = group_value(o);
+        }
+        w_.line("bool " + n + " = " + (is_null.empty() ? "false" : is_null) + ";");
+        w_.line(c_type(type) + " " + v + " = " + zero(type) + ";");
+        w_.line("if (!" + n + ") " + v + " = " + value + ";");
+      }
+      rows_.push_back({d.table, name, false, 0, false, "c", false, true});
+      auto was_loop = std::exchange(loop_, true);
+      auto outer = std::exchange(limit_, limit);
+      w_.open("do");
+      k();
+      w_.close(" while (0);");
+      limit_ = outer;
+      loop_ = was_loop;
+      rows_.pop_back();
+    });
+    w_.close();
+    limit_ = limit;
+  }
+
   // What a GroupEmit gives for no rows: no group with a key; with none, the
   // one group's row over no rows (COUNT 0, every other aggregate NULL)
   // where its HAVING holds of it and its LIMIT is not 0.
@@ -2800,6 +2885,7 @@ private:
   int hashes_{0};                // the hash joins printed: each into table h<i>, its row b<i>
   int nulls_{0};                 // the outer joins printed: each's null row nr<i>
   int groups_{0};                // the grouped aggregates printed: each into a<i>, its group g<i>
+  int derived_{0};               // the derived relations printed: each group's outputs in d<i>_v<j>, d<i>_n<j>
   const Group* group_{nullptr};  // the group in hand, for a grouped aggregate's consumer
   std::string cursor_{"c"};      // the cursor a scan opens
   // The columns a sort below the rows in hand tested for NULL before it added
@@ -2919,26 +3005,6 @@ private:
   }
 
   auto fresh(const std::string& what) -> std::string { return "set" + what + std::to_string(ids_++); }
-
-  static auto zero(PhysType t) -> std::string {
-    switch (t) {
-      case PhysType::I64: return "INT64_C(0)";
-      case PhysType::F64: return "0.0";
-      case PhysType::Bool: return "false";
-      case PhysType::Bytes: return "bc_empty(cx)";
-    }
-    return "INT64_C(0)";
-  }
-
-  static auto c_type(PhysType t) -> std::string {
-    switch (t) {
-      case PhysType::I64: return "int64_t";
-      case PhysType::F64: return "double";
-      case PhysType::Bool: return "bool";
-      case PhysType::Bytes: return "bc_view";
-    }
-    return "int64_t";
-  }
 
   static void emit(Writer& w, const Row& row) {
     w.line("bc_emit_begin(cx);");
@@ -3224,17 +3290,18 @@ auto set_root(const logical::Node& n) -> std::optional<SetRoot> {
 // The plans of a set operation's arms, each searched alone, as a tree. Their
 // constants and costs are added to `into`.
 auto set_tree(const logical::Node& n, const Catalog& cat, const RowCounts& counts, std::uint64_t memory_bytes,
-              const std::vector<PhysType>& param_types, physical::Plan& into) -> std::shared_ptr<const physical::SetPlan> {
+              const std::vector<PhysType>& param_types, const std::vector<std::uint32_t>& never_null,
+              physical::Plan& into) -> std::shared_ptr<const physical::SetPlan> {
   auto out = std::make_shared<physical::SetPlan>();
   if (const auto* s = std::get_if<logical::SetOp>(&n.op)) {
     out->kind = s->kind;
     out->all = s->all;
-    out->left = set_tree(*s->left, cat, counts, memory_bytes, param_types, into);
-    out->right = set_tree(*s->right, cat, counts, memory_bytes, param_types, into);
+    out->left = set_tree(*s->left, cat, counts, memory_bytes, param_types, never_null, into);
+    out->right = set_tree(*s->right, cat, counts, memory_bytes, param_types, never_null, into);
     for (const auto& o : s->outputs) out->types.push_back(o.expr.type);
     return out;
   }
-  auto arm = search(n, cat, counts, memory_bytes);
+  auto arm = search(n, cat, counts, memory_bytes, never_null);
   arm.param_types = param_types;
   for (const auto& c : arm.constants) {
     if (std::ranges::none_of(into.constants, [&](const auto& d) { return d.name == c.name; })) into.constants.push_back(c);
@@ -3248,16 +3315,29 @@ auto set_tree(const logical::Node& n, const Catalog& cat, const RowCounts& count
 // The cheapest plan of a rewritten statement or subquery: a SELECT's, or a
 // set operation's, whose arms are each searched alone.
 auto plan_for(const logical::Node& n, const Catalog& cat, const RowCounts& counts, std::uint64_t memory_bytes,
-              const std::vector<PhysType>& param_types) -> physical::Plan {
+              const std::vector<PhysType>& param_types, const std::vector<std::uint32_t>& never_null) -> physical::Plan {
   const auto set = set_root(n);
-  if (!set) return search(n, cat, counts, memory_bytes);
+  if (!set) return search(n, cat, counts, memory_bytes, never_null);
   physical::Plan p;
   p.catalog_version = cat.version();
-  p.set = set_tree(*set->node, cat, counts, memory_bytes, param_types, p);
+  p.set = set_tree(*set->node, cat, counts, memory_bytes, param_types, never_null, p);
   p.set_limit = set->limit;
   p.set_order = set->op->order;
   for (const auto& o : set->op->outputs) p.result.push_back({o.name, o.expr.type});
   return p;
+}
+
+// The statement's parameters whose value is never NULL: its constants
+// (bound::Bound::fixed, after its own parameters) that are not NULL. A
+// subquery's hidden parameter is NULL there until the subquery runs, and a
+// clock's is its reading, never NULL.
+auto never_null(const bound::Bound& b) -> std::vector<std::uint32_t> {
+  std::vector<std::uint32_t> out;
+  const auto first = b.param_types.size() - b.fixed.size();
+  for (std::size_t i = 0; i < b.fixed.size(); ++i) {
+    if (!std::holds_alternative<std::monostate>(b.fixed[i])) out.push_back(narrow<std::uint32_t>(first + i));
+  }
+  return out;
 }
 
 // Each subquery's cheapest plan, its parameters the statement's, given to
@@ -3267,7 +3347,7 @@ void attach_subqueries(physical::Plan& p, bound::Bound& b, const Catalog& cat, c
                        std::uint64_t memory_bytes) {
   for (auto& s : b.subqueries) {
     logical::rewrite(*s.plan);
-    auto sp = plan_for(*s.plan, cat, counts, memory_bytes, b.param_types);
+    auto sp = plan_for(*s.plan, cat, counts, memory_bytes, b.param_types, never_null(b));
     sp.param_types = b.param_types;
     for (const auto& c : sp.constants) {
       if (std::ranges::none_of(p.constants, [&](const auto& d) { return d.name == c.name; })) p.constants.push_back(c);
@@ -3430,7 +3510,7 @@ auto print_procedure_body(const proc::Body& body) -> std::string { return ProcPr
 
 auto generate_plan(bound::Bound b, const Catalog& cat, std::string_view sql, const RowCounts& counts,
                    std::uint64_t memory_bytes, std::string_view fn) -> GeneratedPlan {
-  auto p = plan_for(rewritten(b), cat, counts, memory_bytes, b.param_types);
+  auto p = plan_for(rewritten(b), cat, counts, memory_bytes, b.param_types, never_null(b));
   attach_subqueries(p, b, cat, counts, memory_bytes);
   return print_plan(p, b.param_types, sql, fn);
 }
@@ -3446,7 +3526,7 @@ auto generate_alternatives(bound::Bound b, const Catalog& cat, std::string_view 
   std::vector<GeneratedPlan> out;
   physical::Plan with_subs;  // the subqueries' plans, the same for every alternative
   attach_subqueries(with_subs, b, cat, counts, memory_bytes);
-  for (auto& p : search_all(rewritten(b), cat, counts, memory_bytes)) {
+  for (auto& p : search_all(rewritten(b), cat, counts, memory_bytes, never_null(b))) {
     p.subs = with_subs.subs;
     for (const auto& c : with_subs.constants) {
       if (std::ranges::none_of(p.constants, [&](const auto& d) { return d.name == c.name; })) p.constants.push_back(c);

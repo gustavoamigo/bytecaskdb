@@ -179,6 +179,17 @@ struct Get {
   bool for_update{false};
 };
 
+// The rows of a grouped view's query, read as a relation of its own
+// (docs/planner_design.md, *Derived relations*): `plan` is that query's
+// logical plan, an Aggregate under any HAVING Filter, and `table` the
+// binder's derived table (Table::derived), whose i-th column is the query's
+// i-th output. A leaf of the plan around it: nothing above reads into
+// `plan`, and the rewrites rewrite it alone.
+struct Derived {
+  NodePtr plan;
+  const Table* table{nullptr};
+};
+
 // No rows: what constant folding leaves of an input a conjunct that is
 // always false filters. It names the tables it replaced.
 struct Empty {
@@ -327,7 +338,8 @@ struct SetOp {
 };
 
 struct Node {
-  std::variant<Get, Empty, OneRow, Filter, Project, Join, Aggregate, Sort, Limit, SetOp, Insert, InsertFrom, Update, Delete> op;
+  std::variant<Get, Empty, OneRow, Filter, Project, Join, Aggregate, Sort, Limit, SetOp, Insert, InsertFrom, Update, Delete, Derived>
+      op;
   // The columns something above reads from this operator's rows: set by
   // projection pruning, empty before it.
   std::vector<ColumnRef> output;
@@ -353,8 +365,8 @@ struct Subquery {
   std::uint32_t param{0};
 };
 
-// The operator below n, or null for a leaf (Get, Empty, OneRow, Insert); a
-// Join has two.
+// The operator below n, or null for a leaf (Get, Empty, OneRow, Insert,
+// Derived); a Join has two.
 template <typename N>
   requires std::is_same_v<std::remove_const_t<N>, Node>
 [[nodiscard]] auto input_of(N& n) {

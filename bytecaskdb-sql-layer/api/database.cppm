@@ -1552,7 +1552,7 @@ auto Database::build(const Statement& s) -> std::shared_ptr<const Compiled> {
   c->param_sql = std::move(bound.param_sql);
   c->param_table = std::move(bound.param_table);
   c->params = std::move(bound.params);
-  c->fixed = std::move(bound.fixed);
+  c->fixed = bound.fixed;  // copied: the search reads which constants are not NULL
   c->clocks = std::move(bound.clocks);
   c->views = std::move(bound.views);
   c->key_columns = bound.key_columns;

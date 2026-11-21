@@ -74,6 +74,7 @@ compute, not how.
 | `Aggregate(input, group_by, aggs)` | `COUNT`, `COUNT(DISTINCT)`, `SUM`, `MIN`, `MAX`, `AVG`; no `group_by` means one row |
 | `Sort(input, keys)` | each key with its direction and its NULL placement |
 | `Limit(input, n)` | the first n rows |
+| `Derived(plan, table)` | the rows of a grouped view's query, one per group, as a relation (*Derived relations*) |
 | `Insert`, `InsertFrom`, `Update`, `Delete` | writes, over the rows their input gives |
 
 Each expression carries its SQL type, which the binder resolves. The
@@ -882,8 +883,89 @@ into its parameters and set (`plan_api_design.md`, *Subqueries*); then its
 computed values, NULL checks and pipeline run as without one.
 
 Not planned yet: a correlated subquery, one inside another, one in `FROM`
-(a derived table), and `IN (SELECT …)` as a semi-join that probes the outer
-table's key per value, which #659 tracks.
+(a derived table, but the grouped view of *Derived relations*), and `IN
+(SELECT …)` as a semi-join that probes the outer table's key per value,
+which #659 tracks.
+
+### Derived relations
+
+A query that aggregates over a grouped view reads the view's groups as
+rows of a relation of its own (`frontend_design.md`, *Views*): `SELECT
+SUM(c) FROM v`, `v` being `SELECT a, MIN(b) AS c FROM t GROUP BY a`. The
+binder gives it a table with no storage (`Table::derived`, an id from
+`kDerivedBase`), whose columns are the view query's outputs, and the
+logical plan reads it by `Derived(plan, table)`, a leaf whose `plan` is the
+view query's own, an `Aggregate` under any `HAVING`. To the plan around it
+the relation is a table: its `WHERE` is a `Filter` over the leaf, and its
+`GROUP BY`, aggregates and `HAVING` are an `Aggregate` above.
+
+- **Rewrites.** The view's query is rewritten alone, first; the leaf is
+  then a table to pushdown and pruning. An `Empty` the outer query folds to
+  names the tables the view's query reads, so the plan still depends on
+  them.
+- **The search.** An aggregated query over a derived relation takes the
+  grouped route (`group_select`), even for one `COUNT` or integer `SUM`. The
+  view's query is searched alone, by a search of its own over the same
+  catalog, counts, budget and `all` (`derived_rows`), through its
+  `group_select` too, so a view with no `GROUP BY` also gives its row by a
+  `GroupEmit` (never by one aggregate row or the keys' answer). Each plan of
+  it, every one when the search returns them all, becomes a
+  `physical::Derived` under the query's `WHERE`; above it the outer groups
+  are in a structure, or, with no `GROUP BY`, one group streamed, never a
+  stream by key: the relation's rows come in no order to group by. An
+  `ORDER BY` sorts the groups. The view's constants join the statement's,
+  and its NULL-checked parameters and `$n ± k` are the statement's: with a
+  `GROUP BY`, a NULL that matches no row gives no group, so no row of the
+  relation, which is what the statement gives when it ends before reading.
+  A view of one group of every row gives that group over no rows too, so
+  its plans that may end before reading (a point lookup, or a parameter
+  checked for NULL that may be NULL) are not taken, and none left is `no
+  plan` (#833). A constant that is not NULL (`Bound::fixed`, which
+  `search` takes as `never_null`) never ends a plan, so a filter or a
+  key's range on constants is taken; a NULL constant or a subquery's value
+  (NULL until the subquery runs) may. The
+  outer `WHERE` compares the relation's columns with parameters, constants
+  or each other, or is a predicate; `$n ± k` there is refused.
+- **The physical plan.** `Derived(input, table, columns)`: `input` is the
+  view query's plan, a `GroupEmit` whose i-th output is `columns[i]`. Its
+  choice points are the plan's, counted, checked and overridden as any
+  (`choices`, `override_thresholds`). `check` holds its columns to its
+  outputs, each of the output's physical type, never a `NUMERIC`, and keeps
+  it under a grouped aggregate alone: no `Emit`, one-row `Aggregate` or row
+  `Sort` reads it, and no structure of groups holds a row of it. A
+  structure keys its groups by a column of it held as `I64` or `BOOLEAN`
+  (0 or 1 in a slot), never one read from a held row; the binder refuses
+  the other types (#833).
+- **Codegen.** The view's plan is printed in place, in a block, and where
+  its `GroupEmit` would emit a group, each output is bound to a local,
+  `d<i>_v<j>` and `d<i>_n<j>` (its NULL), and the plan above runs on them
+  inside `do { … } while (0)`: a filter's miss is `continue`, which leaves
+  it for the next group wherever the view gives it (in its loop over its
+  groups, in its input's loop, or after it). A column read, a `NULL` test
+  and a sort key part of the relation read the locals. The statement's
+  `LIMIT` counts the outer groups, never the view's: `limit_` is cleared
+  around the view's plan. Nothing is held per row of the relation; the
+  outer structure of groups is charged to the budget as any.
+
+```c
+/* SELECT sum(c) FROM v */
+int64_t x0_0 = 0;  /* the outer group, streamed */
+bool xs0_0 = false;
+{
+  bc_agg a1 = bc_agg_open(cx, 2);
+  /* the view's loop, folding t's rows into a1 */
+  while (bc_agg_next(cx, a1, &gk1, 0)) {
+    bc_group g1 = bc_agg_group(cx, a1, gk1);
+    bool d0_n1 = bc_agg_null(cx, g1, 1);
+    int64_t d0_v1 = INT64_C(0);
+    if (!d0_n1) d0_v1 = bc_agg_i64(cx, g1, 1);
+    do {
+      if (!d0_n1) { x0_0 = bc_add(cx, x0_0, d0_v1); xs0_0 = true; }
+    } while (0);
+  }
+}
+/* the one group emitted */
+```
 
 ### Set operations
 
@@ -1447,7 +1529,10 @@ with uncompilable C:
   tables; an aggregate, `GROUP BY` or `ORDER BY` column that is not a
   column of them; an output or `ORDER BY` key not grouped; a
   `HAVING` conjunct that does not compare a grouped column or an aggregate
-  with a parameter.
+  with a parameter;
+- a derived relation of one group whose view query's every plan may end
+  before it reads, or whose `WHERE` compares a column with other than a
+  parameter, a constant or a column (*Derived relations*).
 
 A table no key reaches, an `ORDER BY` no index gives, an `ORDER BY` on a
 join, any NULL placement, a join no key reaches and an `ORDER BY` over a

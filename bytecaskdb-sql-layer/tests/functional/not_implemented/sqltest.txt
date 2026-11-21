@@ -136,8 +136,6 @@ f051_05_07_02  # not PostgreSQL: there is no cast from time to timestamp (42846,
 f051_07_01_01  # CURRENT_TIME is time with time zone: the layer has no WITH TIME ZONE types (#491)
 f051_07_01_02  # CURRENT_TIME is time with time zone: the layer has no WITH TIME ZONE types (#491)
 f131_02_01_01  # a join of a grouped view: needs a derived table (the view is not a plain table), and USING on a view
-f131_03_01_01  # an aggregate over a grouped view: needs a derived table
-f131_03_01_02  # an aggregate over a grouped view: needs a derived table
 f261_01_01_01  # not PostgreSQL: WHEN with a list of values; PostgreSQL 17 gives 42601, "syntax error at or near ",""
 f261_01_01_02  # not PostgreSQL: WHEN with a list of values; PostgreSQL 17 gives 42601, "syntax error at or near ",""
 f261_01_01_03  # not PostgreSQL: WHEN with a list of values; PostgreSQL 17 gives 42601, "syntax error at or near ",""

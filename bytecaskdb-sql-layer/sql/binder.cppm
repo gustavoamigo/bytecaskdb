@@ -2074,7 +2074,14 @@ public:
   [[nodiscard]] auto fixed_types() const -> const std::vector<PhysType>& { return fixed_types_; }
   [[nodiscard]] auto fixed_sql() const -> const std::vector<SqlType>& { return fixed_sql_; }
   [[nodiscard]] auto take_subqueries() -> std::vector<logical::Subquery> { return std::move(subqueries_); }
-  [[nodiscard]] auto take_instances() -> std::vector<std::unique_ptr<Table>> { return std::move(instances_); }
+  // The tables the plan names that the catalog does not hold: the instances
+  // and the derived relations.
+  [[nodiscard]] auto take_instances() -> std::vector<std::unique_ptr<Table>> {
+    auto out = std::move(instances_);
+    for (auto& d : derived_) out.push_back(std::move(d.table));
+    derived_.clear();
+    return out;
+  }
   void set_scope(std::vector<const Table*> tables) { scope_ = std::move(tables); }
 
   // A subquery's SELECT, bound as any is, then listed to run before the
@@ -2160,14 +2167,22 @@ public:
     if (q.set) return correlated(q.set->left) || correlated(q.set->right);
     std::vector<const Table*> own;
     for (const auto& item : q.from) {
+      if (item.derived) continue;  // its columns are its aliases
       if (const auto* t = cat_.table(item.table)) own.push_back(t);
     }
+    auto derived_has = [&](const std::string& column) {
+      return std::ranges::any_of(q.from, [&](const ast::FromItem& item) {
+        return item.derived != nullptr && std::ranges::contains(item.column_aliases, column);
+      });
+    };
     auto outer_names = [&](const ast::Expr& e) {
       if (!e.table.empty()) {
         if (std::ranges::any_of(q.from, [&](const ast::FromItem& item) { return e.table == item.name(); })) return false;
         return std::ranges::any_of(scope_, [&](const Table* t) { return t->name == e.table; });
       }
-      if (std::ranges::any_of(own, [&](const Table* t) { return t->column(e.column) != nullptr; })) return false;
+      if (std::ranges::any_of(own, [&](const Table* t) { return t->column(e.column) != nullptr; }) || derived_has(e.column)) {
+        return false;
+      }
       return std::ranges::any_of(scope_, [&](const Table* t) { return t->column(e.column) != nullptr; });
     };
     std::function<bool(const ast::Expr&)> in_expr = [&](const ast::Expr& e) {
@@ -3765,6 +3780,11 @@ public:
     std::vector<const Table*> rels;
     for (const auto& item : s.from) {
       const auto pos = s.from.size() == 1 ? s.pos : item.pos;
+      if (item.derived) {
+        if (s.from.size() > 1) not_yet("a join of a grouped view a query aggregates over", pos);
+        rels.push_back(derived_relation(item, pos));
+        continue;
+      }
       rels.push_back(instance(*table(item.table, pos), item.name(), rels));
       if (!item.column_aliases.empty()) rename_columns(*rels.back(), item, pos);
       // Two views of one table are merged into the query under one name.
@@ -3773,6 +3793,45 @@ public:
       }
     }
     return rels;
+  }
+
+  // A grouped view read as a relation (ast::FromItem::derived): its query
+  // bound as a SELECT of its own, the query around it out of its scope, as
+  // a subquery's is, and a table of the binder's made of its outputs, named
+  // as the view names its columns (docs/frontend_design.md, *Views*). A
+  // column's NULLs are its output's: a grouped column's as its table
+  // declares, COUNT never, any other aggregate's where its group has no
+  // value. The table has no primary key, so no column of it is dependent on
+  // a GROUP BY. An AVG of an integer or DECIMAL, PostgreSQL's numeric, is
+  // two plan columns and none a relation's: refused.
+  auto derived_relation(const ast::FromItem& item, std::int32_t pos) -> const Table* {
+    auto using_columns = std::move(using_);
+    auto using_alias = std::move(using_alias_);
+    auto scope = std::move(scope_);
+    auto root = select(*item.derived);
+    using_ = std::move(using_columns);
+    using_alias_ = std::move(using_alias);
+    scope_ = std::move(scope);
+    const auto& outs = outputs_of(*root);
+    if (outs.size() != item.column_aliases.size()) throw std::logic_error{"a derived relation's columns are not its query's"};
+    auto t = std::make_unique<Table>();
+    t->id = Table::kDerivedBase + bytecask::sql::narrow<std::uint32_t>(derived_.size());
+    if (!Table::derived(t->id)) not_yet("a statement of so many derived relations", pos);
+    t->name = item.table;
+    for (std::size_t i = 0; i < outs.size(); ++i) {
+      const auto& e = outs[i].expr;
+      if (e.type.kind == SqlKind::Numeric) {
+        not_yet("aggregating over a grouped view's AVG of an integer or numeric (PostgreSQL's numeric)", pos);
+      }
+      auto nullable = e.kind == logical::Expr::Kind::Column ? e.col.nullable
+                                                             : !(e.kind == logical::Expr::Kind::Aggregate && e.fn == logical::Expr::Fn::Count);
+      t->columns.push_back(Column{bytecask::sql::narrow<std::uint32_t>(i), item.column_aliases[i], e.type, e.phys(), nullable, std::monostate{}});
+    }
+    t->next_col_id = bytecask::sql::narrow<std::uint32_t>(t->columns.size());
+    const auto* first = cat_.table(item.derived->from.at(0).table);
+    auto source = first != nullptr ? first->id : 0;
+    derived_.push_back({std::move(t), std::move(root), source});
+    return derived_.back().table.get();
   }
 
   // t AS x (a, b): the instance's first columns carry the names the alias
@@ -3942,6 +4001,11 @@ public:
     std::vector<logical::Expr> group_by;
     for (const auto& e : distinct_groups ? list : s.group_by) {
       auto [t, c] = resolve(e);
+      // A derived relation's groups are keyed by values the plan holds in
+      // locals: integers and booleans (#833).
+      if (Table::derived(t->id) && c->type != PhysType::I64 && c->type != PhysType::Bool) {
+        not_yet("grouping a grouped view's rows by a " + pg_type_name(c->sql) + " column", e.pos);
+      }
       auto g = logical::column_of(t->id, *c);
       if (std::ranges::find(group_by, g) == group_by.end()) group_by.push_back(std::move(g));
     }
@@ -3951,7 +4015,8 @@ public:
     auto grouped = [&](const Table& t, const Column& c, std::int32_t pos) -> logical::Expr {
       auto g = logical::column_of(t.id, c);
       if (std::ranges::find(group_by, g) != group_by.end()) return g;
-      auto by_key = grouping && std::ranges::all_of(t.pk_col_ids, [&](std::uint32_t id) {
+      // A table with no primary key, a derived relation, determines nothing.
+      auto by_key = grouping && !t.pk_col_ids.empty() && std::ranges::all_of(t.pk_col_ids, [&](std::uint32_t id) {
         return std::ranges::find(group_by, logical::column_of(t.id, *t.column(id))) != group_by.end();
       });
       if (!by_key) ungrouped(t, c.name, pos);
@@ -4012,7 +4077,9 @@ public:
       if (auto key = order_key(o.expr, resolve)) keys.push_back({std::move(*key), o.desc, o.nulls_first.value_or(o.desc)});
     }
 
-    auto rows = logical::node(logical::Get{rels[0], !joined && s.for_update});
+    auto rows = Table::derived(rels[0]->id)
+                    ? logical::node(logical::Derived{std::move(derived_.at(rels[0]->id - Table::kDerivedBase).plan), rels[0]})
+                    : logical::node(logical::Get{rels[0], !joined && s.for_update});
     for (std::size_t k = 1; k < n; ++k) {
       rows = logical::node(logical::Join{std::move(rows), logical::node(logical::Get{rels[k], false}), std::move(on[k]), outer[k]});
     }
@@ -4525,6 +4592,11 @@ public:
     std::vector<std::uint32_t> out;
     for (const auto& p : params_) {
       // A refusal names the table the rows are in, not an instance of it.
+      // A derived relation's, the table its query reads first.
+      if (Table::derived(p.table)) {
+        out.push_back(derived_.at(p.table - Table::kDerivedBase).source);
+        continue;
+      }
       out.push_back(p.table >= Table::kInstanceBase ? instances_.at(p.table - Table::kInstanceBase)->source : p.table);
     }
     return out;
@@ -4588,6 +4660,15 @@ private:
   std::vector<std::string> using_;  // a join's USING or NATURAL columns: one column each
   std::string using_alias_;         // USING (…) AS alias
   std::vector<std::unique_ptr<Table>> instances_;  // see instance()
+  // The derived relations bound (derived_relation): each table, the plan
+  // of its query until select() takes it, and the table its first FROM item
+  // reads, which a refusal of a parameter compared with its column names.
+  struct DerivedRelation {
+    std::unique_ptr<Table> table;
+    logical::NodePtr plan;
+    std::uint32_t source{0};
+  };
+  std::vector<DerivedRelation> derived_;
   std::vector<ParamUse> params_;
   std::deque<Column> typed_params_;  // what a $n typed by its place (function_value) is used as; never moves
   std::vector<Datum> fixed_;  // the constants' values, $own_params_ + 1 onwards
@@ -5007,9 +5088,15 @@ private:
     return scratch.expand_stars(q, scratch.relations(q)).size();
   }
 
+  // A FROM item that names a view still to expand: not one already read
+  // as a derived relation.
+  [[nodiscard]] auto names_view(const ast::FromItem& item) const -> bool {
+    return item.derived == nullptr && cat_.view(item.table) != nullptr;
+  }
+
   [[nodiscard]] auto mentions(const ast::Select& s) const -> bool {
     if (s.set) return mentions(s.set->left) || mentions(s.set->right);
-    auto found = std::ranges::any_of(s.from, [&](const ast::FromItem& item) { return cat_.view(item.table) != nullptr; });
+    auto found = std::ranges::any_of(s.from, [&](const ast::FromItem& item) { return names_view(item); });
     each_subquery(s, [&](const std::shared_ptr<const ast::Select>& q) { found = found || mentions(*q); });
     return found;
   }
@@ -5069,7 +5156,7 @@ private:
       if (mentions(*q)) q = std::make_shared<const ast::Select>(expand(*q));
     };
     each_subquery(s, expand_slot);
-    auto views = std::ranges::count_if(s.from, [&](const ast::FromItem& item) { return cat_.view(item.table) != nullptr; });
+    auto views = std::ranges::count_if(s.from, [&](const ast::FromItem& item) { return names_view(item); });
     if (views == 0) return s;
     if (std::ranges::any_of(s.from, [](const ast::FromItem& item) { return !item.alias.empty(); })) {
       not_yet("a view in a query that names a table twice", s.from[0].pos);
@@ -5086,9 +5173,11 @@ private:
 
   // FROM view [WHERE …]: the view's FROM, and its WHERE and the query's
   // together; over a grouped view the query's WHERE is a HAVING, the groups
-  // it keeps. The query may not group or aggregate again, but where a group
-  // is a row of the view (regroup, below); nor may it read through a view
-  // that cuts rows (DISTINCT, LIMIT).
+  // it keeps. Where the query groups or aggregates again, it is merged only
+  // where a group is a row of the view (regroup, below) or its aggregates
+  // cannot tell a row from its base rows (rows_of_base); else it reads the
+  // view as a derived relation (derive). It may not read through a view that
+  // cuts rows (DISTINCT, LIMIT).
   void merge_one(ast::Select& s, const ViewBody& v) {
     const auto& view = v.select;
     const auto& name = s.from[0].table;
@@ -5097,8 +5186,12 @@ private:
     if (view.distinct || view.limit || view.offset != 0) not_yet("a view defined with DISTINCT, LIMIT or OFFSET", s.from[0].pos);
     if (view.for_update) not_yet("a view defined FOR UPDATE", s.from[0].pos);
     auto again = aggregated(s) || s.distinct;
+    // Decided on a copy, before the query is changed: a merge that cannot
+    // say it (a GROUP BY of a view column that is an expression, an
+    // aggregate of an aggregate) is a derived relation instead.
+    auto merged = ast::clone(s);
     std::vector<ast::Expr> targets;
-    for (auto& e : s.targets) {
+    for (auto& e : merged.targets) {
       if (e.kind != ast::Expr::Kind::Star) {
         targets.push_back(std::move(e));
         continue;
@@ -5109,7 +5202,7 @@ private:
       if (!e.alias.empty()) throw SqlError{"syntax error at or near \"AS\"", e.pos};
       for (const auto& column : v.names) targets.push_back(column_named(e, "", column));
     }
-    s.targets = std::move(targets);
+    merged.targets = std::move(targets);
     auto swap = [&](ast::Expr& ref) -> std::optional<ast::Expr> {
       if (!ref.table.empty() && ref.table != name) {
         throw SqlError{"missing FROM-clause entry for table \"" + ref.table + "\"", ref.pos, kUndefinedTable};
@@ -5118,14 +5211,23 @@ private:
       if (at == v.names.end()) throw SqlError{"column \"" + ref.column + "\" does not exist", ref.pos, kUndefinedColumn};
       return ast::clone(view.targets[static_cast<std::size_t>(at - v.names.begin())]);
     };
-    apply(s, swap);
-    if (grouped && again && rows_of_base(view) && duplicate_blind(s)) {
+    if (grouped && again && groups_by_expression(merged, v)) {
+      derive(s, v);
+      return;
+    }
+    apply(merged, swap);
+    if (grouped && again && rows_of_base(view) && duplicate_blind(merged)) {
       // The view's rows are base-row values: the query reads the base rows,
       // those its HAVING (over group columns, so a WHERE) keeps.
-      for (const auto& c : view.having) s.where.push_back(ast::clone(c));
+      for (const auto& c : view.having) merged.where.push_back(ast::clone(c));
     } else if (grouped && again) {
-      if (!regroup(s, view)) not_yet("grouping, aggregating or DISTINCT over a grouped view", s.pos);
-    } else if (grouped) {
+      if (!regroup(merged, view)) {
+        derive(s, v);
+        return;
+      }
+    }
+    s = std::move(merged);
+    if (grouped && !again) {
       s.having.clear();
       for (const auto& c : view.having) s.having.push_back(ast::clone(c));
       for (auto& c : s.where) s.having.push_back(std::move(c));
@@ -5140,6 +5242,35 @@ private:
     for (auto& c : s.where) where.push_back(std::move(c));
     s.where = std::move(where);
     if (s.order_by.empty() && !s.distinct) s.order_by = ast::clone(view.order_by);
+  }
+
+  // Whether the query groups by a column of the view that is an expression
+  // of its rows, an aggregate among them: no column of the base rows.
+  static auto groups_by_expression(const ast::Select& s, const ViewBody& v) -> bool {
+    return std::ranges::any_of(s.group_by, [&](const ast::Expr& g) {
+      if (g.kind != ast::Expr::Kind::Column) return false;
+      auto at = std::ranges::find(v.names, g.column);
+      return at != v.names.end() && v.select.targets[static_cast<std::size_t>(at - v.names.begin())].kind != ast::Expr::Kind::Column;
+    });
+  }
+
+  // The query reads the grouped view as a relation of its own, a derived
+  // table the binder makes from the view's query (Binder::derived_relation):
+  // its rows are the view's groups, which the query groups, filters and
+  // aggregates as a table's rows. The view's ORDER BY orders nothing the
+  // query sees. One level: a view that already reads one is refused.
+  void derive(ast::Select& s, const ViewBody& v) {
+    if (std::ranges::any_of(v.select.from, [](const ast::FromItem& item) { return item.derived != nullptr; })) {
+      not_yet("aggregating over a view that aggregates over a grouped view", s.pos);
+    }
+    auto inner = ast::clone(v.select);
+    inner.order_by.clear();
+    ast::FromItem item;
+    item.table = s.from[0].table;
+    item.pos = s.from[0].pos;
+    item.column_aliases = v.names;
+    item.derived = std::make_shared<const ast::Select>(std::move(inner));
+    s.from = {std::move(item)};
   }
 
   // A grouped view without aggregates, whose HAVING tests group columns alone,
@@ -5172,7 +5303,7 @@ private:
   // the view's group columns, no aggregate, only those columns read. A view
   // row is a group, so grouping the rows by what groups them again is the
   // view; the query's WHERE and HAVING are the view's HAVING. Any other
-  // waits for a derived table.
+  // reads the view as a derived relation (derive).
   static auto regroup(ast::Select& s, const ast::Select& view) -> bool {
     const auto& group = view.group_by;
     auto in_group = [&](const ast::Expr& e) { return is_group_column(e, group); };

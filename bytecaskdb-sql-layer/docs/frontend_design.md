@@ -650,17 +650,36 @@ EXISTS] name`:
   selects its columns, orders by its group columns, and its `WHERE` keeps
   groups: it becomes the view's `HAVING`. It may group again by exactly the
   view's group columns, selecting those alone: a view row is a group, so
-  that is the view. An aggregate, `DISTINCT` or a join over a grouped
-  view, or a `GROUP BY` of anything else, is refused (42601); it needs a
-  derived table. One case is not refused: a grouped view with no aggregate,
-  whose `HAVING` tests group columns alone, has the base rows' values, one row
-  per group. `MIN`, `MAX` and `COUNT(DISTINCT)` cannot tell a value once from
-  many, so a query whose aggregates are those reads the base rows (the view's
-  `HAVING` joining its `WHERE`), grouped by its own `GROUP BY` if any. `SUM`,
-  `COUNT`, `AVG`, an aggregate of a view's own aggregate and a `HAVING` of the
-  query stay refused. A derived table needs an `Aggregate` over another's
-  rows, which the plan API doesn't express: it reads tables. A view defined with `DISTINCT`, `LIMIT` or a set operation
-  is created and not read yet.
+  that is the view. A grouped view with no aggregate, whose `HAVING` tests
+  group columns alone, has the base rows' values, one row per group, so a
+  query whose aggregates are `MIN`, `MAX` and `COUNT(DISTINCT)`, which
+  cannot tell a value once from many, reads the base rows (the view's
+  `HAVING` joining its `WHERE`). Each of these is merged into the query.
+- **A grouped view as a derived relation.** Any other query that
+  aggregates, groups or selects `DISTINCT` over a grouped view (`SUM` or
+  `COUNT` of its rows, an aggregate of its aggregate, `GROUP BY` one of its
+  aggregates) reads it as PostgreSQL's subquery in `FROM` does: as rows of
+  its own, one per group. `ViewExpander::derive` leaves the view in the
+  query as a `FROM` item holding its query (`ast::FromItem::derived`, the
+  view's `ORDER BY` dropped), decided before the query is changed. The
+  binder binds that query as a SELECT of its own, the query around it out of
+  its scope, and makes a table of its outputs (`Binder::derived_relation`,
+  an id from `Table::kDerivedBase`, owned by the bound statement): each
+  column named as the view names it, typed as its output, NULL-able as the
+  output is (a grouped column as its table declares it, `COUNT` never, any
+  other aggregate always). It has no primary key, so a column the query
+  neither groups nor aggregates is 42803, as in PostgreSQL. The plan reads it
+  as `logical::Derived` (`planner_design.md`, *Derived relations*). Refused
+  (42601): a `GROUP BY` or `DISTINCT` of a column held other than as an
+  integer or a boolean (text, bytea, a float) (#833), a view column that is
+  an `AVG` of an integer or `DECIMAL` (PostgreSQL's `numeric`, two plan
+  columns), a join of such a view, and a view that itself reads one.
+  Refused (0A000) by the planner: a view of one group of every row (no
+  `GROUP BY`) whose every plan may end before it reads: a point lookup, or
+  a comparison with NULL or with a subquery's value (#833). Its `WHERE` on
+  other constants, a filter or a key's range, is read.
+- A view defined with `DISTINCT`, `LIMIT` or a set operation is created
+  and not read yet.
 - **Columns** are named as the select list names them, or by the column
   list, which may name fewer than there are columns. Two with one name are
   42701, more names than columns 42601.
@@ -814,7 +833,7 @@ usable yet.
 That includes:
 - `IS DISTINCT FROM`, and a predicate or a constant in `HAVING`; a
   `NULL` constant under `NOT`, and a string constant as a `WHERE` or `ON`;
-- correlated and nested subqueries and the others above, derived tables;
+- correlated and nested subqueries and the others above, a subquery in `FROM`, and a derived relation but a grouped view aggregated over;
 - `DISTINCT ON`, `DISTINCT` of a constant or over groups it does not select
   every key of, an aggregate of `DISTINCT` values of an expression (0A000),
   `GROUP BY` of an expression, and `HAVING` of anything but the
@@ -1369,9 +1388,12 @@ implemented (`functional_testing_design.md`).
 - **Views take `INSERT` only, and a query over a grouped view is limited.**
   PostgreSQL updates and deletes through a simple view (#678), checks the
   rows written with `WITH CHECK OPTION`, replaces a view with `CREATE OR
-  REPLACE VIEW`, and aggregates, joins and selects `DISTINCT` over any view,
-  which it runs as a subquery in `FROM`. Here a view's query is merged into
-  the statement, so these wait for updatable views and derived tables.
+  REPLACE VIEW`, and joins any view, or reads one with `DISTINCT`, `LIMIT`
+  or a set operation, as a subquery in `FROM`. Here a view's query is
+  merged into the statement, and only a grouped view that a query
+  aggregates over is read as a derived relation, grouped by integer and
+  boolean columns only (#833); the rest wait for updatable views and
+  derived tables in joins.
 
 ## Decisions
 
