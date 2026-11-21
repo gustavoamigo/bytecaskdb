@@ -97,7 +97,8 @@ kind the transformer doesn't take is refused with its position.
   qualified by the table's name. Each `ON` sees the tables up to its own
   (a later one is 42P01). It compares columns of two tables by any of `=`,
   `<`, `<=`, `>`, `>=` and `<>`, or is a predicate (`AND`, `OR`, `NOT`, `IS
-  NULL`) over columns of both; NULL is true of none. `USING` and `NATURAL`
+  NULL`) over columns of both, or a boolean constant (`ON TRUE` pairs every
+  row; `ON FALSE` none); NULL is true of none. `USING` and `NATURAL`
   (every column name both tables share) compare their columns by `=`, as
   `ON` would, and name each alone as one column, the left table's, equal to
   the right's in every pair, unless a third table has the name too (42702);
@@ -290,6 +291,21 @@ on any columns, and of predicates over them.
   a key takes each comparison it can. A predicate (`OR`, `NOT`, `IS NULL`)
   is a filter, checked on each row a plan reads, never a key's bound
   (`planner_design.md`, *The search*).
+- **A boolean constant:** `TRUE`, `FALSE` or `NULL` as a conjunct of a
+  `WHERE` or an `ON`, or inside its `AND`, `OR` and `NOT`
+  (`ast::Compare::Kind::Const`). The binder makes it a BOOLEAN constant,
+  `NULL` as `FALSE`, which no filter tells apart from unknown but where a
+  `NOT` is above it (refused there, 42601). Constant folding drops `TRUE`
+  and settles `AND`, `OR` and `NOT` of constants; a `FALSE` left at the top
+  empties its input, so an inner join `ON FALSE` and a `WHERE FALSE` read
+  nothing (`planner_design.md`, *Rewrites*). In a left join's `ON` it pairs
+  no row, so the search makes it a filter of the right table's rows and
+  every left row is NULL-extended. A numeric constant is PostgreSQL's 42804
+  (`argument of WHERE must be type boolean, not type integer`), naming as
+  PostgreSQL does the `AND`, `OR` or `NOT` it is an argument of, else the
+  clause (`JOIN/ON` for an `ON`), and its type: `integer` within int4,
+  `bigint` within int8, else `numeric`. A string is refused, where
+  PostgreSQL reads it as a boolean.
 - **`LIKE`** and **`ILIKE`**: `col [NOT] [I]LIKE pattern [ESCAPE e]`, of a
   TEXT or VARCHAR column and a parameter or constant pattern, typed TEXT as
   PostgreSQL types it; a predicate leaf, matched by `bc_like` or `bc_ilike`
@@ -319,7 +335,8 @@ on any columns, and of predicates over them.
   `id = (SELECT MAX(k) FROM u)` is a key lookup.
 - Not yet: a predicate comparing a REAL or DOUBLE column (`no plan:`, as
   any filter on one), `$n ± k` inside one, one of both tables' columns in a
-  join, in `HAVING`, `LIKE` of a BYTEA column, `IS DISTINCT FROM`; a subquery that reads a column of the
+  join, in `HAVING`, `LIKE` of a BYTEA column, `IS DISTINCT FROM`, `NULL`
+  under `NOT`, a string as a boolean, a constant in `HAVING`; a subquery that reads a column of the
   query around it (correlated), one inside another, in `FROM`, `FOR UPDATE`
   in one, one of `AVG`, assigned by `SET` or `VALUES`, beside an aggregate,
   or compared with other than a column.
@@ -604,7 +621,8 @@ usable yet.
 
 **Refused**, with a message and the node's position: everything not above.
 That includes:
-- `IS DISTINCT FROM`, and a predicate in `HAVING`;
+- `IS DISTINCT FROM`, and a predicate or a constant in `HAVING`; a
+  `NULL` constant under `NOT`, and a string constant as a `WHERE` or `ON`;
 - correlated and nested subqueries and the others above, derived tables;
 - `DISTINCT ON`, `DISTINCT` of a constant or over groups it does not select
   every key of, `GROUP BY` of an expression, and `HAVING` of anything but

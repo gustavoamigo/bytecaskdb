@@ -900,8 +900,6 @@
 
 - name: a join ON TRUE
   features: [F041-01]
-  # ON must compare a column
-  unimplemented: true
   setup:
     - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)
     - CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)
@@ -920,6 +918,47 @@
     - DROP TABLE a
     - DROP TABLE b
     - DROP TABLE c
+
+- name: a constant ON or WHERE, FALSE or NULL
+  features: [F041-01, F041-03]
+  setup:
+    - CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)
+    - CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)
+    - INSERT INTO a VALUES (1, 1)
+    - INSERT INTO a VALUES (2, 2)
+    - INSERT INTO a VALUES (3, NULL)
+    - INSERT INTO b VALUES (1, 1)
+    - INSERT INTO b VALUES (2, 3)
+  steps:
+    - sql: SELECT a.id, b.id FROM a JOIN b ON FALSE
+      expected: []
+    - sql: SELECT a.id, b.id FROM a LEFT JOIN b ON FALSE ORDER BY a.id
+      expected: [[1, null], [2, null], [3, null]]
+    - sql: SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k AND NULL ORDER BY a.id
+      expected: [[1, null], [2, null], [3, null]]
+    - sql: SELECT a.id FROM a WHERE TRUE ORDER BY a.id
+      expected: [[1], [2], [3]]
+    - sql: SELECT count(*) FROM a WHERE FALSE
+      expected: [[0]]
+    - sql: SELECT a.id FROM a WHERE NULL
+      expected: []
+    - sql: SELECT min(a.k), max(a.id), count(*) FROM a WHERE FALSE
+      expected: [[null, null, 0]]
+    - sql: SELECT a.k, count(*) FROM a WHERE FALSE GROUP BY a.k
+      expected: []
+    - sql: SELECT DISTINCT a.k FROM a WHERE NULL
+      expected: []
+    - sql: SELECT a.k, max(b.id) FROM a JOIN b ON FALSE GROUP BY a.k
+      expected: []
+    - sql: SELECT min(b.k) FROM a JOIN b ON FALSE
+      expected: [[null]]
+    - sql: SELECT a.id FROM a JOIN b ON 1
+      error: "42804"
+    - sql: SELECT a.id FROM a WHERE a.id = 1 AND 1
+      error: "42804"
+  teardown:
+    - DROP TABLE a
+    - DROP TABLE b
 
 - name: a table name its alias hides, in a join of three tables FOR UPDATE
   features: [F041-01]

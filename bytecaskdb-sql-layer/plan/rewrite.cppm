@@ -4,9 +4,10 @@
 // rewrite.cppm — the fixed rewrites (docs/planner_design.md, *Rewrites*):
 // each turns a logical plan into an equivalent one, the same plan every
 // time, and none needs a cost. Applied in order, each to a fixpoint:
-//   1. constant folding: an expression of constants becomes a constant; a
-//      conjunct always true is dropped, and one always false makes its input
-//      Empty, as does an empty side of a Join;
+//   1. constant folding: an expression of constants becomes a constant (an
+//      AND, OR or NOT of TRUE and FALSE too); a conjunct always true is
+//      dropped, and one always false makes its input Empty, as does an empty
+//      side of a Join, but for a left outer join's ON, which the search plans;
 //   2. predicate pushdown: a conjunct moves to the lowest operator whose
 //      columns it reads, a Filter on one Get or a Join's predicate; two
 //      Filters in a row become one, so a Get has at most one;
@@ -120,6 +121,26 @@ auto comparable(const Expr& a, const Expr& b) -> std::optional<std::pair<std::in
 auto fold(Expr& e) -> bool {
   auto changed = false;
   for (auto& a : e.args) changed = fold(a) || changed;
+  if (e.kind == Kind::Not && (is_bool(e.args[0], true) || is_bool(e.args[0], false))) {
+    e = constant(is_bool(e.args[0], true) ? 0 : 1, SqlType{SqlKind::Boolean});
+    return true;
+  }
+  if (e.kind == Kind::And || e.kind == Kind::Or) {
+    // TRUE decides an OR and FALSE an AND; the other drops out.
+    auto decides = e.kind == Kind::Or;
+    if (std::ranges::any_of(e.args, [&](const Expr& a) { return is_bool(a, decides); })) {
+      e = constant(decides ? 1 : 0, SqlType{SqlKind::Boolean});
+      return true;
+    }
+    if (std::erase_if(e.args, [&](const Expr& a) { return is_bool(a, !decides); }) == 0) return changed;
+    if (e.args.empty()) {
+      e = constant(decides ? 0 : 1, SqlType{SqlKind::Boolean});
+    } else if (e.args.size() == 1) {
+      auto one = std::move(e.args[0]);
+      e = std::move(one);
+    }
+    return true;
+  }
   if (e.args.size() != 2 || !is_const(e.args[0]) || !is_const(e.args[1])) return changed;
   switch (e.kind) {
     case Kind::Add:
