@@ -390,6 +390,9 @@ struct Insert {
   std::vector<Expr> checks;  // logical::Insert's, evaluated over each row as written
   std::vector<Expr> returning;  // RETURNING's: one result row per row written, over the row as written
   std::optional<std::uint32_t> arbiter;  // logical::Insert's: its count is then the rows written
+  // ON CONFLICT DO UPDATE's: a SET list per row, as Update's `set`, over the
+  // row that holds the key; its count is then the rows inserted or updated.
+  std::vector<std::vector<std::pair<ColumnRef, Expr>>> update;
 };
 
 // INSERT … SELECT: each row its input, an Emit, gives, written as a row of
@@ -718,6 +721,21 @@ private:
     if (a.distinct && a.args[0].kind != Expr::Kind::Column) broken("an aggregate of DISTINCT values of other than a column");
     value(a.args[0]);
     params(a.args[0]);
+  }
+
+  // An UPDATE's SET list, or ON CONFLICT DO UPDATE's: a column from a
+  // parameter, a column of its type, or an integer column ± a parameter or
+  // a constant.
+  void set_list(const std::vector<std::pair<ColumnRef, Expr>>& set) const {
+    if (set.empty()) broken("an update that sets no column");
+    for (const auto& [col, e] : set) {
+      params(e);
+      if (e.kind == Expr::Kind::Column && e.col.type != col.type) broken("a column set from a column of another type");
+      if ((e.kind == Expr::Kind::Add || e.kind == Expr::Kind::Sub) &&
+          (e.args[0].kind != Expr::Kind::Column || e.args[0].col.type != PhysType::I64 || col.type != PhysType::I64)) {
+        broken("column + or - parameter on a type other than an integer");
+      }
+    }
   }
 
   // RETURNING's expressions: values over columns of the table written, the
@@ -1549,6 +1567,11 @@ private:
             }
             for (const auto& c : op.checks) params(c);
             returned(op.table, op.returning);
+            if (!op.update.empty()) {
+              if (!op.arbiter) broken("an insert's update with no arbiter");
+              if (op.update.size() != op.rows.size()) broken("an insert's update lists not one per row");
+              for (const auto& set : op.update) set_list(set);
+            }
           } else if constexpr (std::is_same_v<T, InsertFrom>) {
             if (parent != nullptr) broken("an insert of a query's rows under another operator");
             const auto* e = std::get_if<Emit>(&op.input->op);
@@ -1582,16 +1605,8 @@ private:
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Update>) {
             returned(op.table, op.returning);
-            if (op.set.empty()) broken("an update that sets no column");
             for (const auto& c : op.checks) params(c);
-            for (const auto& [col, e] : op.set) {
-              params(e);
-              if (e.kind == Expr::Kind::Column && e.col.type != col.type) broken("a column set from a column of another type");
-              if ((e.kind == Expr::Kind::Add || e.kind == Expr::Kind::Sub) &&
-                  (e.args[0].kind != Expr::Kind::Column || e.args[0].col.type != PhysType::I64 || col.type != PhysType::I64)) {
-                broken("column + or - parameter on a type other than an integer");
-              }
-            }
+            set_list(op.set);
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Delete>) {
             returned(op.table, op.returning);

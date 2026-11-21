@@ -822,7 +822,7 @@ private:
           using T = std::decay_t<decltype(op)>;
           if constexpr (std::is_same_v<T, logical::Insert>) {
             constants(*op.table);
-            physical::Insert ins{op.table->id, {}, op.checks, returned(op.returning), op.arbiter};
+            physical::Insert ins{op.table->id, {}, op.checks, returned(op.returning), op.arbiter, op.update};
             for (const auto& values : op.rows) {
               auto& row = ins.rows.emplace_back();
               for (std::size_t i = 0; i < op.table->columns.size(); ++i) {

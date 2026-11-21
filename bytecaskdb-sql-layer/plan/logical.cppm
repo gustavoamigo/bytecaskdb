@@ -277,9 +277,12 @@ struct Limit {
 // a BOOLEAN over the table's columns and constants: the row is refused
 // (23514) where one is false, and accepted where it is true or NULL.
 //
-// `arbiter` is ON CONFLICT DO NOTHING's: a row whose key under it is taken
-// is skipped (bc_insert_on_conflict). The table's id (its primary key), a
-// unique index's, or kAnyArbiter.
+// `arbiter` is ON CONFLICT's: the table's id (its primary key), a unique
+// index's, or kAnyArbiter. With DO NOTHING a row whose key under it is
+// taken is skipped (bc_insert_on_conflict). With DO UPDATE, `update` holds
+// a SET list per row of `rows`, as Update's `set`, over the row that holds
+// the key, which is updated in the proposed row's place
+// (bc_insert_or_existing); EXCLUDED.col is that row's value for col.
 inline constexpr std::uint32_t kAnyArbiter = 0xFFFFFFFF;  // BC_ARBITER_ANY
 
 struct Insert {
@@ -288,6 +291,7 @@ struct Insert {
   std::vector<Expr> checks;
   std::vector<Output> returning;  // RETURNING's: a row of these per row written, over the row as written
   std::optional<std::uint32_t> arbiter;
+  std::vector<std::vector<std::pair<ColumnRef, Expr>>> update;  // empty but for DO UPDATE
 };
 
 // INSERT … SELECT: each row the input gives, a SELECT's rows (a Project

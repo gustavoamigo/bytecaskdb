@@ -939,6 +939,15 @@ TEST_CASE("parser: ON CONFLICT DO NOTHING keeps its target's columns; the other 
   REQUIRE(cols.on_conflict);
   CHECK(cols.on_conflict->columns == std::vector<std::string>{"b", "a"});
   CHECK_FALSE(std::get<Insert>(parse("INSERT INTO t VALUES ($1)")).on_conflict);
+  CHECK_FALSE(any.on_conflict->update);
+  // DO UPDATE keeps its SET list, in order.
+  auto upd = std::get<Insert>(parse("INSERT INTO t VALUES ($1, $2) ON CONFLICT (a) DO UPDATE SET b = excluded.b, c = t.c + 1"));
+  REQUIRE(upd.on_conflict);
+  REQUIRE(upd.on_conflict->update);
+  REQUIRE(upd.on_conflict->update->size() == 2);
+  CHECK((*upd.on_conflict->update)[0].column == "b");
+  CHECK((*upd.on_conflict->update)[0].value.table == "excluded");
+  CHECK((*upd.on_conflict->update)[1].column == "c");
   auto state = [](std::string_view s) -> std::string {
     try {
       (void)parse(s);
@@ -947,7 +956,8 @@ TEST_CASE("parser: ON CONFLICT DO NOTHING keeps its target's columns; the other 
     }
     return "accepted";
   };
-  CHECK(state("INSERT INTO t VALUES (1) ON CONFLICT (a) DO UPDATE SET b = 1") == "0A000");
+  CHECK(state("INSERT INTO t VALUES (1) ON CONFLICT (a) DO UPDATE SET b = 1 WHERE t.b > 0") == "0A000");
+  CHECK(state("INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET b = 1") == "42601");
   CHECK(state("INSERT INTO t VALUES (1) ON CONFLICT ON CONSTRAINT t_pkey DO NOTHING") == "0A000");
   CHECK(state("INSERT INTO t VALUES (1) ON CONFLICT (a) WHERE a > 0 DO NOTHING") == "0A000");
   CHECK(state("INSERT INTO t VALUES (1) ON CONFLICT ((a + 1)) DO NOTHING") == "0A000");

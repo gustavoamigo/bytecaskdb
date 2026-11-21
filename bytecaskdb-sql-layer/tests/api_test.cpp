@@ -4610,6 +4610,82 @@ TEST_CASE("embedded API: a LEFT JOIN sorted by its right side, its lookup by key
             .rows == Grid{{i(7), i(2)}, {kNull, i(1)}});
 }
 
+TEST_CASE("embedded API: INSERT … ON CONFLICT DO UPDATE updates the row that holds the key", "[sql][api]") {
+  sql_test::TempDir dir{"api_on_conflict_update"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE ou (id INTEGER PRIMARY KEY, v INTEGER, u TEXT UNIQUE, w BIGINT DEFAULT 7, CHECK (v < 100))");
+  (void)db->execute("INSERT INTO ou VALUES (1, 10, 'a'), (2, 20, 'b')");
+  auto state = [&](const std::string& sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  auto all = [&] { return db->execute("SELECT id, v, u, w FROM ou ORDER BY id").rows; };
+  auto t = [](const char* s) -> Value { return bytes(s); };
+  constexpr auto kUpsert = "INSERT INTO ou VALUES ($1, $2, $3) ON CONFLICT (id) DO UPDATE SET v = excluded.v";
+  // A taken key updates its row from EXCLUDED; a free one inserts. Both count.
+  CHECK(db->execute(kUpsert, {i(1), i(11), t("x")}).affected == 1);
+  CHECK(db->execute(kUpsert, {i(3), i(30), t("c")}).affected == 1);
+  CHECK(all() == Grid{{i(1), i(11), t("a"), i(7)}, {i(2), i(20), t("b"), i(7)}, {i(3), i(30), t("c"), i(7)}});
+  // RETURNING gives the row as updated, and as inserted; the holder's columns, qualified, and constants.
+  auto r = db->execute(
+      "INSERT INTO ou VALUES (2, 0, 'q'), (4, 40, 'd') ON CONFLICT (id) DO UPDATE SET v = ou.v + 1, w = 8 RETURNING id, v, w");
+  CHECK(r.affected == 2);
+  CHECK(r.rows == Grid{{i(2), i(21), i(8)}, {i(4), i(40), i(7)}});
+  // A unique index as the arbiter; EXCLUDED of a column the row leaves out is its default.
+  CHECK(db->execute("INSERT INTO ou (id, v, u) VALUES (9, 1, 'a') ON CONFLICT (u) DO UPDATE SET w = excluded.w, v = excluded.id")
+            .affected == 1);
+  CHECK(db->execute("SELECT v, w FROM ou WHERE id = 1").rows == Grid{{i(9), i(7)}});
+  // A row the statement inserted or updated, hit again: 21000, and nothing is written.
+  CHECK(state("INSERT INTO ou VALUES (5, 1, 'e'), (5, 2, 'f') ON CONFLICT (id) DO UPDATE SET v = excluded.v") == "21000");
+  CHECK(state("INSERT INTO ou VALUES (1, 1, 'e'), (1, 2, 'f') ON CONFLICT (id) DO UPDATE SET v = excluded.v") == "21000");
+  CHECK(state("INSERT INTO ou VALUES (6, 1, 'a'), (7, 2, 'a') ON CONFLICT (u) DO UPDATE SET v = excluded.v") == "21000");
+  // PostgreSQL's hint goes with it.
+  try {
+    (void)db->execute("INSERT INTO ou VALUES (5, 1, 'e'), (5, 2, 'f') ON CONFLICT (id) DO UPDATE SET v = excluded.v");
+    FAIL("no 21000");
+  } catch (const std::exception& e) {
+    CHECK(error_hint(e) ==
+          "Ensure that no rows proposed for insertion within the same command have duplicate constrained values.");
+  }
+  // CHECK on the updated row (23514), and a SET that moves the key onto another row's (23505).
+  CHECK(state("INSERT INTO ou VALUES (1, 1, 'x') ON CONFLICT (id) DO UPDATE SET v = 200") == "23514");
+  CHECK(state("INSERT INTO ou VALUES (1, 1, 'x') ON CONFLICT (id) DO UPDATE SET v = excluded.v + 0") == "42601");
+  CHECK(state("INSERT INTO ou VALUES (1, 1, 'x') ON CONFLICT (id) DO UPDATE SET id = 2") == "23505");
+  CHECK(all() == Grid{{i(1), i(9), t("a"), i(7)}, {i(2), i(21), t("b"), i(8)}, {i(3), i(30), t("c"), i(7)}, {i(4), i(40), t("d"), i(7)}});
+  // The key a SET vacated is free: the statement's later row with it is inserted.
+  r = db->execute("INSERT INTO ou VALUES (1, 50, 'y'), (1, 51, 'z') ON CONFLICT (id) DO UPDATE SET id = 10 RETURNING id, v");
+  CHECK(r.rows == Grid{{i(10), i(9)}, {i(1), i(51)}});
+  // A unique prefix a SET took from its row is free too, in autocommit and in a transaction; one
+  // the updated row kept is a second hit.
+  r = db->execute("INSERT INTO ou VALUES (11, 0, 'a'), (12, 1, 'a') ON CONFLICT (u) DO UPDATE SET u = 'aa' RETURNING id, u");
+  CHECK(r.rows == Grid{{i(10), t("aa")}, {i(12), t("a")}});
+  {
+    auto tx = db->begin();
+    r = tx.execute("INSERT INTO ou VALUES (13, 0, 'b'), (14, 1, 'b') ON CONFLICT (u) DO UPDATE SET u = 'bb' RETURNING id, u");
+    CHECK(r.rows == Grid{{i(2), t("bb")}, {i(14), t("b")}});
+    CHECK(tx.commit() == CommitOutcome::Committed);
+  }
+  CHECK(state("INSERT INTO ou VALUES (15, 0, 'c'), (16, 1, 'c') ON CONFLICT (u) DO UPDATE SET v = 0") == "21000");
+  CHECK(state("INSERT INTO ou VALUES (15, 0, 'c'), (16, 1, 'c') ON CONFLICT (u) DO UPDATE SET id = 17") == "21000");
+  // Binding: unqualified is ambiguous, an unknown column, a type PostgreSQL does not assign, no target.
+  CHECK(state("INSERT INTO ou VALUES (1, 1, 'x') ON CONFLICT (id) DO UPDATE SET v = v") == "42702");
+  CHECK(state("INSERT INTO ou VALUES (1, 1, 'x') ON CONFLICT (id) DO UPDATE SET v = excluded.zz") == "42703");
+  CHECK(state("INSERT INTO ou VALUES (1, 1, 'x') ON CONFLICT (id) DO UPDATE SET zz = 1") == "42703");
+  CHECK(state("INSERT INTO ou VALUES (1, 1, 'x') ON CONFLICT (id) DO UPDATE SET v = excluded.u") == "42804");
+  CHECK(state("INSERT INTO ou VALUES (1, 1, 'x') ON CONFLICT (id) DO UPDATE SET v = 1, v = 2") == "42601");
+  CHECK(state("INSERT INTO ou VALUES (1, 1, 'x') ON CONFLICT (id) DO UPDATE SET v = zz.v") == "42P01");
+  CHECK(state("INSERT INTO ou VALUES (1, 1, 'x') ON CONFLICT DO UPDATE SET v = 1") == "42601");
+  CHECK(state("INSERT INTO ou SELECT id, v, u FROM ou ON CONFLICT (id) DO UPDATE SET v = 1") == "42601");
+  // Integers assign across their types, the value checked against the column's.
+  CHECK(db->execute("INSERT INTO ou VALUES (1, 1, 'x', 5) ON CONFLICT (id) DO UPDATE SET v = excluded.w").affected == 1);
+  CHECK(state("INSERT INTO ou VALUES (1, 1, 'x', 5000000000) ON CONFLICT (id) DO UPDATE SET v = excluded.w") == "22003");
+  CHECK(db->execute("SELECT v FROM ou WHERE id = 1").rows == Grid{{i(5)}});
+}
+
 TEST_CASE("embedded API: INSERT … ON CONFLICT DO NOTHING skips a row whose arbiter key is taken", "[sql][api]") {
   sql_test::TempDir dir{"api_on_conflict"};
   auto db = Database::open(dir.path());
@@ -4657,7 +4733,7 @@ TEST_CASE("embedded API: INSERT … ON CONFLICT DO NOTHING skips a row whose arb
   CHECK(state("INSERT INTO oc VALUES (1, 10, 1) ON CONFLICT ON CONSTRAINT oc_pkey DO NOTHING") == "0A000");
   CHECK(state("INSERT INTO oc VALUES (1, 10, 1) ON CONFLICT (id) WHERE id > 0 DO NOTHING") == "0A000");
   CHECK(state("INSERT INTO oc VALUES (1, 10, 1) ON CONFLICT ((id + 1)) DO NOTHING") == "0A000");
-  CHECK(state("INSERT INTO oc VALUES (1, 10, 1) ON CONFLICT (id) DO UPDATE SET v = 1") == "0A000");
+  CHECK(state("INSERT INTO oc VALUES (1, 10, 1) ON CONFLICT (id) DO UPDATE SET v = 1 WHERE oc.v > 0") == "0A000");
   (void)db->execute("CREATE VIEW ocv AS SELECT id, v, w FROM oc");
   CHECK(state("INSERT INTO ocv VALUES (1, 10, 1) ON CONFLICT DO NOTHING") == "0A000");
   (void)db->execute("CREATE PROCEDURE ocp() LANGUAGE plpgsql AS $$ BEGIN INSERT INTO oc VALUES (1, 10, 1) ON CONFLICT DO "

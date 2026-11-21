@@ -1057,15 +1057,27 @@ auto returning_list(PgQuery__Node** list, std::size_t n) -> std::vector<Expr> {
   return out;
 }
 
-// ON CONFLICT DO NOTHING, with no target or a list of columns: DO UPDATE,
-// ON CONSTRAINT, an inference WHERE and an expression, collation or
-// operator class in the target are refused (0A000); ASC/DESC or NULLS
-// FIRST/LAST on a target column is 42P10, as in PostgreSQL.
+// ON CONFLICT DO NOTHING, with no target or a list of columns, or DO
+// UPDATE SET with a list of columns: ON CONSTRAINT, an inference WHERE, DO
+// UPDATE's WHERE and an expression, collation or operator class in the
+// target are refused (0A000); ASC/DESC or NULLS FIRST/LAST on a target
+// column is 42P10, and DO UPDATE with no target 42601, as in PostgreSQL.
 auto on_conflict(const PgQuery__OnConflictClause* c) -> Insert::OnConflict {
+  Insert::OnConflict out{{}, c->location, {}};
   if (c->action == PG_QUERY__ON_CONFLICT_ACTION__ONCONFLICT_UPDATE) {
-    reject("ON CONFLICT DO UPDATE is not supported yet", c->location, kFeatureNotSupported);
+    if (c->infer == nullptr) {
+      throw SqlError{"ON CONFLICT DO UPDATE requires inference specification or constraint name", c->location}.with_notes(
+          "", "For example, ON CONFLICT (column_name).");
+    }
+    if (c->where_clause != nullptr) reject("ON CONFLICT DO UPDATE … WHERE is not supported yet", c->location, kFeatureNotSupported);
+    std::vector<Assignment> set;
+    for (std::size_t i = 0; i < c->n_target_list; ++i) {
+      const auto* rt = c->target_list[i]->res_target;
+      if (rt->n_indirection != 0) reject("subscripted assignment is not supported", rt->location);
+      set.push_back(Assignment{rt->name, expr(rt->val), rt->location});
+    }
+    out.update = std::make_shared<const std::vector<Assignment>>(std::move(set));
   }
-  Insert::OnConflict out{{}, c->location};
   const auto* infer = c->infer;
   if (infer == nullptr) return out;
   if (!empty(infer->conname)) reject("ON CONFLICT ON CONSTRAINT is not supported yet", infer->location, kFeatureNotSupported);

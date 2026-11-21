@@ -1140,6 +1140,125 @@ TEST_CASE("plan writes: every unique key over the arbiter's columns is an arbite
   check_indexes_exact(f);
 }
 
+namespace {
+
+// INSERT INTO w VALUES ($1, $2, $3, $4) ON CONFLICT (g_arbiter's) DO UPDATE
+// SET c = w.c + 1, as codegen writes it; `times` proposes the row that often.
+void upsert_w_n(bc_ctx* cx, int times) {
+  ++g_runs;
+  int64_t n = 0;
+  for (int i = 0; i < times; ++i) {
+    bc_row r = bc_row_begin(cx, kW);
+    bc_row_set_param(cx, r, kId, 0);
+    bc_row_set_param(cx, r, kA, 1);
+    bc_row_set_param(cx, r, kB, 2);
+    bc_row_set_param(cx, r, kC, 3);
+    bc_view old = bc_empty(cx);
+    if (!bc_insert_or_existing(cx, kW, bc_row_end(cx, r), g_arbiter, &old)) {
+      bc_row u = bc_row_from(cx, kW, old);
+      bc_row_set_i64(cx, u, kC, bc_add(cx, bc_col_i64(cx, old, kC), 1));
+      bc_update(cx, kW, old, bc_row_end(cx, u));
+    }
+    ++n;
+  }
+  bc_emit_count(cx, n);
+}
+void upsert_w(bc_ctx* cx) { upsert_w_n(cx, 1); }
+void upsert_w_twice(bc_ctx* cx) { upsert_w_n(cx, 2); }
+
+// The c of row $1 of w, as the count.
+void c_of_w(bc_ctx* cx) {
+  bool found = false;
+  bc_view row = bc_get(cx, bc_key_params(cx, kW, 0, 1), &found);
+  bc_emit_count(cx, found ? bc_col_i64(cx, row, kC) : -1);
+}
+
+auto c_of(Fixture& f, std::int64_t id) -> std::int64_t {
+  REQUIRE(run(f, c_of_w, {id}) == BC_COMMITTED);
+  return bc_ctx_affected(f.cx);
+}
+
+}  // namespace
+
+TEST_CASE("plan writes: bc_insert_or_existing inserts a free row and gives the row that holds a taken key",
+          "[sql][algebra][writes]") {
+  Fixture f;
+  create_w(f);
+  g_arbiter = kW;
+  REQUIRE(run(f, upsert_w, {std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{0}}) == BC_COMMITTED);
+  CHECK(c_of(f, 1) == 0);
+  // The primary key taken: the row there is updated.
+  REQUIRE(run(f, upsert_w, {std::int64_t{1}, std::int64_t{5}, bytes("q"), std::int64_t{7}}) == BC_COMMITTED);
+  CHECK(bc_ctx_affected(f.cx) == 1);
+  CHECK(c_of(f, 1) == 1);
+  // A unique index's key taken under another primary key: its holder, row 1, is updated.
+  g_arbiter = kWB;
+  REQUIRE(run(f, upsert_w, {std::int64_t{9}, std::int64_t{9}, bytes("x"), std::int64_t{0}}) == BC_COMMITTED);
+  CHECK(c_of(f, 1) == 2);
+  CHECK(c_of(f, 9) == -1);
+  g_arbiter = BC_ARBITER_ANY;
+  REQUIRE(run(f, upsert_w, {std::int64_t{9}, std::int64_t{9}, bytes("x"), std::int64_t{0}}) == BC_COMMITTED);
+  CHECK(c_of(f, 1) == 3);
+  // A free key under every arbiter is inserted; another unique key's duplicate is still 23505.
+  REQUIRE(run(f, upsert_w, {std::int64_t{2}, std::int64_t{2}, bytes("y"), std::int64_t{0}}) == BC_COMMITTED);
+  CHECK(c_of(f, 2) == 0);
+  g_arbiter = kW;
+  CHECK(run(f, upsert_w, {std::int64_t{3}, std::int64_t{3}, bytes("y"), std::int64_t{0}}) == BC_FAILED);
+  CHECK(bc_error_detail(f.cx) == unique_on(kWB));
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 2);
+  check_indexes_exact(f);
+}
+
+TEST_CASE("plan writes: bc_insert_or_existing refuses a row the execution wrote with BC_E_CARDINALITY",
+          "[sql][algebra][writes]") {
+  Fixture f;
+  create_w(f);
+  for (auto arbiter : {kW, kWB, BC_ARBITER_ANY}) {
+    g_arbiter = arbiter;
+    // Inserted, then hit: 21000, and nothing is written.
+    CHECK(run(f, upsert_w_twice, {std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{0}}) == BC_FAILED);
+    CHECK(bc_error(f.cx) == BC_E_CARDINALITY);
+    CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 0);
+  }
+  // Updated, then hit.
+  REQUIRE(run(f, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{0}}) == BC_COMMITTED);
+  for (auto arbiter : {kW, kWB}) {
+    g_arbiter = arbiter;
+    CHECK(run(f, upsert_w_twice, {std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{0}}) == BC_FAILED);
+    CHECK(bc_error(f.cx) == BC_E_CARDINALITY);
+  }
+  CHECK(c_of(f, 1) == 0);
+  check_indexes_exact(f);
+}
+
+TEST_CASE("plan writes: a holder a concurrent commit changes is a conflict, and the retry updates the row as committed",
+          "[sql][algebra][writes]") {
+  Fixture f;
+  create_w(f);
+  REQUIRE(run(f, insert_w, {std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{0}}) == BC_COMMITTED);
+  SchemaRef sr{all_objects(f.cat()), all_tables(f.cat()), all_cols(f.cat()), {}, f.cat().version()};
+  auto ref = sr.get();
+  auto* other = bc_ctx_new(&f.bdb, &f.bcat);
+  REQUIRE(other != nullptr);
+  g_arbiter = kWB;
+  auto pa = params({std::int64_t{5}, std::int64_t{5}, bytes("x"), std::int64_t{0}});
+  bc_ctx_begin(f.cx, &pa, {});
+  bc_ctx_run(f.cx, upsert_w, &ref);
+  REQUIRE(bc_error(f.cx) == BC_OK);
+  // Their UPDATE of the holder commits first: c = 10.
+  auto pb = params({std::int64_t{1}, std::int64_t{1}, std::int64_t{1}, bytes("x"), std::int64_t{10}});
+  CHECK(bc_execute(other, update_w, &ref, &pb, {}, false, 0) == BC_COMMITTED);
+  CHECK(bc_ctx_commit(f.cx, false) == BC_CONFLICT);
+  bc_ctx_reset(f.cx);
+  g_runs = 0;
+  CHECK(bc_execute(f.cx, upsert_w, &ref, &pa, {}, false, 3) == BC_COMMITTED);
+  CHECK(g_runs == 1);
+  CHECK(c_of(f, 1) == 11);
+  CHECK(count_entries(*f.db, bytecask::sql::kNsRow, kW) == 1);
+  bc_ctx_free(other);
+  check_indexes_exact(f);
+}
+
 TEST_CASE("plan writes: a conflicting row a concurrent commit deletes is still skipped (a known difference)",
           "[sql][algebra][writes]") {
   // The owner's decision: the check reads the snapshot and guards nothing,

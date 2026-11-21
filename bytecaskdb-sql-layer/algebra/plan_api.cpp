@@ -1007,6 +1007,11 @@ struct bc_ctx {
   // id: the snapshot does not hold them, so without this two rows of one
   // statement could share one (#507). Kept and reset as written_rows.
   std::set<std::pair<std::uint32_t, Bytes>> unique_written;
+  // The unique index prefixes this execution's updates took from a row: the
+  // view still shows the row's entry, so without this ON CONFLICT DO UPDATE
+  // could not tell a holder that left a prefix from one that kept it. Kept
+  // and reset as written_rows.
+  std::set<std::pair<std::uint32_t, Bytes>> unique_vacated;
   // The aggregates bc_agg_open made: their groups' keys, in first-appearance
   // order, and their slots. Kept until reset; a group key's view reads its
   // Bytes, which a move of the vector keeps where it is.
@@ -1547,6 +1552,7 @@ struct bc_ctx {
     pinned.reset();  // an idle context keeps no superseded catalog alive
     written_rows.clear();
     unique_written.clear();
+    unique_vacated.clear();
     aggs.clear();
     sorters.clear();
     hashes.clear();
@@ -2748,6 +2754,14 @@ void lock_row(bc_ctx* cx, BytesView pk, BytesView row) {
     cx->release(n);
     return false;
   }
+  return true;
+}
+
+// Records a unique prefix an update takes from a row, charged first.
+[[nodiscard]] auto vacate_unique(bc_ctx* cx, const Index& ix, BytesView prefix) -> bool {
+  const auto n = buffer_bytes(prefix.size()) + kUniqueNodeBytes;
+  if (!cx->take(n)) return false;
+  if (!cx->unique_vacated.emplace(ix.id, Bytes(prefix.begin(), prefix.end())).second) cx->release(n);
   return true;
 }
 
@@ -5911,6 +5925,68 @@ void insert_row(bc_ctx* cx, NewRow& n, std::span<const std::uint32_t> arbiters) 
   return false;
 }
 
+// ON CONFLICT DO UPDATE: the row key of the row that holds a key of `n`
+// under `arbiters` into `pk`, the primary key first, then the unique
+// indexes in order; false when none is taken, or with the error set. A key
+// a row this execution wrote holds (written_rows, unique_written), or a
+// unique prefix whose holder in the view it wrote and that kept it, is
+// BC_E_CARDINALITY, as PostgreSQL refuses a command that affects a row
+// twice. A primary key this execution vacated is free, as conflicts() has
+// it, and so is a unique prefix its update took from the view's holder
+// (unique_vacated): no other row holds it, or unique_written would. Reads,
+// charged, and records nothing.
+[[nodiscard]] auto holder(bc_ctx* cx, const NewRow& n, std::span<const std::uint32_t> arbiters, Bytes& pk) -> bool {
+  const auto& t = *n.t;
+  auto twice = [&] {
+    cx->fail(BC_E_CARDINALITY, "ON CONFLICT DO UPDATE command cannot affect row a second time");
+    return false;
+  };
+  if (arbiter_covers(arbiters, t.id)) {
+    auto it = cx->written_rows.find(n.pk);
+    if (it != cx->written_rows.end() && it->second) return twice();
+    if (it == cx->written_rows.end()) {
+      if (!cx->charge()) return false;
+      if (view_contains(cx, n.pk)) {
+        pk = n.pk;
+        return true;
+      }
+    }
+  }
+  for (std::size_t i = 0; i < t.indexes.size(); ++i) {
+    const auto& ix = t.indexes[i];
+    if (!ix.unique || !arbiter_covers(arbiters, ix.id) || n.entries[i].has_null) continue;
+    auto prefix = n.entries[i].prefix();
+    if (cx->unique_written.contains({ix.id, Bytes(prefix.begin(), prefix.end())})) return twice();
+    if (!cx->charge()) return false;
+    ViewEntries entries{*cx->base, cx->overlay, prefix, bytecask::sql::key_successor(prefix), false};
+    if (!entries.next(cx)) {
+      if (!cx->ok()) return false;
+      continue;
+    }
+    // The holder's row key: the table's prefix and the entry's primary-key
+    // suffix, found by skipping the index parts.
+    const auto* kl = cx->cat->key_layout(ix.id);
+    if (kl == nullptr) {
+      cx->fail(BC_E_HANDLE, "no index " + std::to_string(ix.id));
+      return false;
+    }
+    KeyReader r{entries.key(), bytecask::sql::kKeyPrefixBytes};
+    for (std::size_t p = 0; p < kl->index_parts; ++p) {
+      if (!r.skip(kl->parts[p])) {
+        cx->fail(BC_E_CORRUPT, "unparseable index key");
+        return false;
+      }
+    }
+    pk.clear();
+    bytecask::sql::key_put_prefix(pk, bytecask::sql::kNsRow, t.id);
+    auto rest = r.rest();
+    pk.insert(pk.end(), rest.begin(), rest.end());
+    if (!cx->written_rows.contains(pk)) return true;
+    if (!cx->unique_vacated.contains({ix.id, Bytes(prefix.begin(), prefix.end())})) return twice();
+  }
+  return false;
+}
+
 }  // namespace
 
 void bc_insert(bc_ctx* cx, uint32_t table, bc_view row) {
@@ -5931,6 +6007,37 @@ bool bc_insert_on_conflict(bc_ctx* cx, uint32_t table, bc_view row, uint32_t arb
     return false;
   }
   if (conflicts(cx, n, arbiters)) return false;
+  insert_row(cx, n, arbiters);
+  return cx->ok();
+  BC_GUARD_END(cx)
+  return false;
+}
+
+bool bc_insert_or_existing(bc_ctx* cx, uint32_t table, bc_view row, uint32_t arbiter, bc_view* existing) {
+  BC_GUARD_BEGIN
+  if (existing != nullptr) *existing = {};
+  NewRow n{};
+  if (!new_row(cx, table, row, n)) return false;
+  const auto& t = *n.t;
+  std::vector<std::uint32_t> arbiters;
+  if (!arbiter_keys(t, arbiter, arbiters)) {
+    cx->fail(BC_E_HANDLE, "arbiter " + std::to_string(arbiter) + " is neither table " + t.name + " nor a unique index of it");
+    return false;
+  }
+  if (existing == nullptr) {
+    cx->fail(BC_E_HANDLE, "bc_insert_or_existing with no row to give");
+    return false;
+  }
+  Bytes pk;
+  if (holder(cx, n, arbiters, pk)) {
+    bool found = false;
+    auto v = read_record(cx, pk, &found);
+    // An index entry whose row is missing is damage: the runtime writes every entry with its row.
+    if (!found && cx->ok()) cx->fail(BC_E_CORRUPT, "table " + t.name + " has an index entry whose row is missing");
+    if (cx->ok()) *existing = v;
+    return false;
+  }
+  if (!cx->ok()) return false;
   insert_row(cx, n, arbiters);
   return cx->ok();
   BC_GUARD_END(cx)
@@ -5975,10 +6082,9 @@ void bc_update(bc_ctx* cx, uint32_t table, bc_view old, bc_view row) {
   if (moved_pk && !vacated && !pk_free(cx, *t, pk_new)) return;
   for (const auto& m : moves) {
     // A row never collides with itself: checked only when the prefix changed.
-    if (m.ix->unique && !m.to.has_null && !std::ranges::equal(m.from.prefix(), m.to.prefix()) &&
-        !unique_free(cx, *m.ix, m.to)) {
-      return;
-    }
+    if (!m.ix->unique || std::ranges::equal(m.from.prefix(), m.to.prefix())) continue;
+    if (!m.to.has_null && !unique_free(cx, *m.ix, m.to)) return;
+    if (!m.from.has_null && !vacate_unique(cx, *m.ix, m.from.prefix())) return;
   }
   lock_row(cx, pk_old, *o);
   if (moved_pk) {
