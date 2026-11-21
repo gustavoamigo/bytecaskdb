@@ -142,9 +142,12 @@ kind the transformer doesn't take is refused with its position.
   d)` is SQL standard only, not PostgreSQL, and is a syntax error (42601).
   An alias of a join, a join in
   parentheses or inside a comma list, and a view in a query that names a
-  table twice are refused. Without `FROM`, a `SELECT` of constants returns
-  one row of them, or none under `LIMIT 0`; it takes no `WHERE`, `GROUP BY`,
-  `HAVING`, `ORDER BY` or `FOR UPDATE` yet.
+  table twice are refused. Without `FROM`, a `SELECT` returns one row of
+  its items, or none under `LIMIT 0`: each is any select-list expression
+  (*Expressions over columns*) of constants, parameters, subqueries and the
+  time; a column in it is of no table (42703, or 42P01 for `t.x`), as in
+  PostgreSQL. It takes no `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` or
+  `FOR UPDATE` yet.
 - `UPDATE` and `DELETE` of any number of rows.
 - `ORDER BY`, `LIMIT` and `FOR UPDATE`, below.
 
@@ -623,8 +626,11 @@ That includes:
   `||` of a boolean, float or date value, `LENGTH`, `CONCAT`,
   `REPLACE`, the regular-expression `SUBSTRING`, `bytea` string functions
   (#671);
-- a cast of anything but a constant (a parameter beside a column of the
-  cast's type excepted), a numeric literal of more than 18 digits, a string literal in arithmetic, unary `-` or `abs`
+- a cast of anything but a constant or a parameter; a cast of a
+  parameter to `DECIMAL`, `VARCHAR(n)` or `CHAR(n)`, to a type another use
+  of it does not give it, or, in `VALUES`, `SET` or a `WHERE`, to other
+  than its column's type; a cast parameter inside an expression in `SET`,
+  a `WHERE` or `HAVING`, or in an aggregated select list; a numeric literal of more than 18 digits, a string literal in arithmetic, unary `-` or `abs`
   of a parameter, and a constant beside an aggregate;
 - date and time arithmetic other than `DATE - DATE`: `date ± integer`,
   `date + time`, any operator whose result is an `interval` (PostgreSQL has
@@ -888,10 +894,21 @@ are the runtime's, filled by `bc_row_begin` (`catalog_design.md`).
 - compared with a column, or combined with one in arithmetic: the column's
   type;
 - assigned to a column: the column's type;
-- cast, `$n::T` or `CAST($n AS T)`, and compared with a column of type `T`:
-  `T`, which is the column's, so the cast changes nothing and the parameter
-  binds as if bare. A cast to another type, or to `DECIMAL`, `VARCHAR(n)` or
+- cast, `$n::T` or `CAST($n AS T)`, and compared with or assigned to a
+  column of type `T` (in a `WHERE`, `VALUES` or `SET`): `T`, which is the
+  column's, so the cast changes nothing and the parameter binds as if
+  bare. A cast to another type, or to `DECIMAL`, `VARCHAR(n)` or
   `CHAR(n)`, whose casts round, cut or pad, is not taken yet;
+- cast in a select-list value of no aggregated query, with or without
+  `FROM` (`SELECT $1::integer + 1`, `SELECT v + $2::bigint FROM t`): `T`, and
+  its value is range-checked as a `T` before the plan runs (22003, 22P02
+  for text that is no `T`). Alone in a select list it is named by its type
+  (`int4`), as PostgreSQL names it; an operator of it is `?column?`. A cast
+  to `DECIMAL`, `VARCHAR(n)` or `CHAR(n)` is not taken yet, nor one to a
+  type other than another use of the parameter gives it (*Known
+  differences*). A cast parameter as an operand anywhere else (`SET n =
+  $1::integer + 1`, `WHERE n > $1::integer + 1`, `HAVING`, beside an
+  aggregate) is not taken yet;
 - combined only with an integer literal (`$3 - 20`, where `$3` has no
   other use): `integer`;
 - otherwise: "could not determine data type of parameter $n" (42P18).
@@ -973,6 +990,18 @@ fail on them.
     (`test_a_parameter_compared_with_two_types_is_refused`,
     `test_a_parameter_used_with_two_types_is_refused`; the DECIMAL scales,
     which the oracle doesn't model, in the embedded API's test).
+- **`$n::T` beside another use of `$n` of another type is refused.**
+  PostgreSQL types `$n` by its first use in the statement's text and casts
+  that value to `T`: `SELECT $1::bigint FROM t WHERE k = $1`, with `k
+  INTEGER`, runs there. The layer types a parameter once, as `T` too, and
+  refuses the pair (42601), as it refuses two column types (above). The
+  same type in both uses runs.
+- **`VARCHAR` without a length is `TEXT`, and described as `text` (OID
+  25).** PostgreSQL describes it as `varchar` (OID 1043). The values and
+  their comparisons are the same; only the type a client is told differs:
+  a column declared `VARCHAR`, a constant cast to it (`'a'::varchar`), and
+  a parameter cast to it (`SELECT $1::varchar`, the parameter and the
+  column both 25). A `VARCHAR(n)` is described as PostgreSQL describes it.
 - **A DECIMAL operand of `col ± $n` past 18 digits is 22003.** The layer's
   DECIMAL is a scaled 64-bit integer (`types_design.md`), so the operand is
   checked against 18 digits at the column's scale before the plan runs,

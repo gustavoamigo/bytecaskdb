@@ -53,7 +53,6 @@
 
 - name: a parameter with a cast
   features: [pg:parameters, pg:cast-operator]
-  unimplemented: true
   query: SELECT $1::integer + 1
   params: ["41"]
   expected: [[42]]

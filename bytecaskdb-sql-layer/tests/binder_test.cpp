@@ -1561,3 +1561,68 @@ TEST_CASE("binder: CALL's arguments are constants read as the procedure's argume
   CHECK(state("CALL p(1, 0, '', 0, TO_TIMESTAMP('2026', 'YYYY'))") == "42601");       // another format
   CHECK(state("CALL p(1, 0, '', 0, TO_TIMESTAMP('20261332000000', 'YYYYMMDDHH24MISS'))") != "bound");
 }
+
+TEST_CASE("binder: $n::T in a value types $n as T; a SELECT without FROM binds any expression", "[sql][binder]") {
+  sql_test::Fixture f;
+  const auto& cat = f.cat();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what();
+    }
+    return "bound";
+  };
+  {
+    // Named by its type, as PostgreSQL names a cast of a parameter; an
+    // operator of it is ?column?.
+    auto b = bind_sql(cat, "SELECT $1::integer, $1::integer + 1");
+    const auto& p = get<logical::Project>(b);
+    REQUIRE(p.exprs.size() == 2);
+    CHECK(p.exprs[0].name == "int4");
+    CHECK(p.exprs[0].expr.type == SqlType{SqlKind::Integer});
+    CHECK(p.exprs[1].name == "?column?");
+    CHECK(p.exprs[1].expr.type == SqlType{SqlKind::Integer});
+    CHECK(b.param_types == std::vector<PhysType>{PhysType::I64, PhysType::I64});  // $1, then the literal 1
+    REQUIRE(b.params.size() == 1);
+    CHECK(b.params[0].type == SqlType{SqlKind::Integer});
+    REQUIRE(b.param_sql.size() == 1);
+    CHECK(b.param_sql[0] == SqlType{SqlKind::Integer});  // checked as an INTEGER before the plan runs
+  }
+  {
+    auto b = bind_sql(cat, "SELECT $1::text AS a, qty + $2::bigint FROM t");
+    const auto& p = get<logical::Project>(b);
+    CHECK(p.exprs[0].name == "a");
+    CHECK(p.exprs[1].name == "?column?");
+    CHECK(b.param_types == std::vector<PhysType>{PhysType::Bytes, PhysType::I64});
+  }
+  // Cast to the type its other use gives it: one type, taken.
+  CHECK(state("SELECT $1::bigint FROM t WHERE id = $1") == "bound");
+  // A cast to another type after another use: PostgreSQL types $n by its
+  // first use and casts it; the layer refuses (a known difference).
+  CHECK(state("SELECT $1::integer FROM t WHERE id = $1") ==
+        "42601 parameter $1 is compared with id (bigint) and combined with $1 (integer)");
+  CHECK(state("SELECT $1::numeric(5, 2)") == "42601 a cast of a parameter to DECIMAL, VARCHAR(n) or CHAR(n) is not supported yet");
+  CHECK(state("SELECT $1::varchar(3)") == "42601 a cast of a parameter to DECIMAL, VARCHAR(n) or CHAR(n) is not supported yet");
+  CHECK(state("SELECT $1::char(3)") == "42601 a cast of a parameter to DECIMAL, VARCHAR(n) or CHAR(n) is not supported yet");
+  // A SELECT without FROM: a column anywhere in it is of no table.
+  CHECK(state("SELECT x + 1") == "42703 column \"x\" does not exist");
+  CHECK(state("SELECT 1, abs(x)") == "42703 column \"x\" does not exist");
+  CHECK(state("SELECT u.x") == "42P01 missing FROM-clause entry for table \"u\"");
+  CHECK(state("SELECT 1 + $1") == "42601 a parameter or a constant with no column beside it to give it a type is not supported yet");
+  // Assigned, $n::T of the column's type binds as $n, as in a WHERE.
+  {
+    auto b = bind_sql(cat, "INSERT INTO t VALUES ($1::bigint, NULL, $2::bigint)");
+    REQUIRE(b.params.size() == 2);
+    CHECK(b.params[0].type == SqlType{SqlKind::BigInt});
+    CHECK(b.params[1].type == SqlType{SqlKind::BigInt});
+  }
+  CHECK(state("UPDATE t SET qty = $1::bigint WHERE id = 1") == "bound");
+  CHECK(state("UPDATE t SET qty = $1::integer WHERE id = 1") ==
+        "42601 a cast of a parameter to other than its column's type is not supported yet");
+  CHECK(state("UPDATE t SET qty = qty::bigint WHERE id = 1") ==
+        "42601 a cast of other than a constant or a parameter is not supported yet");
+  // An operator is ?column?, % among them, as PostgreSQL names it.
+  CHECK(get<logical::Project>(bind_sql(cat, "SELECT qty % 2 FROM t")).exprs[0].name == "?column?");
+  CHECK(get<logical::Project>(bind_sql(cat, "SELECT (SELECT 1) % 2")).exprs[0].name == "?column?");
+}
