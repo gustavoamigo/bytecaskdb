@@ -583,7 +583,22 @@ struct Computed {
 struct ResultColumn {
   std::string name;
   SqlType sql;
+  // The code points a value is padded to with spaces: a CHAR(n)'s n, and
+  // MIN's or MAX's of a CHAR(n) column, a CHAR of no length whose value
+  // PostgreSQL prints padded to the column's n. 0: none.
+  std::uint32_t pad{0};
 };
+
+// A result column of `o`, its pad as ResultColumn says.
+[[nodiscard]] auto result_column(const logical::Output& o) -> ResultColumn {
+  const auto& e = o.expr;
+  auto pad = e.type.kind == SqlKind::Char ? e.type.length : 0;
+  if (e.kind == Expr::Kind::Aggregate && e.type.kind == SqlKind::Char && e.args.size() == 1 &&
+      e.args[0].type.kind == SqlKind::Char) {
+    pad = e.args[0].type.length;
+  }
+  return {o.name, e.type, pad};
+}
 
 struct Plan;
 
@@ -831,6 +846,11 @@ private:
     if (a.args.size() > 1) broken("an aggregate call of more than one argument");
     if (a.args.empty()) return;
     if (a.distinct && a.args[0].kind != Expr::Kind::Column) broken("an aggregate of DISTINCT values of other than a column");
+    // MIN and MAX fold an int64_t, a double or bytes (bc_agg_min_bytes).
+    const auto t = a.args[0].phys();
+    if ((a.fn == Expr::Fn::Min || a.fn == Expr::Fn::Max) && t != PhysType::I64 && t != PhysType::F64 && t != PhysType::Bytes) {
+      broken("MIN or MAX of other than an integer, a double or bytes");
+    }
     value(a.args[0]);
     params(a.args[0]);
   }

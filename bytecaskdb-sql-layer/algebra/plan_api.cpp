@@ -77,6 +77,7 @@ using bytecask::sql::Datum;
 using bytecask::sql::Index;
 using bytecask::sql::kCursorEntryBytes;
 using bytecask::sql::kAggBytes;
+using bytecask::sql::kAggHeldBytes;
 using bytecask::sql::kAggSlotBytes;
 using bytecask::sql::kGroupEntryBytes;
 using bytecask::sql::kHashBytes;
@@ -839,10 +840,10 @@ struct HashIter {
 };
 
 // What an aggregate's slot accumulates, fixed by its first fold.
-enum class SlotKind : std::uint8_t { None, SumI64, SumF64, MinI64, MaxI64, MinF64, MaxF64, Count };
+enum class SlotKind : std::uint8_t { None, SumI64, SumF64, MinI64, MaxI64, MinF64, MaxF64, Count, MinBytes, MaxBytes };
 
 struct Slot {
-  std::int64_t i{0};  // a sum, a minimum or maximum, or a count
+  std::int64_t i{0};  // a sum, a minimum or maximum, or a count; of bytes, its index in Agg::held
   double f{0};        // a double sum, minimum or maximum
   bool set{false};    // a value was folded in
 };
@@ -865,6 +866,9 @@ static_assert(4 * sizeof(void*) + sizeof(std::pair<const Bytes, std::uint32_t>) 
                   sizeof(const Bytes*) <=
               kGroupEntryBytes);
 static_assert(2 * sizeof(Slot) <= kAggSlotBytes);
+// A held MIN or MAX of bytes: its block's header, and its place in the
+// aggregate's vector, at twice its size.
+static_assert(kAllocBytes + 2 * sizeof(Bytes) <= kAggHeldBytes);
 static_assert(2 * sizeof(Sorter) <= kSorterBytes);
 static_assert(2 * sizeof(Hash) <= kHashBytes);
 static_assert(2 * sizeof(SortEntry) + kAllocBytes <= kSortEntryBytes);
@@ -1228,12 +1232,17 @@ struct bc_ctx {
     std::uint64_t gen{0};
     std::uint64_t groups{0};
     std::uint32_t slots{0};
+    std::uint32_t scope{kNoStep};  // its loop's step in steps, while bc_agg_next is on a group
+    std::uint32_t next{0};         // the group bc_agg_next gives next
     std::map<Bytes, std::uint32_t, BytesLess> index;
     std::vector<const Bytes*> order;
     std::vector<SlotKind> kinds;  // per slot, the same in every group
     std::vector<Slot> values;
-    std::size_t next{0};
-    std::uint32_t scope{kNoStep};  // its loop's step in steps, while bc_agg_next is on a group
+    // The value of each MinBytes or MaxBytes slot a value reached, in the
+    // order they were first reached: the slot's `i` is its index. Made on
+    // the first, so an aggregate of none keeps its size; charged as
+    // held_value_bytes says, released by a clear or the reset.
+    std::unique_ptr<std::vector<Bytes>> held;
   };
   // Sorters, hash tables and aggregates, in the order opened, so their
   // generations ascend; kept until reset.
@@ -4959,6 +4968,15 @@ void emit_decoded(bc_ctx* cx, const std::optional<T>& v, bool corrupt, bool has_
 // ---------------------------------------------------------------- subqueries
 
 static auto group_bytes(const bc_ctx::Agg& a, std::size_t key_bytes) -> std::uint64_t;
+// What the MIN and MAX values of bytes an aggregate holds are charged.
+// The vector, once made: its block; and each value: its bytes and
+// kAggHeldBytes.
+static auto held_value_bytes(const bc_ctx::Agg& a) -> std::uint64_t {
+  if (!a.held) return 0;
+  std::uint64_t n = kAllocBytes + sizeof(std::vector<Bytes>);
+  for (const auto& b : *a.held) n += b.size() + kAggHeldBytes;
+  return n;
+}
 
 extern "C++" {
 namespace {
@@ -5115,7 +5133,7 @@ auto held_bytes(const Hash& h) -> std::uint64_t {
 auto held_bytes(const bc_ctx::Agg& a) -> std::uint64_t {
   std::uint64_t n = kAggBytes + std::uint64_t{a.slots} * sizeof(SlotKind);
   for (const auto& [key, i] : a.index) n += group_bytes(a, key.size());
-  return n;
+  return n + held_value_bytes(a);
 }
 
 // Drops the structures of `v` past its first n, and releases their charge.
@@ -7310,10 +7328,12 @@ void bc_agg_clear(bc_ctx* cx, bc_agg a) {
   }
   std::uint64_t released = 0;
   for (const auto& [key, i] : agg->index) released += group_bytes(*agg, key.size());
+  released += held_value_bytes(*agg);
   agg->groups = cx->next_gen();
   agg->index.clear();
   agg->order.clear();
   agg->values.clear();
+  agg->held.reset();
   cx->release(released);
   BC_GUARD_END(cx)
 }
@@ -7364,6 +7384,8 @@ auto slot_kind_name(SlotKind k) -> const char* {
     case SlotKind::MinF64: return "a double minimum";
     case SlotKind::MaxF64: return "a double maximum";
     case SlotKind::Count: return "a count";
+    case SlotKind::MinBytes: return "a bytes minimum";
+    case SlotKind::MaxBytes: return "a bytes maximum";
   }
   return "a slot";
 }
@@ -7386,9 +7408,12 @@ auto fold_slot(bc_ctx* cx, bc_group g, std::uint32_t slot, SlotKind kind) -> Slo
   return &agg->values[std::size_t{g.i} * agg->slots + slot];
 }
 
-// The slot a read goes to, with its kind; nullptr and BC_E_HANDLE for a
-// slot out of range, or, given `f64`, of the other type than the read's.
-auto read_slot(bc_ctx* cx, bc_group g, std::uint32_t slot, std::optional<bool> f64) -> const Slot* {
+// What a read of a slot takes it as.
+enum class SlotRead : std::uint8_t { Any, I64, F64, Bytes };
+
+// The slot a read goes to; nullptr and BC_E_HANDLE for a slot out of range,
+// or one an earlier fold made of another type than the read's.
+auto read_slot(bc_ctx* cx, bc_group g, std::uint32_t slot, SlotRead read) -> const Slot* {
   auto* agg = group_agg(cx, g);
   if (agg == nullptr) return nullptr;
   if (slot >= agg->slots) {
@@ -7397,12 +7422,58 @@ auto read_slot(bc_ctx* cx, bc_group g, std::uint32_t slot, std::optional<bool> f
   }
   auto k = agg->kinds[slot];
   auto is_f64 = k == SlotKind::SumF64 || k == SlotKind::MinF64 || k == SlotKind::MaxF64;
-  if (f64 && k != SlotKind::None && is_f64 != *f64) {
-    cx->fail(BC_E_HANDLE, std::string{"slot "} + std::to_string(slot) + " is " + slot_kind_name(k) + ", read as " +
-                              (*f64 ? "a double" : "an integer"));
+  auto is_bytes = k == SlotKind::MinBytes || k == SlotKind::MaxBytes;
+  auto kind = is_f64 ? SlotRead::F64 : is_bytes ? SlotRead::Bytes : SlotRead::I64;
+  if (read != SlotRead::Any && k != SlotKind::None && kind != read) {
+    const char* as = read == SlotRead::F64 ? "a double" : read == SlotRead::Bytes ? "bytes" : "an integer";
+    cx->fail(BC_E_HANDLE, std::string{"slot "} + std::to_string(slot) + " is " + slot_kind_name(k) + ", read as " + as);
     return nullptr;
   }
   return &agg->values[std::size_t{g.i} * agg->slots + slot];
+}
+
+// Folds `v` into a MinBytes or MaxBytes slot of group g: held when it is
+// the slot's first value, or orders before (MIN) or after (MAX) the one
+// held, by bytes_cmp, the order of bc_bytes_cmp and of sort keys. The new
+// value is charged before it is copied, and the old one released after: a
+// failure (BC_E_LIMIT past the budget, BC_E_MEMORY) leaves the old value
+// held and charged.
+void fold_bytes(bc_ctx* cx, bc_group g, std::uint32_t slot, bc_view v, SlotKind kind) {
+  auto* s = fold_slot(cx, g, slot, kind);
+  if (s == nullptr) return;
+  auto& agg = *group_agg(cx, g);
+  auto b = cx->resolve(v);
+  if (!b || !cx->ok()) return;
+  if (s->set) {
+    auto& old = (*agg.held)[static_cast<std::size_t>(s->i)];
+    auto o = bytes_cmp(*b, old);
+    if (kind == SlotKind::MinBytes ? !std::is_lt(o) : !std::is_gt(o)) return;
+    if (!cx->take(b->size())) return;
+    Bytes copy;
+    try {
+      copy.assign(b->begin(), b->end());
+    } catch (...) {
+      cx->release(b->size());
+      throw;
+    }
+    cx->release(old.size());
+    old = std::move(copy);
+    return;
+  }
+  const auto made = agg.held ? 0 : kAllocBytes + sizeof(std::vector<Bytes>);
+  const auto charge = b->size() + kAggHeldBytes + made;
+  if (!cx->take(charge)) return;
+  try {
+    if (!agg.held) agg.held = std::make_unique<std::vector<Bytes>>();
+    agg.held->emplace_back(b->begin(), b->end());
+  } catch (...) {
+    // A vector made empty is released whole.
+    if (made != 0 && agg.held && agg.held->empty()) agg.held.reset();
+    cx->release(agg.held ? charge - made : charge);
+    throw;
+  }
+  s->i = static_cast<std::int64_t>(agg.held->size() - 1);
+  s->set = true;
 }
 
 }  // namespace
@@ -7484,6 +7555,16 @@ void bc_agg_max_i64(bc_ctx* cx, bc_group g, uint32_t slot, int64_t v) {
   s->set = true;
   BC_GUARD_END(cx)
 }
+void bc_agg_min_bytes(bc_ctx* cx, bc_group g, uint32_t slot, bc_view v) {
+  BC_GUARD_BEGIN
+  fold_bytes(cx, g, slot, v, SlotKind::MinBytes);
+  BC_GUARD_END(cx)
+}
+void bc_agg_max_bytes(bc_ctx* cx, bc_group g, uint32_t slot, bc_view v) {
+  BC_GUARD_BEGIN
+  fold_bytes(cx, g, slot, v, SlotKind::MaxBytes);
+  BC_GUARD_END(cx)
+}
 void bc_agg_count(bc_ctx* cx, bc_group g, uint32_t slot) {
   BC_GUARD_BEGIN
   auto* s = fold_slot(cx, g, slot, SlotKind::Count);
@@ -7513,22 +7594,33 @@ bool bc_agg_next(bc_ctx* cx, bc_agg a, bc_view* group_key, bc_group* g) {
 }
 int64_t bc_agg_i64(bc_ctx* cx, bc_group g, uint32_t slot) {
   BC_GUARD_BEGIN
-  const auto* s = read_slot(cx, g, slot, false);
+  const auto* s = read_slot(cx, g, slot, SlotRead::I64);
   return s == nullptr ? 0 : s->i;
   BC_GUARD_END(cx)
   return {};
 }
 double bc_agg_f64(bc_ctx* cx, bc_group g, uint32_t slot) {
   BC_GUARD_BEGIN
-  const auto* s = read_slot(cx, g, slot, true);
+  const auto* s = read_slot(cx, g, slot, SlotRead::F64);
   return s == nullptr ? 0 : s->f;
+  BC_GUARD_END(cx)
+  return {};
+}
+// A copy in the step's arena: the held value changes when a later fold
+// replaces it, and goes with a clear. The empty view when no value reached
+// the slot (bc_agg_null).
+bc_view bc_agg_bytes(bc_ctx* cx, bc_group g, uint32_t slot) {
+  BC_GUARD_BEGIN
+  const auto* s = read_slot(cx, g, slot, SlotRead::Bytes);
+  if (s == nullptr || !s->set) return {};
+  return cx->arena_view((*group_agg(cx, g)->held)[static_cast<std::size_t>(s->i)]);
   BC_GUARD_END(cx)
   return {};
 }
 // PostgreSQL's NULL for SUM, MIN, MAX or AVG of a group no value reached.
 bool bc_agg_null(bc_ctx* cx, bc_group g, uint32_t slot) {
   BC_GUARD_BEGIN
-  const auto* s = read_slot(cx, g, slot, std::nullopt);
+  const auto* s = read_slot(cx, g, slot, SlotRead::Any);
   return s != nullptr && !s->set;
   BC_GUARD_END(cx)
   return {};

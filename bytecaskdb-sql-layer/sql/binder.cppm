@@ -3220,6 +3220,9 @@ public:
   // names it, by its own column's name.
   auto subquery_output(const ast::Expr& e) -> logical::Output {
     auto s = subquery(*e.subquery, logical::Subquery::Kind::Value, e.pos);
+    // MIN or MAX of a CHAR(n): PostgreSQL's value is padded to n, which the
+    // parameter does not carry. Compared with a column it is not needed.
+    if (unsized_char(s.type)) not_supported("a scalar subquery of MIN or MAX of a CHAR(n) column other than compared with a column", e.pos);
     return {logical::param(s.param, s.type), s.name};
   }
 
@@ -4422,8 +4425,7 @@ public:
   // Whether the layer takes `fn` of a value of type `t`, and if not the SQLSTATE of the
   // refusal: 42883 where PostgreSQL has no such aggregate either, 42601 where
   // it has and the layer does not yet (SUM, AVG, MIN or MAX of a REAL, SUM or
-  // AVG of a TIME column, which PostgreSQL takes as an interval; MIN or MAX
-  // of a string column).
+  // AVG of a TIME column, which PostgreSQL takes as an interval).
   struct AggregateSupport {
     bool supported;
     SqlState sqlstate;
@@ -4442,7 +4444,7 @@ public:
       case SqlKind::Text:
       case SqlKind::Varchar:
       case SqlKind::Char:
-      case SqlKind::Name: return {false, sum ? kUndefinedFunction : kSyntaxError};
+      case SqlKind::Name: return {!sum, kUndefinedFunction};  // MIN and MAX bytewise (#904)
       case SqlKind::Boolean:
       case SqlKind::Bytea: return {false, kUndefinedFunction};
       case SqlKind::Timestamp:
@@ -4507,20 +4509,54 @@ public:
     return arg;
   }
 
+  // MIN's or MAX's type of a CHAR(n) argument: PostgreSQL's bpchar of no
+  // length, whose value is padded to the argument's n. Only a result column
+  // pads it (physical::result_column); anywhere else that n is lost, so a
+  // use that would print or measure it is refused.
+  static auto unsized_char(SqlType t) -> bool { return t.kind == SqlKind::Char && t.length == 0; }
+
+  // MIN's and MAX's result type: the argument's, but text for VARCHAR and
+  // NAME (PostgreSQL has max(text), and none of those), and CHAR of no
+  // length for a CHAR(n), as PostgreSQL's max(bpchar).
+  static auto min_max_type(SqlType t) -> SqlType {
+    switch (t.kind) {
+      case SqlKind::Varchar:
+      case SqlKind::Name: return SqlType{SqlKind::Text};
+      case SqlKind::Char: return SqlType{SqlKind::Char};
+      case SqlKind::SmallInt:
+      case SqlKind::Integer:
+      case SqlKind::BigInt:
+      case SqlKind::Real:
+      case SqlKind::Double:
+      case SqlKind::Decimal:
+      case SqlKind::Boolean:
+      case SqlKind::Text:
+      case SqlKind::Bytea:
+      case SqlKind::Timestamp:
+      case SqlKind::TimestampTz:
+      case SqlKind::Date:
+      case SqlKind::Time:
+      case SqlKind::TimeTz:
+      case SqlKind::Numeric:
+      case SqlKind::Jsonb: return t;
+    }
+    std::unreachable();
+  }
+
   // An aggregate call of `arg`, or COUNT(*) with none: a column, or an
-  // expression of columns, whose type decides the call's. SUM, MIN, MAX and
-  // AVG take a value the plan holds as int64_t: SUM and AVG an integer or
-  // DECIMAL one, as PostgreSQL sums them exactly; MIN and MAX those and the
-  // date and time types; and each a DOUBLE PRECISION one. Of a REAL they are
-  // later, and MIN and MAX of a string or bytes value outside the MVP
-  // (docs/frontend_design.md, *Aggregates*).
+  // expression of columns, whose type decides the call's. SUM and AVG take
+  // an integer, DECIMAL or DOUBLE PRECISION value, as PostgreSQL sums them
+  // exactly; MIN and MAX those, the date and time types and the string
+  // types (text, VARCHAR, NAME, CHAR(n)), compared bytewise. Of a REAL they
+  // are later (docs/frontend_design.md, *Aggregates*).
   //
   // Its result as PostgreSQL names and types it: COUNT a bigint; SUM of a
   // SMALLINT or INTEGER a bigint, of a BIGINT or DECIMAL a numeric of no
   // declared precision (the total may take 19 digits), held at the
-  // argument's scale; MIN and MAX of the argument's type; AVG a numeric of no
-  // declared precision, its scale PostgreSQL's division's (the API computes
-  // it from the plan's sum and count, docs/planner_design.md, *Aggregates*).
+  // argument's scale; MIN and MAX of the argument's type except as
+  // min_max_type gives; AVG a numeric of no declared precision, its scale
+  // PostgreSQL's division's (the API computes it from the plan's sum and
+  // count, docs/planner_design.md, *Aggregates*).
   static auto aggregate(std::optional<logical::Expr> arg, const ast::Expr& e) -> logical::Output {
     using Fn = ast::Expr::Fn;
     auto agg = logical::expr(logical::Expr::Kind::Aggregate, SqlType{SqlKind::BigInt});
@@ -4539,16 +4575,25 @@ public:
       refuse_numeric(std::string{aggregate_name(e.fn)} + (agg.distinct ? " of DISTINCT values" : "") + " of a NUMERIC", e.pos);
     }
     if (t.kind == SqlKind::Jsonb && e.fn == Fn::Count && agg.distinct) refuse_uncompared(t.kind, "COUNT of DISTINCT jsonb values", e.pos);
-    if (t.kind == SqlKind::Jsonb && e.fn != Fn::Count) {
-      auto name = std::string{aggregate_name(e.fn)};
-      std::ranges::transform(name, name.begin(), [](char ch) { return static_cast<char>(std::tolower(static_cast<unsigned char>(ch))); });
-      throw SqlError{"function " + name + "(jsonb) does not exist", e.pos, kUndefinedFunction}.with_notes(
-          "", "No function matches the given name and argument types. You might need to add explicit type casts.");
-    }
     if (auto s = aggregate_support(e.fn, t); !s.supported) {
+      if (s.sqlstate.view() == kUndefinedFunction.view()) {
+        // PostgreSQL's own refusal: it has no such aggregate.
+        auto name = std::string{aggregate_name(e.fn)};
+        std::ranges::transform(name, name.begin(), [](char ch) { return static_cast<char>(std::tolower(static_cast<unsigned char>(ch))); });
+        throw SqlError{"function " + name + "(" + pg_type_name(t) + ") does not exist", e.pos, kUndefinedFunction}.with_notes(
+            "", "No function matches the given name and argument types. You might need to add explicit type casts.");
+      }
       auto of = arg->kind == logical::Expr::Kind::Column ? " column" : " value";
       throw SqlError{std::string{aggregate_name(e.fn)} + " of a " + sql_type_name(t) + of + " is not supported", e.pos,
                      s.sqlstate};
+    }
+    // MIN or MAX of a CHAR(n) is PostgreSQL's bpchar of no length, its value
+    // the stored one padded to n: a column's, whose n the result pads to
+    // (logical::display_width). A CHAR-typed expression is not taken: that
+    // its value never keeps trailing spaces is not checked (#904, open
+    // question 9).
+    if (t.kind == SqlKind::Char && arg->kind != logical::Expr::Kind::Column) {
+      not_supported(std::string{aggregate_name(e.fn)} + " of a CHAR expression other than a column", e.pos);
     }
     agg.args.push_back(std::move(*arg));
     switch (e.fn) {
@@ -4560,8 +4605,8 @@ public:
           agg.type = SqlType{SqlKind::Decimal, 0, 0, t.scale};
         }
         return {std::move(agg), "sum"};
-      case Fn::Min: agg.type = t; return {std::move(agg), "min"};
-      case Fn::Max: agg.type = t; return {std::move(agg), "max"};
+      case Fn::Min: agg.type = min_max_type(t); return {std::move(agg), "min"};
+      case Fn::Max: agg.type = min_max_type(t); return {std::move(agg), "max"};
       case Fn::Avg:
         agg.type = t.kind == SqlKind::Double ? t : SqlType{SqlKind::Numeric, 0, 0, t.scale};
         return {std::move(agg), "avg"};
@@ -5402,6 +5447,8 @@ public:
       if (e.type.kind == SqlKind::Numeric) {
         not_yet("aggregating over a grouped view's AVG of an integer or numeric (PostgreSQL's numeric)", pos);
       }
+      // Its column would not carry the n PostgreSQL pads the value to.
+      if (unsized_char(e.type)) not_supported("a derived relation's MIN or MAX of a CHAR(n) column", pos);
       auto nullable = e.kind == logical::Expr::Kind::Column ? e.col.nullable
                                                              : !(e.kind == logical::Expr::Kind::Aggregate && e.fn == logical::Expr::Fn::Count);
       t->columns.push_back(Column{bytecask::sql::narrow<std::uint32_t>(i), item.column_aliases[i], e.type, e.phys(), nullable, std::monostate{}});
@@ -6325,8 +6372,8 @@ public:
   // a parameter, in either order. The parameter takes the column's type, or
   // the aggregate's: COUNT's and SUM's of a SMALLINT or INTEGER a BIGINT,
   // SUM's of a BIGINT or DECIMAL the numeric at its scale, checked as a
-  // BIGINT is (compared_type), MIN's and MAX's their column's; SUM's, MIN's
-  // and MAX's of a DOUBLE PRECISION a double precision, compared in
+  // BIGINT is (compared_type), MIN's and MAX's their column's (of text,
+  // text); SUM's, MIN's and MAX's of a DOUBLE PRECISION a double precision, compared in
   // PostgreSQL's float8 order. HAVING on AVG is not supported: its quotient
   // is numeric text (PhysType::Num), which a plan does not compare.
   auto having_conjunct(const ast::Compare& w, const auto& resolve, const auto& grouped) -> logical::Expr {
@@ -6339,6 +6386,20 @@ public:
       op = mirrored(op);
     }
     auto constant = is_constant(*rhs);
+    // A text constant (a ::text cast, ||, lower()) beside a CHAR value:
+    // PostgreSQL casts the CHAR to text, so trailing spaces count, where a
+    // comparison as the CHAR's type would drop them. The WHERE compares it
+    // as values (compared_values); a HAVING has no such path, so it is
+    // refused rather than compared as a CHAR. A VARCHAR cast is folded as
+    // text but compared as the CHAR, as PostgreSQL's bpchar = bpchar is.
+    auto text_beside_char = [&](const Column& c) {
+      if (!constant || c.sql.kind != SqlKind::Char) return;
+      auto k = fold(*rhs);
+      auto varchar = rhs->kind == ast::Expr::Kind::Cast && rhs->cast_type == "varchar";
+      if (!k.unknown && k.type.kind == SqlKind::Text && !varchar) {
+        not_supported("HAVING comparing a CHAR(n) column, or MIN or MAX of one, with a text value", w.pos);
+      }
+    };
     if ((lhs->kind != ast::Expr::Kind::Column && lhs->kind != ast::Expr::Kind::Aggregate) ||
         (rhs->kind != ast::Expr::Kind::Param && !constant)) {
       throw SqlError{"HAVING must compare a grouped column or an aggregate with a parameter or a constant", w.pos};
@@ -6346,6 +6407,7 @@ public:
     if (lhs->kind == ast::Expr::Kind::Column) {
       auto [t, c] = resolve(*lhs);
       auto g = grouped(*t, *c, lhs->pos);
+      text_beside_char(*c);
       if (constant) return logical::compare(op, std::move(g), fixed(coerce(fold(*rhs), *c, false, op_text(op)), c->sql));
       auto sql = having_param(rhs->param, c->type, rhs->pos, *c, t->id);
       return logical::compare(op, std::move(g), logical::param(rhs->param, sql));
@@ -6362,13 +6424,19 @@ public:
     }
     auto agg = aggregate(aggregate_arg(*lhs, resolve), *lhs);
     if (agg.expr.fn == logical::Expr::Fn::Avg) throw SqlError{"HAVING on AVG is not supported yet", lhs->pos};
+    // MIN or MAX of text is compared as text whatever its argument (a
+    // VARCHAR's, a NAME's: PostgreSQL's max(text)); of a CHAR(n) column as
+    // the column is, so a parameter is refused as one compared with it.
+    const auto text = agg.expr.fn != logical::Expr::Fn::Count && agg.expr.type.kind == SqlKind::Text;
     auto phys = agg.expr.fn != logical::Expr::Fn::Count && agg.expr.args[0].type.kind == SqlKind::Double ? PhysType::F64
+                : agg.expr.fn != logical::Expr::Fn::Count && agg.expr.args[0].phys() == PhysType::Bytes ? PhysType::Bytes
                                                                                                         : PhysType::I64;
     const Column* as = arg;
-    if (agg.expr.fn == logical::Expr::Fn::Count || agg.expr.fn == logical::Expr::Fn::Sum || arg == nullptr) {
+    if (agg.expr.fn == logical::Expr::Fn::Count || agg.expr.fn == logical::Expr::Fn::Sum || arg == nullptr || text) {
       synthetic_.push_back(Column{0, agg.name, agg.expr.type, phys, true, {}});
       as = &synthetic_.back();
     }
+    text_beside_char(*as);
     if (constant) {
       return logical::compare(op, std::move(agg.expr), fixed(coerce(fold(*rhs), *as, false, op_text(op)), as->sql));
     }

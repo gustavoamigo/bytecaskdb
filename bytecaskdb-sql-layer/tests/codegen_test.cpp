@@ -572,3 +572,34 @@ TEST_CASE("codegen: an expression filter is printed by eval after the tests befo
   auto like = generate(f.cat(), "SELECT k FROM u WHERE lower(k || 'x') LIKE $1").source;
   CHECK(like.find("bc_like(cx, ") != std::string::npos);
 }
+
+TEST_CASE("codegen: MIN and MAX of text fold into a slot's bytes in a structure, into a holder in a stream",
+          "[sql][codegen][group]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bound::bind(ast::parse("CREATE TABLE mx (id BIGINT PRIMARY KEY, g BIGINT, s TEXT, ch CHAR(3))"), f.cat()).stmt));
+  f.ddl(std::get<Ddl>(bound::bind(ast::parse("CREATE INDEX mx_g ON mx (g)"), f.cat()).stmt));
+  const auto& cat = f.cat();
+  // Grouped in a structure: the bytes beside the slot, read as a copy.
+  auto grouped = generate(cat, "SELECT s, max(ch), count(*) FROM mx GROUP BY s");
+  INFO(grouped.source);
+  CHECK(grouped.source.find("bc_agg_max_bytes(cx, gg0, ") != std::string::npos);
+  CHECK(grouped.source.find("bc_emit_bytes(cx, bc_agg_bytes(cx, g0, ") != std::string::npos);
+  CHECK(grouped.result_sql.at(1) == SqlType{SqlKind::Char});  // bpchar of no length
+  CHECK(grouped.result_pad == std::vector<std::uint32_t>{0, 3, 0});  // printed padded to ch's 3
+  // Of no key: one streamed group, the text in a holder of one group.
+  auto all = generate(cat, "SELECT min(s), max(s), count(*) FROM mx");
+  INFO(all.source);
+  CHECK(all.source.find("bc_agg h0_0 = bc_agg_open(cx, 2);") != std::string::npos);
+  CHECK(all.source.find("bc_group hg0_0 = bc_agg_group(cx, h0_0, bc_empty(cx));") != std::string::npos);
+  CHECK(all.source.find("bc_agg_min_bytes(cx, hg0_0, 0, ") != std::string::npos);
+  CHECK(all.source.find("bc_agg_max_bytes(cx, hg0_0, 1, ") != std::string::npos);
+  CHECK(all.source.find("bc_agg_bytes(cx, hg0_0, 1)") != std::string::npos);
+  CHECK(all.result_types == std::vector<PhysType>{PhysType::Bytes, PhysType::Bytes, PhysType::I64});
+  CHECK_NOTHROW(TccPlan::compile(all.source));
+  // Streamed by g's index: the holder is cleared and its group found again as each group ends.
+  auto streamed = generate(cat, "SELECT g, max(s) FROM mx WHERE g >= $1 GROUP BY g");
+  INFO(streamed.source);
+  CHECK(streamed.source.find("bc_agg_clear(cx, h0_0);") != std::string::npos);
+  CHECK(streamed.source.find("hg0_0 = bc_agg_group(cx, h0_0, bc_empty(cx));") != std::string::npos);
+  CHECK_NOTHROW(TccPlan::compile(streamed.source));
+}

@@ -1,6 +1,8 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 22 (revision 22 with jsonb's accessors and casts
+Status: **built**, revision 23 (revision 23 with `bc_agg_min_bytes`,
+`bc_agg_max_bytes` and `bc_agg_bytes`, `MIN` and `MAX` of text (#904,
+stage M1); revision 22 with jsonb's accessors and casts
 out, `bc_jsonb_field`, `bc_jsonb_element`, `bc_jsonb_path` and their `_text`
 forms, `bc_jsonb_path_in`, `bc_jsonb_path_add`, `bc_jsonb_typeof`,
 `bc_jsonb_array_length` and `bc_jsonb_to_bool`, `_to_i64`, `_to_f64` and
@@ -1102,10 +1104,13 @@ void      bc_agg_min_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);
 void      bc_agg_max_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);
 void      bc_agg_min_f64(bc_ctx *, bc_group, uint32_t slot, double);
 void      bc_agg_max_f64(bc_ctx *, bc_group, uint32_t slot, double);
+void      bc_agg_min_bytes(bc_ctx *, bc_group, uint32_t slot, bc_view);
+void      bc_agg_max_bytes(bc_ctx *, bc_group, uint32_t slot, bc_view);
 void      bc_agg_count(bc_ctx *, bc_group, uint32_t slot);
 bool      bc_agg_next(bc_ctx *, bc_agg, bc_view *group_key, bc_group *g);
 int64_t   bc_agg_i64(bc_ctx *, bc_group, uint32_t slot);
 double    bc_agg_f64(bc_ctx *, bc_group, uint32_t slot);
+bc_view   bc_agg_bytes(bc_ctx *, bc_group, uint32_t slot);
 bool      bc_agg_null(bc_ctx *, bc_group, uint32_t slot);
 ```
 
@@ -1121,9 +1126,11 @@ bool      bc_agg_null(bc_ctx *, bc_group, uint32_t slot);
 | `bc_agg_open` | Grouped accumulators with `slots` numeric slots per group (0 for `COUNT(DISTINCT)`, which needs only the groups), for `GROUP BY` the plan cannot get from index order. Ungrouped aggregates use one group with an empty key. Opening one charges `kAggBytes` and a byte per slot, as `bc_sorter_open` charges `kSorterBytes` and `bc_hash_open` `kHashBytes`: past the budget, the open is `BC_E_LIMIT`. Each group's key is held once, and a new group charges its key's bytes, `kGroupEntryBytes` and `kAggSlotBytes` per slot. |
 | `bc_agg_group` | Finds or creates the group for `group_key`, a mem-comparable byte string. Slots start at zero, with no value folded in. |
 | `bc_agg_add_*`, `bc_agg_min_*`, `bc_agg_max_*`, `bc_agg_count` | Folds a value into a slot: `SUM`, `MIN`, `MAX`, `COUNT`; `AVG` is a sum slot and a count slot divided at emit. A slot's first fold fixes its kind, the same for every group; a fold of another kind, or a slot past `slots`, is `BC_E_HANDLE`. An integer sum, or a count, that overflows is `BC_E_ARITH` ("bigint out of range"); a double sum that overflows from finite values is `BC_E_ARITH` ("value out of range: overflow"), as PostgreSQL's `float8` sum, and an infinite or NaN input carries through. |
+| `bc_agg_min_bytes`, `bc_agg_max_bytes` | `MIN` and `MAX` of text (#904): the slot keeps a copy of the least or greatest value folded, bytewise (`bytes_cmp`, the order of `bc_bytes_cmp` and sort keys), beside the slot. The first value in an aggregate makes its vector of held values, charged its block (`kAllocBytes` and its size); each value held is charged its bytes and `kAggHeldBytes`. A replacement takes the new value's size before it copies and releases the old one's after: past the budget it is `BC_E_LIMIT` (54000), and a failed take or copy leaves the old value held and charged. |
+| `bc_agg_bytes` | A bytes slot's value, as a copy in the step's arena, so it outlives a later fold that replaces the held value; the empty view when none was folded (`bc_agg_null`). Of another kind's slot, `BC_E_HANDLE`. |
 | `bc_agg_next` | Iterates groups in first-appearance order, one unit each. |
-| `bc_agg_clear` | Drops every group and releases what each was charged, its key, `kGroupEntryBytes` and its slots; the slots keep their kinds. The groups' indices start again at 0, under a new generation of the aggregate's groups, so a handle of a dropped group is stale (`BC_E_HANDLE`), never another group's, and the limit of 2^32 groups (`BC_E_LIMIT`) counts the groups held, not every group ever made. A streamed `COUNT(DISTINCT)` clears its values' aggregate as each group ends, so it holds only the current group's (`planner_design.md`, *Aggregates*). Once `bc_agg_next` has started on it, `BC_E_HANDLE`. |
-| `bc_agg_i64`, `bc_agg_f64` | Reads a slot: `bc_agg_f64` a double sum, minimum or maximum, `bc_agg_i64` any other. A slot read as the other type is `BC_E_HANDLE`; one never folded reads zero either way. |
+| `bc_agg_clear` | Drops every group and releases what each was charged, its key, `kGroupEntryBytes` and its slots, and every held bytes value; the slots keep their kinds. The groups' indices start again at 0, under a new generation of the aggregate's groups, so a handle of a dropped group is stale (`BC_E_HANDLE`), never another group's, and the limit of 2^32 groups (`BC_E_LIMIT`) counts the groups held, not every group ever made. A streamed `COUNT(DISTINCT)` clears its values' aggregate as each group ends, so it holds only the current group's (`planner_design.md`, *Aggregates*). Once `bc_agg_next` has started on it, `BC_E_HANDLE`. |
+| `bc_agg_i64`, `bc_agg_f64` | Reads a slot: `bc_agg_f64` a double sum, minimum or maximum, `bc_agg_i64` any other but a bytes one. A slot read as another type is `BC_E_HANDLE`; one never folded reads zero either way. |
 | `bc_agg_null` | True when no value was folded into the slot in this group, of any kind; a slot past `slots` is `BC_E_HANDLE`. |
 
 **PostgreSQL's NULLs are the plan's.** The slots hold numbers, never

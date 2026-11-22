@@ -75,6 +75,7 @@ import dataclasses
 import decimal
 import math
 import os
+import random
 import shutil
 import sys
 import tempfile
@@ -3187,6 +3188,34 @@ def test_double_aggregates_and_distinct_values_agree_with_postgresql(dsn):
         m.teardown()
 
 
+def test_text_min_max_agree_with_postgresql(dsn):
+    """MIN and MAX of TEXT and VARCHAR columns and of an expression of text
+    (#904, stage M1), alone, per group, in HAVING and over no rows: bytewise,
+    PostgreSQL's order under COLLATE "C", NULLs skipped."""
+    m = fixed(dsn)
+    try:
+        m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.BIGINT), Column("c2", o.TEXT),
+                              Column("c3", o.varchar(6))], ["c0"]))
+        rng = random.Random(904)
+        alphabet = ["a", "B", "z", "Z", "é", "", " ", "ab", "a ", "~", "0"]
+        for c0 in range(1, 41):
+            text = None if rng.random() < 0.15 else "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 3)))
+            short = None if rng.random() < 0.15 else "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 2)))[:6]
+            m.insert("t0", {"c0": c0, "c1": None if c0 % 7 == 0 else c0 % 4, "c2": text, "c3": short}, all_columns=True)
+        for sql in (
+            "SELECT min(c2), max(c2), min(c3), max(c3), count(*) FROM t0 WHERE c0 >= $1",
+            "SELECT max(DISTINCT c2), min(c2 || c3), max(lower(c2)) FROM t0 WHERE c0 >= $1",
+            "SELECT c1, min(c2), max(c3), count(c2) FROM t0 WHERE c0 >= $1 GROUP BY c1 ORDER BY c1",
+            "SELECT c1, max(c2) FROM t0 WHERE c0 >= $1 GROUP BY c1 HAVING max(c2) > 'a' ORDER BY c1",
+        ):
+            m.both(sql, (0,))
+            m.both(sql, (20,))
+            m.both(sql, (100,))  # no row matches
+        m.check()
+    finally:
+        m.teardown()
+
+
 def test_forms_the_layer_does_not_support_are_refused_without_a_sqlstate(dsn):
     """A statement PostgreSQL runs, which the layer refuses as a form it does not
     support, is 42601: the layer claims PostgreSQL's code only where
@@ -3203,7 +3232,6 @@ def test_forms_the_layer_does_not_support_are_refused_without_a_sqlstate(dsn):
             ("SELECT c0 FROM t0 WHERE c2 = $1 AND c6 = $1", (1.5,)),
             ("UPDATE t0 SET c1 = $1 WHERE c6 = $1 AND c0 = $2", (1, 99)),  # PostgreSQL types the WHERE's $1 first
             ("UPDATE t0 SET c6 = c6 + $1 WHERE c0 = $2 AND c2 = $1", (1, 99)),
-            ("SELECT min(c1) FROM t0 WHERE c0 = $1", (1,)),
         ):
             layer = o.run_layer(m.db, sql, params)
             pg = o.run_pg_numbered(m.pg.conn, sql, params)

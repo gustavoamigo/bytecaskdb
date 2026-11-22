@@ -1599,7 +1599,7 @@ auto sql_type_name(SqlType t) -> std::string {
     case SqlKind::Bytea: return "bytea";
     case SqlKind::Text: return "text";
     case SqlKind::Varchar: return "varchar(" + std::to_string(t.length) + ")";
-    case SqlKind::Char: return "char(" + std::to_string(t.length) + ")";
+    case SqlKind::Char: return t.length == 0 ? "bpchar" : "char(" + std::to_string(t.length) + ")";  // of no length: MIN or MAX of a CHAR(n)
     case SqlKind::Name: return "name";
     case SqlKind::Decimal:
       if (t.precision == 0) return "numeric";  // no declared precision: a SUM's result

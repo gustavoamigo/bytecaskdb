@@ -508,6 +508,30 @@ def test_the_jsonb_accessors_describe_as_postgresql_17(server):
     assert states(run(c, "SELECT (v -> 'a')::int FROM jw")) == ["22023"]
 
 
+def test_text_min_and_max_describe_as_postgresql_17(server):
+    """MIN and MAX of text (#904, stage M1): of a VARCHAR text (25), of a
+    CHAR(n) column bpchar of no length (1042, typmod -1), its value padded
+    to the column's n, as PostgreSQL 17 describes and returns them."""
+    c = connect(server)
+    c.send(query("CREATE TABLE mw (k INTEGER PRIMARY KEY, g INTEGER, v VARCHAR(10), ch CHAR(4))"))
+    c.until_ready()
+    sql = "SELECT g, max(v), min(ch) FROM mw WHERE k > $1 GROUP BY g"
+    c.send(parse(sql, "q"), describe("S", "q"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"1tTZ"
+    assert row_description(out[2][1]) == [("g", 23), ("max", 25), ("min", 1042)]
+    body = out[2][1][2:]
+    mods = []
+    for _ in range(3):
+        _, body = body.split(b"\0", 1)
+        mods.append(struct.unpack("!ihihih", body[:18])[4])
+        body = body[18:]
+    assert mods == [-1, -1, -1]
+    assert states(run(c, "INSERT INTO mw VALUES (1, 1, 'b', 'b'), (2, 1, 'a', 'ab'), (3, 1, NULL, NULL)")) == []
+    assert data(run(c, sql, ["0"])) == [["1", "b", "ab  "]]
+    assert data(run(c, "SELECT max(v), min(ch) FROM mw WHERE k > $1", ["5"])) == [[None, None]]
+
+
 def test_a_cast_of_a_cast_parameter_is_named_by_the_outer_type(server):
     """PostgreSQL's FigureColname: a cast's name is its operand's when that
     names it, and an inner cast's is weak, so $1::jsonb::int is int4."""
