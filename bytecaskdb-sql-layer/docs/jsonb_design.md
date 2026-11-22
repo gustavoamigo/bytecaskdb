@@ -1036,17 +1036,13 @@ PG 17's rules per operator:
 
 ### Expressions in WHERE and ON
 
-The `WHERE` of a one-table query compares columns, constants and
-parameters (`Compare`, `sql/ast.cppm:169-189`); "a string function in a
-`WHERE`" and "an expression in … a `WHERE`" are refused today (README).
 `Data->>'scope' = $1` needs an expression operand. That is general work,
-not jsonb's: it lets either side of a comparison, `IS NULL`, `LIKE` and
-`IN` be any value expression the select list takes, evaluated per row as a
-filter after the scan, never as an index key, and lifts the README's
-string-function refusal with it. Its design goes in `frontend_design.md`
-and `planner_design.md` as a short addendum of its own (stage P, about
-1,200 lines, with its own contract row), and stage 3 depends on it for
-`->>` in a `WHERE`.
+not jsonb's, designed as stage P (`frontend_design.md`, *Expressions in
+WHERE, ON and HAVING (stage P)*; `planner_design.md`, *Expression filters
+(stage P)*). Its first stage, P1a, is built: either side of a comparison,
+`IS NULL`, `LIKE`, `IN` and `BETWEEN` may be any value expression the
+select list takes, evaluated per row as a filter, never an index key. Stage
+3's `->>` in a `WHERE` needs nothing more than its select-list kinds.
 
 ### Wire OIDs and formats for jsonb and json
 

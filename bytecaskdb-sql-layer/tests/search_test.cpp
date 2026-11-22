@@ -12,6 +12,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <functional>
+#include <type_traits>
 #include <limits>
 #include <map>
 #include <optional>
@@ -139,20 +141,24 @@ TEST_CASE("search: a shape it does not plan is refused with no plan, never a var
   const auto& t = *f.cat().table({kPublicSchema, "t"});
   const auto& u = *f.cat().table({kPublicSchema, "u"});
 
-  // A conjunct that reads no column stays above the Join pushdown moved the
-  // others from.
-  auto pair = logical::node(logical::Join{get(t), get(u), {}});
-  auto over_join = project(filter(std::move(pair), {logical::compare(Op::Eq, col(t, "id"), p(0)),
-                                                   logical::compare(Op::Eq, col(t, "qty"), col(u, "k")),
-                                                   logical::compare(Op::Eq, p(1), p(2))}),
-                           {col(u, "v")});
-  CHECK(refusal(f.cat(), std::move(over_join), 3) == "no plan: a conjunct that reads no column");
+  // A conjunct that reads no column: pushdown makes it a filter of the
+  // join's left side; left above the Join, the search refuses it.
+  auto over_join = [&] {
+    auto pair = logical::node(logical::Join{get(t), get(u), {}});
+    return project(filter(std::move(pair), {logical::compare(Op::Eq, col(t, "id"), p(0)),
+                                            logical::compare(Op::Eq, col(t, "qty"), col(u, "k")),
+                                            logical::compare(Op::Eq, p(1), p(2))}),
+                   {col(u, "v")});
+  };
+  CHECK(refusal(f.cat(), over_join(), 3) == "accepted");
+  CHECK(refusal(f.cat(), over_join(), 3, false) == "no plan: a conjunct that reads no column");
 
-  // On one table, it stays on the table's Filter.
+  // On one table, it stays on the table's Filter: a filter of every row
+  // alike, never a key's bound.
   auto on_table = project(
       filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0)), logical::compare(Op::Eq, p(1), p(2))}),
       {col(t, "id")});
-  CHECK(refusal(f.cat(), std::move(on_table), 3) == "no plan: a conjunct on t that does not compare one of its columns");
+  CHECK(refusal(f.cat(), std::move(on_table), 3) == "accepted");
 
   // A column compared with another of its own table, outside a join.
   auto two_columns = project(filter(get(t), {logical::compare(Op::Eq, col(t, "id"), p(0)),
@@ -356,15 +362,18 @@ TEST_CASE("rewrite: an input folded to Empty empties the Filter above it; Filter
   logical::rewrite(*root);
   CHECK(std::holds_alternative<logical::Empty>(std::get<logical::Project>(root->op).input->op));
 
-  // Two Filters over a Join, of conjuncts that read no column, become one.
+  // Two Filters over a Join, of conjuncts that read no column, become one,
+  // a filter of the join's left side, whose rows every conjunct of no
+  // column keeps or drops alike.
   auto pair = logical::node(logical::Join{get(t), get(u), {logical::compare(Op::Eq, col(t, "qty"), col(u, "k"))}});
   auto over = project(filter(filter(std::move(pair), {logical::compare(Op::Eq, p(0), p(1))}),
                              {logical::compare(Op::Eq, p(1), p(2))}),
                       {col(u, "k")});
   logical::rewrite(*over);
-  const auto& top = std::get<logical::Filter>(std::get<logical::Project>(over->op).input->op);
-  CHECK(top.conjuncts.size() == 2);
-  CHECK(std::holds_alternative<logical::Join>(top.input->op));
+  const auto& j = std::get<logical::Join>(std::get<logical::Project>(over->op).input->op);
+  const auto& left = std::get<logical::Filter>(j.left->op);
+  CHECK(left.conjuncts.size() == 2);
+  CHECK(std::holds_alternative<logical::Get>(left.input->op));
 }
 
 TEST_CASE("search: costs choose the join order, from the tables' counts", "[sql][search][cost]") {
@@ -1776,4 +1785,77 @@ TEST_CASE("search: joins of up to 32 tables are planned, every order tried up to
   auto g = plan_sql(cat, star, rows);
   INFO(g.source);
   CHECK(occurrences(g.source, "bc_scan_open(") == 1);
+}
+
+TEST_CASE("search: an expression conjunct is a filter in written order, never a key's bound", "[sql][search]") {
+  sql_test::Fixture f;
+  auto ddl = [&](std::string_view sql) { f.ddl(std::get<Ddl>(bound::bind(ast::parse(sql), f.cat()).stmt)); };
+  ddl("CREATE TABLE ex (id INTEGER PRIMARY KEY, a INTEGER, d DECIMAL(10,2), s TEXT)");
+  ddl("CREATE INDEX ex_d ON ex (d)");
+  ddl("CREATE TABLE ey (x INTEGER PRIMARY KEY, y INTEGER)");
+  using K = Expr::Kind;
+  auto planned = [&](std::string_view sql) {
+    auto b = bound::bind(ast::parse(sql), f.cat());
+    auto& root = *std::get<logical::NodePtr>(b.stmt);
+    logical::rewrite(root);
+    return search(root, f.cat());
+  };
+  // The first Filter on the way down from the root, and what it reads.
+  std::function<const physical::Node*(const physical::Node&)> below = [&](const physical::Node& n) -> const physical::Node* {
+    return std::visit(
+        [&](const auto& op) -> const physical::Node* {
+          if constexpr (std::is_same_v<std::decay_t<decltype(op)>, physical::Filter>) {
+            return &n;
+          } else if constexpr (requires { op.input; }) {
+            return below(*op.input);
+          } else {
+            return nullptr;
+          }
+        },
+        n.op);
+  };
+  auto filter_of = [&](const physical::Plan& p) -> const physical::Filter& {
+    const auto* n = below(*p.root);
+    REQUIRE(n != nullptr);
+    return std::get<physical::Filter>(n->op);
+  };
+
+  // Beside a key on the same column: the point lookup, then the filter.
+  auto point = planned("SELECT id FROM ex WHERE id = $1 AND id * 2 = 10");
+  const auto& pf = filter_of(point);
+  REQUIRE(pf.conjuncts.size() == 1);
+  CHECK(pf.conjuncts[0].args[0].kind == K::Mul);
+  CHECK(std::holds_alternative<physical::PointGet>(pf.input->op));
+  // id + 0 = 500: no key, a scan of every row.
+  auto full = planned("SELECT id FROM ex WHERE id + 0 = 500");
+  CHECK_FALSE(std::holds_alternative<physical::PointGet>(filter_of(full).input->op));
+  // d > $1::int: the parameter an INTEGER, the conjunct evaluated, never
+  // ex_d's range, where the DECIMAL's key part would read it at scale 2.
+  auto cast = planned("SELECT id FROM ex WHERE d > $1::int");
+  const auto& cf = filter_of(cast);
+  REQUIRE(cf.conjuncts.size() == 1);
+  CHECK(physical::evaluated(cf.conjuncts[0]));
+  const auto* sc = std::get_if<physical::Scan>(&cf.input->op);
+  CHECK((sc == nullptr || sc->object == sc->table));
+  // a = id + 1 records no computed value; a = $1 + 1 does, as the key's.
+  CHECK(planned("SELECT id FROM ex WHERE a = id + 1").computed.empty());
+  CHECK(planned("SELECT id FROM ex WHERE a = $1 + 1").computed.size() == 1);
+  // The residual in written order: the expression, the comparison the key
+  // does not take, the predicate.
+  auto order = planned("SELECT id FROM ex WHERE a * 2 > 0 AND a = $1 AND s IS NULL");
+  const auto& of = filter_of(order);
+  REQUIRE(of.conjuncts.size() == 3);
+  CHECK(of.conjuncts[0].args[0].kind == K::Mul);
+  CHECK(of.conjuncts[1].args[1].kind == K::Param);
+  CHECK(of.conjuncts[2].kind == K::IsNull);
+  // A conjunct of no column over a join, in an inner and a left ON: a
+  // filter of the leftmost side, every row alike.
+  CHECK(planned("SELECT ex.id FROM ex JOIN ey ON ex.a = ey.x WHERE $1 = $2").root != nullptr);
+  CHECK(planned("SELECT ex.id FROM ex JOIN ey ON ex.a = ey.x AND $1 = $2").root != nullptr);
+  CHECK(planned("SELECT ex.id FROM ex LEFT JOIN ey ON ex.a = ey.x AND $1 = $2").root != nullptr);
+  // A left join's ON expression: of the right side alone, a filter of its
+  // rows; of both, of the pairs.
+  CHECK(planned("SELECT ex.id FROM ex LEFT JOIN ey ON ey.x = ex.a AND 10 / ey.y > 0").root != nullptr);
+  CHECK(planned("SELECT ex.id FROM ex LEFT JOIN ey ON ex.a + 1 = ey.x").root != nullptr);
+  CHECK(planned("SELECT ex.id FROM ex JOIN ey ON lower(ex.s) = 'x' AND ey.y * 2 > ex.a").root != nullptr);
 }

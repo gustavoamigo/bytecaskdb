@@ -1010,12 +1010,13 @@ is the same `Truth` or `InSet` wrap, never a comparison of its own, so its
 parameters are never a key bound or a NULL check of the outer plan, which
 runs before the arguments are set: they are a filter of the outer row.
 
-The run is not printed first. The outer `Filter` prints its conjuncts that
-test no correlated subquery first; then, for each that does, the run for
-the row in hand before its test: each argument set from the row's column
-(`bc_sub_arg_*`, `bc_sub_arg_null` for a NULL), then `bc_sub_begin`,
-`sub<i>` and `bc_sub_end`, as above. A row the earlier conjuncts reject
-runs nothing. Over a one-row aggregate's single row, whose misses join a
+The run is not printed first. The outer `Filter` prints its conjuncts in
+written order (*Expression filters (stage P)*), and for one that tests a
+correlated subquery, the run for the row in hand just before its test:
+each argument set from the row's column (`bc_sub_arg_*`,
+`bc_sub_arg_null` for a NULL), then `bc_sub_begin`, `sub<i>` and
+`bc_sub_end`, as above. A row the earlier conjuncts reject runs nothing,
+and a conjunct written after it is not tried on a row it rejects. Over a one-row aggregate's single row, whose misses join a
 condition instead of ending the plan, the run is in an `if` of that
 condition, so it runs only for a row that is there and has passed. The plan
 API releases what each run sorted, hashed or grouped at its `bc_sub_end`,
@@ -1318,7 +1319,8 @@ subquery's value is one, hidden), `Add`, `Sub`, `Mul`, `Div`, `Compare`,
 
 ### Expression filters (stage P)
 
-Status: **design, approved by the owner on 2026-11-22.** The dialect is
+Status: **P1a built (written conjunct order); P1b, P2 and P3 design,
+approved by the owner on 2026-11-22.** The dialect is
 `frontend_design.md`, *Expressions in WHERE, ON and HAVING (stage P)*:
 which forms, their types, and the order conjuncts are tried in. This
 section is how the planner and codegen run them. **A conjunct whose
@@ -1988,11 +1990,13 @@ with uncompilable C:
 - an operator where the search plans another (`no plan: a Filter over a
   Filter where the search plans a table`, `an Empty where …`, `… where the
   search plans an Aggregate`);
-- a conjunct `use_of` refuses (`no plan: a conjunct on <table> that does
-  not compare one of its columns`, `… compares two columns outside a
-  join` (a column of another table on a table's `Filter`), `a join conjunct
-  that does not compare a column of each side`,
-  `a conjunct that reads no column`, `a predicate (…) that reads no column`);
+- a conjunct of a shape no binder builds (`no plan: a conjunct on <table>
+  compares two columns outside a join` (a column of another table on a
+  table's `Filter`), `a join conjunct that does not compare a column of
+  each side`, `a conjunct that reads no column` left above a Join, `a
+  predicate (…) that reads no column` in a Join's predicate); any other
+  conjunct `use_of` does not take is a filter (*Expression filters (stage
+  P)*);
   a table read twice with no instance for each use; a left outer join whose
   right side holds an outer join; more than 32 tables;
 - a result column that is not an expression of columns of the statement's
@@ -2002,7 +2006,8 @@ with uncompilable C:
   with a parameter;
 - a derived relation of one group whose view query's every plan may end
   before it reads, or whose `WHERE` compares a column with other than a
-  parameter, a constant or a column (*Derived relations*).
+  parameter, a constant or a column and is no evaluated filter (*Derived
+  relations*).
 
 A table no key reaches, an `ORDER BY` no index gives, an `ORDER BY` on a
 join, any NULL placement, a join no key reaches and an `ORDER BY` over a

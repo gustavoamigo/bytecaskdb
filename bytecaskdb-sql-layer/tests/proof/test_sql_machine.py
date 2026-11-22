@@ -283,6 +283,75 @@ def param_value(v):
     return v.value if isinstance(v, Calc) else v
 
 
+def draw_expression(data, t: Table, rows: list[tuple]) -> str | None:
+    """A WHERE conjunct of expressions over t's integer and text columns, the
+    same SQL on both sides (docs/planner_design.md, *Tests of stage P*): an
+    integer column's c % k under +, -, * of small literals, abs, COALESCE and
+    CASE, or a text column under lower, upper, btrim, || and substring;
+    compared with a literal, under IS [NOT] NULL, IN, BETWEEN or LIKE, or
+    now and then with another expression. No / and no operator that leaves
+    its type, so neither side raises (stage P1a). None for a table of no
+    such column."""
+    names = [c.name for c in t.columns]
+    ints = [c.name for c in t.columns if c.type.kind == "int"]
+    texts = [c.name for c in t.columns if c.type.kind == "text"]
+    if not ints and not texts:
+        return None
+    kind = data.draw(st.sampled_from((["int"] if ints else []) + (["text"] if texts else [])), label="expression of")
+
+    def int_value(depth: int) -> str:
+        c = data.draw(st.sampled_from(ints), label="expression column")
+        e = f"({c} % {data.draw(st.integers(2, 9), label='modulus')})"
+        for _ in range(depth):
+            f = data.draw(st.sampled_from(["+", "-", "*", "abs", "coalesce", "case"]), label="operator")
+            n = data.draw(st.integers(-9, 9), label="operand")
+            if f in ("+", "-", "*"):
+                e = f"({e} {f} {n})"
+            elif f == "abs":
+                e = f"abs({e})"
+            elif f == "coalesce":
+                e = f"coalesce({e}, {n})"
+            else:
+                e = f"CASE WHEN {e} > {n} THEN {e} ELSE {n} END"
+        return e
+
+    if kind == "int":
+        e = int_value(data.draw(st.integers(0, 2), label="depth"))
+        n = lambda label: data.draw(st.integers(-30, 30), label=label)  # noqa: E731
+        form = data.draw(st.sampled_from(["=", "<>", "<", ">=", "IS NULL", "IS NOT NULL", "IN", "NOT IN", "BETWEEN",
+                                          "expression"]), label="expression form")
+        if form in ("IS NULL", "IS NOT NULL"):
+            return f"{e} {form}"
+        if form in ("IN", "NOT IN"):
+            return f"{e} {form} ({', '.join(str(n(f'in {i}')) for i in range(data.draw(st.integers(1, 3), label='in size')))})"
+        if form == "BETWEEN":
+            return f"{e} BETWEEN {n('lo')} AND {n('hi')}"
+        if form == "expression":
+            return f"{e} {data.draw(st.sampled_from(['=', '<', '>=']), label='op')} {int_value(1)}"
+        return f"{e} {form} {n('operand')}"
+    c = data.draw(st.sampled_from(texts), label="expression column")
+    e = c
+    for _ in range(data.draw(st.integers(1, 2), label="depth")):
+        f = data.draw(st.sampled_from(["lower", "upper", "btrim", "concat", "substring"]), label="function")
+        if f == "concat":
+            e = f"({e} || 'x')"
+        elif f == "substring":
+            e = f"substring({e} from {data.draw(st.integers(1, 3), label='from')} for {data.draw(st.integers(0, 3), label='for')})"
+        else:
+            e = f"{f}({e})"
+    held = [r[names.index(c)] for r in rows if r[names.index(c)] is not None]
+    text = lambda v: "'" + v.replace("'", "''") + "'"  # noqa: E731
+    lit = lambda label: text(data.draw(st.sampled_from(held) if held else st.text(alphabet="abAB x", max_size=3), label=label))  # noqa: E731
+    form = data.draw(st.sampled_from(["=", "<>", "IS NULL", "IS NOT NULL", "IN", "LIKE", "NOT LIKE"]), label="expression form")
+    if form in ("IS NULL", "IS NOT NULL"):
+        return f"{e} {form}"
+    if form == "IN":
+        return f"{e} IN ({lit('in 0')}, {lit('in 1')})"
+    if form in ("LIKE", "NOT LIKE"):
+        return f"{e} {form} {text(KeylessMachine.draw_pattern(data, held))}"
+    return f"{e} {form} {lit('operand')}"
+
+
 def compared(t: Table, c: str, op: str, v, n: int, pg: bool, qualified: bool = False) -> str:
     """One conjunct's text: column op $n, or op $n ± k for a Calc, which
     PostgreSQL's side types integer, as it types an unknown $n beside an
@@ -556,15 +625,19 @@ class SqlMachine(Sides, RuleBasedStateMachine):
 
     def select(self, name: str, targets: list[str], where: list[tuple[str, str, object]],
                order: list[tuple] = (), limit: int | None = None, count: str | None = None,
-               fn: str = "count", distinct: bool = False, for_update: bool = False) -> None:
+               fn: str = "count", distinct: bool = False, for_update: bool = False, extra: str = "") -> None:
         """SELECT targets (or the aggregate fn(count), "*" for COUNT(*))
-        WHERE each (column, operator, value), none for a full scan, ORDER BY
+        WHERE each (column, operator, value), none for a full scan, and
+        `extra`, a conjunct as SQL text both sides read alike, ORDER BY
         each (column, DESC[, NULLS FIRST]) ... LIMIT ...: on both sides."""
         t = self.tables[name]
         cols = [c for c, _, _ in where]
         select = f"{fn}({'DISTINCT ' if distinct else ''}{count})" if count else ", ".join(targets)
         conds = [compared(t, c, op, v, i + 1, False) for i, (c, op, v) in enumerate(where)]
         pg_conds = [compared(t, c, op, v, i + 1, True) for i, (c, op, v) in enumerate(where)]
+        if extra:
+            conds.append(extra)
+            pg_conds.append(extra)
         tail = (" ORDER BY " + order_text(order) if order else "") + (f" LIMIT {limit}" if limit is not None else "") + (
             " FOR UPDATE" if for_update else "")
         sql = f"SELECT {select} FROM {name}{self.where_text(conds)}{tail}"
@@ -1245,6 +1318,21 @@ class SqlMachine(Sides, RuleBasedStateMachine):
 
     @precondition(lambda self: self.tables)
     @rule(data=st.data())
+    def select_with_expression(self, data):
+        # A key path's conjuncts and an expression conjunct beside them, a
+        # filter of the rows the path reads (stage P1a).
+        t = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
+        rows = o.run_pg(self.pg.conn, t.select_all).rows
+        extra = draw_expression(data, t, list(rows))
+        if extra is None:
+            return
+        where, _, _ = self.where_on_a_path(data, t)
+        names = [c.name for c in t.columns]
+        targets = data.draw(st.lists(st.sampled_from(names), min_size=1, max_size=3, unique=True), label="targets")
+        self.select(t.name, targets, where, extra=extra)
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
     def count_by_key(self, data):
         t = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
         where, _, _ = self.where_on_a_path(data, t)
@@ -1729,12 +1817,16 @@ class KeylessMachine(Sides, RuleBasedStateMachine):
         """A predicate on any columns, as SQL both sides read alike:
         AND, OR and NOT over =, <>, IS [NOT] NULL, [NOT] BETWEEN and [NOT]
         IN, of literals the table holds or NULL, so each is one its column
-        holds exactly."""
+        holds exactly; or of expressions (draw_expression)."""
         if depth > 0 and data.draw(st.integers(0, 2), label="combine?") == 0:
             op = data.draw(st.sampled_from(["AND", "OR", "NOT"]), label="combinator")
             if op == "NOT":
                 return f"NOT ({self.draw_predicate(data, t, depth - 1)})"
             return f"({self.draw_predicate(data, t, depth - 1)}) {op} ({self.draw_predicate(data, t, depth - 1)})"
+        if data.draw(st.integers(0, 3), label="expression?") == 0:
+            e = draw_expression(data, t, self.rows(t))
+            if e is not None:
+                return e
         c = data.draw(st.sampled_from([x.name for x in t.columns]), label="predicate column")
         ty = t.column(c).type
         held = [r[[x.name for x in t.columns].index(c)] for r in self.rows(t)]

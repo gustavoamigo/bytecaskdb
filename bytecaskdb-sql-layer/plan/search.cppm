@@ -214,9 +214,9 @@ auto mirrored(Op op) -> Op {
 }
 
 // The fraction of rows a conjunct keeps, as the cost model assumes it: a
-// predicate's as a range's.
+// predicate's, and an expression's, as a range's.
 auto selectivity(const Expr& c) -> double {
-  return is_compare(c) && c.op == Op::Eq ? kEqSelectivity : kRangeSelectivity;
+  return physical::column_compare(c) && c.op == Op::Eq ? kEqSelectivity : kRangeSelectivity;
 }
 auto selectivity(const Conjuncts& cs) -> double {
   auto s = 1.0;
@@ -227,9 +227,15 @@ auto selectivity(const Conjuncts& cs) -> double {
 // An operand's $n ± k, compared with a column of `table`: its place in the
 // plan's computed values, added if new.
 void add_computed(std::vector<physical::Computed>& comp, const Expr& o, std::uint32_t table) {
-  if (o.kind != Expr::Kind::Add && o.kind != Expr::Kind::Sub) return;
+  if (!physical::is_computed(o)) return;
   auto v = physical::computed_of(o, table);
   if (std::ranges::find(comp, v) == comp.end()) comp.push_back(v);
+}
+// A filter conjunct's $n ± k, where truth prints it as one: an evaluated
+// conjunct's arithmetic is its own, computed per row.
+void add_computed_of(std::vector<physical::Computed>& comp, const Expr& c) {
+  if (physical::evaluated(c) || c.kind != Expr::Kind::Compare) return;
+  add_computed(comp, c.args[1], c.args[0].col.table);
 }
 
 void add_param(std::vector<std::uint32_t>& to, std::uint32_t p) {
@@ -254,19 +260,20 @@ auto columns_compared(const Expr& c) -> bool {
 }
 
 // The one test of a conjunct the search can use, on a table's Filter and in
-// a Join's predicate alike: a column of `here` compared with a parameter, with
-// $n ± k, or with a column of `other`. For a Filter `other` is empty; for a
-// Join's predicate `here` is the side the conjunct's first column is on and
-// `other` the other side, so a column operand is accepted only from the
-// other side of a join, only in its predicate.
+// a Join's predicate alike: a column of `here` compared with a parameter of
+// its type, with $n ± k, or with a column of `other` (physical::
+// column_compare). For a Filter `other` is empty; for a Join's predicate
+// `here` is the side the conjunct's first column is on and `other` the other
+// side, so a column operand is accepted only from the other side of a join,
+// only in its predicate. Any other conjunct is a filter, never a key's bound.
 auto use_of(const Expr& c, const Tables& here, const Tables& other) -> Use {
   if (!is_compare(c) || !reads(here, c.args[0])) return Use::NoColumn;
+  if (!physical::column_compare(c)) return Use::Operand;
   const auto& o = operand_of(c);
   switch (o.kind) {
-    case Expr::Kind::Param: return Use::Ok;
+    case Expr::Kind::Param:
     case Expr::Kind::Add:
-    case Expr::Kind::Sub:
-      return o.args[0].kind == Expr::Kind::Param && o.args[1].kind == Expr::Kind::Const ? Use::Ok : Use::Operand;
+    case Expr::Kind::Sub: return Use::Ok;
     case Expr::Kind::Column: return reads(other, o) ? Use::Ok : Use::Columns;
     case Expr::Kind::Const:
     case Expr::Kind::Mul:
@@ -550,7 +557,10 @@ struct Cross {
 struct Rel {
   std::variant<const logical::Get*, const logical::Derived*> source;
   Conjuncts where;  // its comparisons, which its access paths may take
-  Conjuncts preds;  // its predicates (logical::is_predicate) and comparisons of two of its columns: filters only
+  // Its predicates (logical::is_predicate), comparisons of two of its
+  // columns and every conjunct use_of does not take (an expression's):
+  // filters only.
+  Conjuncts preds;
   bool outer{false};  // the right side of a left outer join of it and the tables before it
   // Outer: the first rel of that right side, a group of one or more rels read
   // one after another in FROM order, inner joins of each other, all
@@ -569,17 +579,32 @@ struct Rel {
     const auto* g = std::get_if<const logical::Get*>(&source);
     return g != nullptr && (*g)->for_update;
   }
+  // Each conjunct in the order the plan wrote it: of `preds` (true) or of
+  // `where`, and its index there.
+  std::vector<std::pair<bool, std::size_t>> written;
+  void add_where(Expr c) {
+    written.emplace_back(false, where.size());
+    where.push_back(std::move(c));
+  }
+  void add_pred(Expr c) {
+    written.emplace_back(true, preds.size());
+    preds.push_back(std::move(c));
+  }
 };
 
-// The conjuncts of rel's WHERE not in `used`, then its predicates, as
-// filters. A filter on a DOUBLE or REAL column compares the row's exact
-// value in PostgreSQL's float8 order (bc_cmp_f64).
+// The conjuncts of rel not in `used` (those its key takes), as filters, in
+// written order (docs/frontend_design.md, *Evaluation order*). A filter on
+// a DOUBLE or REAL column compares the row's exact value in PostgreSQL's
+// float8 order (bc_cmp_f64).
 auto residual(const Rel& rel, const std::vector<const Expr*>& used) -> Conjuncts {
   Conjuncts out;
-  for (const auto& c : rel.where) {
-    if (std::ranges::find(used, &c) == used.end()) out.push_back(c);
+  for (auto [pred, i] : rel.written) {
+    if (pred) {
+      out.push_back(rel.preds[i]);
+    } else if (std::ranges::find(used, &rel.where[i]) == used.end()) {
+      out.push_back(rel.where[i]);
+    }
   }
-  out.insert(out.end(), rel.preds.begin(), rel.preds.end());
   return out;
 }
 
@@ -930,8 +955,6 @@ private:
     return rows;
   }
 
-  auto name_of(const ColumnRef& c) const -> std::string { return table_of(c.table).column(c.col)->name; }
-
   // ------------------------------------------------------------ the source
 
   // The tables the statement reads, in FROM order, each with its conjuncts,
@@ -995,21 +1018,17 @@ private:
         no_plan("a Filter over " + with_article(op_name(*f->input)) + " where the search plans a table");
       }
       const auto& t = g != nullptr ? *g->table : *d->table;
-      Rel rel{g, {}, {}};
+      Rel rel{g, {}, {}, false, 0, {}};
       if (d != nullptr) rel.source = d;
       for (const auto& c : f->conjuncts) {
-        if (logical::is_predicate(c) || columns_compared(c)) {
-          rel.preds.push_back(c);
-          continue;
-        }
-        rel.where.push_back(c);
-        switch (use_of(c, {t.id}, {})) {
-          case Use::Ok: break;
-          case Use::NoColumn: no_plan("a conjunct on " + t.name + " that does not compare one of its columns");
-          case Use::Columns: no_plan("a conjunct on " + t.name + " compares two columns outside a join");
-          case Use::Operand:
-            no_plan("a conjunct on " + t.name + " compares " + name_of(col_of(c)) +
-                    " with an expression the search does not plan yet");
+        // A key may take a comparison use_of takes; any other conjunct is a
+        // filter of the rows the table's access gives.
+        auto use = logical::is_predicate(c) || columns_compared(c) ? Use::Operand : use_of(c, {t.id}, {});
+        if (use == Use::Columns) no_plan("a conjunct on " + t.name + " compares two columns outside a join");
+        if (use == Use::Ok) {
+          rel.add_where(c);
+        } else {
+          rel.add_pred(c);
         }
       }
       add_rel(q, std::move(rel));
@@ -1046,7 +1065,7 @@ private:
       // filter of the right side's rows, as an ON conjunct on the left alone.
       if (c.kind == logical::Expr::Kind::Const) {
         if (!j->left_outer) no_plan("a constant ON conjunct of an inner join");
-        q.rels[right_from].preds.push_back(c);
+        q.rels[right_from].add_pred(c);
         continue;
       }
       std::vector<ColumnRef> cols;
@@ -1065,39 +1084,34 @@ private:
       if (j->left_outer && !cols.empty() &&
           std::ranges::all_of(cols, [&](const ColumnRef& r) { return reads(left, logical::column(r, {})); })) {
         if (single) {
-          q.rels[right_from].preds.push_back(c);
+          q.rels[right_from].add_pred(c);
         } else {
           q.cross.push_back({c, mask, right_from});
-        }
-        continue;
-      }
-      if (logical::is_predicate(c) || (single && columns_compared(c))) {
-        if (cols.empty()) no_plan("a predicate (AND, OR, NOT, IS NULL) that reads no column");
-        // A filter of the one table whose columns it reads; of several, of
-        // their pairs.
-        if (single) {
-          q.rels[q.index_of(cols[0].table)].preds.push_back(c);
-        } else {
-          if (reads_outside) no_plan("a predicate (AND, OR, NOT, IS NULL) over a table the join does not have");
-          q.cross.push_back({c, mask, j->left_outer ? std::optional{right_from} : std::nullopt});
         }
         continue;
       }
       auto on_right = is_compare(c) && reads(right, c.args[0]);
       const auto& here = on_right ? right : left;
       const auto& other = on_right ? left : right;
-      switch (use_of(c, here, other)) {
-        case Use::Ok: break;
-        case Use::NoColumn:
-        case Use::Columns: no_plan("a join conjunct that does not compare a column of each side");
-        case Use::Operand:
-          no_plan("a join conjunct compares " + name_of(col_of(c)) + " with an expression the search does not plan yet");
+      auto use = logical::is_predicate(c) || (single && columns_compared(c)) ? Use::Operand : use_of(c, here, other);
+      if (use == Use::Columns) no_plan("a join conjunct that does not compare a column of each side");
+      if (use != Use::Ok) {
+        // A predicate or an expression: a filter of the one table whose
+        // columns it reads; of several, of their pairs.
+        if (cols.empty()) no_plan("a predicate (AND, OR, NOT, IS NULL) that reads no column");
+        if (single) {
+          q.rels[q.index_of(cols[0].table)].add_pred(c);
+        } else {
+          if (reads_outside) no_plan("a predicate (AND, OR, NOT, IS NULL) over a table the join does not have");
+          q.cross.push_back({c, mask, j->left_outer ? std::optional{right_from} : std::nullopt});
+        }
+        continue;
       }
       // One of its own table's: on that table, as pushdown would put it.
       if (operand_of(c).kind == Expr::Kind::Column) {
         q.on.push_back(c);
       } else {
-        q.rels[q.index_of(col_of(c).table)].where.push_back(c);
+        q.rels[q.index_of(col_of(c).table)].add_where(c);
       }
     }
   }
@@ -1663,7 +1677,7 @@ private:
   // filters and its scan's range.
   static void access_computed(std::vector<physical::Computed>& comp, const Access& a, std::uint32_t table) {
     for (const auto& f : a.filters) {
-      if (is_compare(f)) add_computed(comp, operand_of(f), table);
+      add_computed_of(comp, f);
     }
     const auto* scan = scan_of(a);
     if (scan == nullptr) return;
@@ -1766,7 +1780,7 @@ private:
     for (std::size_t i = 0; i < c.steps.size(); ++i) {
       if (const auto* pr = std::get_if<Probe>(&c.steps[i])) {
         for (const auto& f : pr->filters) {
-          if (is_compare(f)) add_computed(out.computed, operand_of(f), q.rels[pr->rel].table().id);
+          add_computed_of(out.computed, f);
         }
         by_column = by_column || pr->by_column;
       } else {
@@ -1878,7 +1892,7 @@ private:
     // a sort, so a LIMIT counts the rows it keeps.
     if (!q.post.empty()) {
       for (const auto& f : q.post) {
-        if (is_compare(f)) add_computed(out.computed, operand_of(f), col_of(f).table);
+        add_computed_of(out.computed, f);
       }
       out.rows = filtered(std::move(out.rows), q.post);
     }
@@ -2965,10 +2979,11 @@ private:
   // misses) that plan is not taken; none left is a refusal. A constant that
   // is not NULL (never_null_) never ends it, so a filter or range on
   // constants is taken. The WHERE compares the relation's
-  // columns with parameters, constants or each other, or is a predicate.
+  // columns with parameters, constants or each other, or is a predicate or
+  // an expression the Filter evaluates.
   auto derived_rows(const logical::Derived& d, const Conjuncts& where) -> std::vector<Finished> {
     for (const auto& c : where) {
-      if (logical::is_predicate(c) || c.kind == Expr::Kind::Const) continue;
+      if (logical::is_predicate(c) || c.kind == Expr::Kind::Const || physical::evaluated(c)) continue;
       if (!is_compare(c) || c.args[0].kind != Expr::Kind::Column ||
           (operand_of(c).kind != Expr::Kind::Param && operand_of(c).kind != Expr::Kind::Column)) {
         no_plan("a conjunct on a derived relation other than a comparison of its column with a parameter or a column");
