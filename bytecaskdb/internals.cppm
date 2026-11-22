@@ -391,7 +391,9 @@ export [[nodiscard]] inline auto range_prefix_length(
     -> std::size_t {
   const auto c = static_cast<std::size_t>(
       std::ranges::mismatch(from, to).in1 - from.begin());
-  if (c == from.size() || c == to.size()) return c;
+  // One bound is a prefix of the other. With from < to that is `from`; the
+  // min keeps a reversed range from reading past `to`.
+  if (c >= std::min(from.size(), to.size())) return c;
   if (to.size() != c + 1 || std::to_integer<unsigned>(to[c]) !=
                                 std::to_integer<unsigned>(from[c]) + 1)
     return c;

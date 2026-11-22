@@ -59,6 +59,12 @@ jobs:
       BYTECASK_MARCH: x86-64-v3
       XMAKE_ROOT: "y"
     steps:
+      # Before checkout: without git in the container, actions/checkout
+      # downloads a tarball with no .git, and every mutation then fails to
+      # apply as a conflict.
+      - name: Install git
+        run: dnf install -y git
+
       - uses: actions/checkout@v4
         with:
           # The mutations apply by three-way merge, which needs the blobs
@@ -75,7 +81,7 @@ jobs:
             libcxx libcxx-devel libstdc++-static \
             xmake make which \
             python3-pip python3-devel \
-            git ninja-build \
+            ninja-build \
             java-21-openjdk-headless \
             graphviz
           pip3 install nanobind
