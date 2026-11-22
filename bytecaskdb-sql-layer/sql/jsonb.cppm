@@ -18,6 +18,7 @@
 module;
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -27,6 +28,7 @@ module;
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -144,12 +146,86 @@ struct Outcome {
 [[nodiscard]] auto canonical_text(std::string_view text, std::string& out) -> Outcome;
 // A stored value's text, uncharged; Corrupt when it does not decode.
 [[nodiscard]] auto value_text(ByteView value, std::string& out) -> Outcome;
+// An Alloc into a vector, uncharged: for constants folded by the binder.
+[[nodiscard]] auto vector_out(std::vector<std::byte>& v) -> Alloc;
+// A node's text, uncharged; Corrupt when it does not decode.
+[[nodiscard]] auto node_text(ByteView node, std::string& out) -> Outcome;
 // Text parsed into a stored value, uncharged.
 [[nodiscard]] auto parse_value(std::string_view text, std::vector<std::byte>& out) -> Outcome;
 
 // What a call returns for 54001 and the 54000 messages: one place for
 // PostgreSQL's words.
 [[nodiscard]] auto depth_error() -> Error;
+
+// ------------------------------------------------- accessors (stage 3)
+//
+// Each reads only the parts of a node it needs, every one bounds-checked as
+// the walk checks it, so a lookup is O(log n) in an object and O(1) in an
+// array, and a damaged value is Corrupt, never a read outside it. A value
+// found is a slice of its source, with no copy. A node is a jsonb value in
+// its own right: a scalar is PostgreSQL's raw scalar, an array of itself to
+// -> i.
+
+// A node's JSON type, from its tag.
+enum class Type : std::uint8_t { Null, Boolean, Number, String, Array, Object };
+
+// The type of a node; Corrupt for an empty node or an unknown tag.
+[[nodiscard]] auto type_of(ByteView node, Type& type) -> Outcome;
+// jsonb_typeof's name of a type: object, array, string, number, boolean, null.
+[[nodiscard]] auto typeof_name(Type type) -> std::string_view;
+
+// j -> key: the value of `key` in an object node, by binary search over its
+// sorted keys; nullopt for a node that is no object, or has no such key.
+[[nodiscard]] auto field(ByteView node, std::string_view key, std::optional<ByteView>& value) -> Outcome;
+// j -> i: element i of an array node, counted from its end when negative
+// (-1 the last); a scalar is an array of itself. nullopt for an object, or
+// an index outside the array.
+[[nodiscard]] auto element(ByteView node, std::int64_t i, std::optional<ByteView>& value) -> Outcome;
+
+// A path (docs/jsonb_design.md, *Path arguments*): a u32 count, then each
+// element as a u32 length (kPathNull for a NULL element) and its bytes. The
+// empty view is the empty path too.
+inline constexpr std::uint32_t kPathNull = 0xFFFFFFFF;
+// array_in's reading of a text[]'s text, as a path: every dimension read
+// flat, in order. Errors as array_in's: 22P02 "malformed array literal" with
+// its DETAIL, 54000 past 6 dimensions, 2202E for an upper bound below its
+// lower one, 22003 for a bound outside integer.
+[[nodiscard]] auto parse_path(std::string_view text, Alloc out, std::span<std::byte>& path) -> Outcome;
+// The number of elements of a path, or nullopt when its bytes are none:
+// a count or a length past its extent, or bytes after its last element.
+[[nodiscard]] auto path_size(ByteView path) -> std::optional<std::uint32_t>;
+// The size of `path` with one more element (nullopt for NULL), and its
+// writing into `out` of that size: `count` is path_size(path), and `out`
+// may begin where `path` does (the binder grows its path in place).
+[[nodiscard]] auto path_append_size(ByteView path, std::optional<ByteView> element) -> std::size_t;
+void path_append(ByteView path, std::uint32_t count, std::optional<ByteView> element, std::span<std::byte> out);
+// j #> path, as jsonb_get_element walks it: an object takes an element as a
+// key, an array as an integer index (strtoint's text, negative from the
+// end), and a scalar or a NULL element ends the walk with nullopt. The
+// empty path is the node itself. `path` must be one path_size accepts.
+[[nodiscard]] auto at_path(ByteView node, ByteView path, std::optional<ByteView>& value) -> Outcome;
+
+// What ->> and #>> make of a node: SQL NULL for a JSON null, a string's own
+// bytes (checked UTF-8 without a NUL byte), or the node's text otherwise.
+enum class TextForm : std::uint8_t { Null, Bytes, Text };
+[[nodiscard]] auto text_form(ByteView node, TextForm& form, ByteView& bytes) -> Outcome;
+
+// jsonb_array_length: 22023 for a scalar or an object.
+[[nodiscard]] auto array_length(ByteView node, std::int64_t& n) -> Outcome;
+
+// The casts out of jsonb (docs/jsonb_design.md, *Casts to and from jsonb
+// and json*), each 22023 "cannot cast jsonb <type> to type <target>" for a
+// node of another type, `target` as PostgreSQL names the type.
+[[nodiscard]] auto to_bool(ByteView node, bool& v) -> Outcome;
+// A number rounded half away from zero, as numeric_int8 rounds it; nullopt
+// past bigint, the caller's range error.
+[[nodiscard]] auto to_integer(ByteView node, std::string_view target, std::optional<std::int64_t>& v) -> Outcome;
+// A number's text (numeric_out's), into what `out` gives: numeric's value.
+[[nodiscard]] auto to_numeric(ByteView node, std::string_view target, Memory mem, Alloc out, std::span<char>& text) -> Outcome;
+// A number as float8in (or float4in, `real`) reads its text: 22003
+// "\"<text>\" is out of range for type double precision" (real) past the
+// type's range, or below it but zero. A real is its float's value.
+[[nodiscard]] auto to_float(ByteView node, bool real, Memory mem, Alloc out, double& v) -> Outcome;
 
 }  // namespace bytecask::sql::jsonb
 
@@ -1183,38 +1259,65 @@ auto emit_string(ByteView v, std::size_t b, std::size_t e, Sink& out) -> Outcome
   return {};
 }
 
+// A number node's parts, read by the rules of *Decoding a stored jsonb value
+// without overflow*.
+struct Number {
+  std::uint32_t sign{0};  // 0 zero, 1 positive, 2 negative
+  std::uint32_t dscale{0};
+  std::int32_t weight{0};
+  const std::byte* digits{nullptr};
+  std::size_t k{0};
+};
+
+// The parts of the number node at [b, e), every rule checked.
+auto read_number(ByteView v, std::size_t b, std::size_t e, Number& n) -> Outcome {
+  if (e - b < 8) return corrupt("a number shorter than its header");
+  n.sign = std::to_integer<std::uint32_t>(v[b + 1]);
+  n.dscale = rd16(v, b + 2);
+  n.weight = static_cast<std::int32_t>(rd32(v, b + 4));
+  n.k = e - b - 8;
+  n.digits = v.data() + b + 8;
+  if (n.sign > 2) return corrupt("a number of an unknown sign");
+  if (std::int64_t{n.dscale} > kNumericMaxScale) return corrupt("a number's scale past 16383");
+  if (n.sign == 0) {
+    if (n.weight != 0 || n.k != 0) return corrupt("a zero with a weight or digits");
+    return {};
+  }
+  if (n.weight < -kNumericMaxScale || n.weight > kNumericMaxWholeDigits - 1) return corrupt("a number's weight out of range");
+  if (n.k == 0 || n.k > static_cast<std::size_t>(kNumericMaxWholeDigits + kNumericMaxScale)) {
+    return corrupt("a number of no digits or too many");
+  }
+  for (std::size_t i = 0; i < n.k; ++i) {
+    auto c = std::to_integer<unsigned>(n.digits[i]);
+    if (c < '0' || c > '9') return corrupt("a number digit that is not ASCII 0-9");
+  }
+  if (std::to_integer<unsigned>(n.digits[0]) == '0' || std::to_integer<unsigned>(n.digits[n.k - 1]) == '0') {
+    return corrupt("a number with a leading or trailing zero digit");
+  }
+  if (std::int64_t{n.weight} - static_cast<std::int64_t>(n.k) + 1 < -std::int64_t{n.dscale}) {
+    return corrupt("a number whose digits pass its scale");
+  }
+  return {};
+}
+
 // numeric_out's text of a number node at [b, e), after its checks.
 template <typename Sink>
 auto emit_number(ByteView v, std::size_t b, std::size_t e, Sink& out) -> Outcome {
-  if (e - b < 8) return corrupt("a number shorter than its header");
-  auto sign = std::to_integer<std::uint32_t>(v[b + 1]);
-  auto dscale = rd16(v, b + 2);
-  auto weight = static_cast<std::int32_t>(rd32(v, b + 4));
-  auto k = e - b - 8;
-  if (sign > 2) return corrupt("a number of an unknown sign");
-  if (std::int64_t{dscale} > kNumericMaxScale) return corrupt("a number's scale past 16383");
+  Number num;
+  if (auto r = read_number(v, b, e, num); !r.ok()) return r;
+  auto sign = num.sign;
+  auto dscale = num.dscale;
+  auto weight = num.weight;
+  auto k = num.k;
+  const auto* d = num.digits;
   auto fail = [] { return corrupt("text past its length"); };
   if (sign == 0) {
-    if (weight != 0 || k != 0) return corrupt("a zero with a weight or digits");
     if (!out.put('0')) return fail();
     if (dscale > 0 && (!out.put('.') || !out.repeat('0', dscale))) return fail();
     return {};
   }
-  if (weight < -kNumericMaxScale || weight > kNumericMaxWholeDigits - 1) return corrupt("a number's weight out of range");
-  if (k == 0 || k > static_cast<std::size_t>(kNumericMaxWholeDigits + kNumericMaxScale)) {
-    return corrupt("a number of no digits or too many");
-  }
-  const auto* d = v.data() + b + 8;
-  for (std::size_t i = 0; i < k; ++i) {
-    auto c = std::to_integer<unsigned>(d[i]);
-    if (c < '0' || c > '9') return corrupt("a number digit that is not ASCII 0-9");
-  }
-  if (std::to_integer<unsigned>(d[0]) == '0' || std::to_integer<unsigned>(d[k - 1]) == '0') {
-    return corrupt("a number with a leading or trailing zero digit");
-  }
   auto w = std::int64_t{weight};
   auto kk = static_cast<std::int64_t>(k);
-  if (w - kk + 1 < -std::int64_t{dscale}) return corrupt("a number whose digits pass its scale");
   if (sign == 2 && !out.put('-')) return fail();
   if (w >= 0) {
     auto lead = std::min(kk, w + 1);
@@ -1404,20 +1507,725 @@ auto parse_value(std::string_view text, std::vector<std::byte>& out) -> Outcome 
   return parse(text, {}, {&out, vector_alloc}, value);
 }
 
+auto vector_out(std::vector<std::byte>& v) -> Alloc { return {&v, vector_alloc}; }
+
+auto node_text(ByteView node, std::string& out) -> Outcome {
+  std::vector<std::byte> buf;
+  std::span<char> text;
+  auto r = to_text(node, {}, {&buf, vector_alloc}, text);
+  if (r.ok()) out.assign(text.data(), text.size());
+  return r;
+}
+
 auto value_text(ByteView value, std::string& out) -> Outcome {
   auto node = node_of(value);
   if (!node) return corrupt("not a jsonb value of a known format");
-  std::vector<std::byte> buf;
-  std::span<char> text;
-  auto r = to_text(*node, {}, {&buf, vector_alloc}, text);
-  if (r.ok()) out.assign(text.data(), text.size());
-  return r;
+  return node_text(*node, out);
 }
 
 auto canonical_text(std::string_view text, std::string& out) -> Outcome {
   std::vector<std::byte> value;
   if (auto r = parse_value(text, value); !r.ok()) return r;
   return value_text(value, out);
+}
+
+// ------------------------------------------------- accessors (stage 3)
+
+namespace {
+
+// An array or object node's header and tables, checked as the walk checks
+// them, without reading a child.
+struct Container {
+  std::size_t table{0};  // its first end table
+  std::size_t area{0};   // its elements, or its keys
+  std::size_t vals{0};   // an object's values
+  std::size_t e{0};      // its end
+  std::uint32_t n{0};
+  std::uint32_t keys_size{0};
+  bool object{false};
+};
+
+auto open_container(ByteView v, Container& c) -> Outcome {
+  auto e = v.size();
+  if (e < 5) return corrupt("a container shorter than its header");
+  auto tag = std::to_integer<std::uint8_t>(v[0]);
+  c.object = tag == kTagObject;
+  c.n = rd32(v, 1);
+  c.e = e;
+  c.table = 5;
+  auto room = (e - 5) / (c.object ? 9 : 5);
+  if (c.n > room) return corrupt("a container count past its extent");
+  if (c.n == 0 && e != 5) return corrupt("an empty container with trailing bytes");
+  if (c.object) {
+    c.area = 5 + 8 * std::size_t{c.n};
+    c.keys_size = c.n == 0 ? 0 : rd32(v, 5 + 4 * (std::size_t{c.n} - 1));
+    if (c.keys_size > e - c.area) return corrupt("an object's keys past its extent");
+    c.vals = c.area + c.keys_size;
+  } else {
+    c.area = 5 + 4 * std::size_t{c.n};
+  }
+  return {};
+}
+
+// Child i's extent among the children of `area` (an array's elements or an
+// object's values), from the end table at `table`.
+auto child(ByteView v, const Container& c, std::size_t table, std::size_t area, std::uint32_t i, ByteView& out) -> Outcome {
+  auto size = c.e - area;
+  auto prev = i == 0 ? std::uint32_t{0} : rd32(v, table + 4 * (std::size_t{i} - 1));
+  auto cur = rd32(v, table + 4 * std::size_t{i});
+  if (cur <= prev || cur > size || (i + 1 == c.n && cur != size)) return corrupt("an element end out of order or past its area");
+  out = v.subspan(area + prev, cur - prev);
+  return {};
+}
+
+// Key i's bytes.
+auto key_at(ByteView v, const Container& c, std::uint32_t i, ByteView& out) -> Outcome {
+  auto prev = i == 0 ? std::uint32_t{0} : rd32(v, c.table + 4 * (std::size_t{i} - 1));
+  auto cur = rd32(v, c.table + 4 * std::size_t{i});
+  if (cur < prev || cur > c.keys_size) return corrupt("a key end out of order or past its area");
+  out = v.subspan(c.area + prev, cur - prev);
+  return {};
+}
+
+auto tag_of(ByteView node) -> std::optional<std::uint8_t> {
+  if (node.empty()) return std::nullopt;
+  return std::to_integer<std::uint8_t>(node[0]);
+}
+
+// The value of key in an object node: binary search in storage order.
+auto object_field(ByteView v, std::string_view key, std::optional<ByteView>& value) -> Outcome {
+  Container c;
+  if (auto r = open_container(v, c); !r.ok()) return r;
+  std::uint32_t lo = 0;
+  std::uint32_t hi = c.n;
+  auto want = std::as_bytes(std::span{key.data(), key.size()});
+  while (lo < hi) {
+    auto mid = lo + (hi - lo) / 2;
+    ByteView k;
+    if (auto r = key_at(v, c, mid, k); !r.ok()) return r;
+    int cmp = 0;
+    if (k.size() != want.size()) {
+      cmp = k.size() < want.size() ? -1 : 1;
+    } else if (!k.empty()) {
+      cmp = std::memcmp(k.data(), want.data(), k.size());
+    }
+    if (cmp == 0) {
+      ByteView out;
+      if (auto r = child(v, c, c.table + 4 * std::size_t{c.n}, c.vals, mid, out); !r.ok()) return r;
+      value = out;
+      return {};
+    }
+    if (cmp < 0) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  value.reset();
+  return {};
+}
+
+auto array_element(ByteView v, std::int64_t i, std::optional<ByteView>& value) -> Outcome {
+  Container c;
+  if (auto r = open_container(v, c); !r.ok()) return r;
+  auto n = std::int64_t{c.n};
+  if (i < 0) {
+    if (i < -n) {
+      value.reset();
+      return {};
+    }
+    i += n;
+  }
+  if (i >= n) {
+    value.reset();
+    return {};
+  }
+  ByteView out;
+  if (auto r = child(v, c, c.table, c.area, static_cast<std::uint32_t>(i), out); !r.ok()) return r;
+  value = out;
+  return {};
+}
+
+auto is_space(char c) -> bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; }
+
+// strtoint's reading of a path element as an array index: leading space, a
+// sign, digits to the end, inside integer; nullopt otherwise.
+auto path_index(std::string_view s) -> std::optional<std::int32_t> {
+  std::size_t i = 0;
+  while (i < s.size() && is_space(s[i])) ++i;
+  auto negative = false;
+  if (i < s.size() && (s[i] == '+' || s[i] == '-')) negative = s[i++] == '-';
+  if (i >= s.size()) return std::nullopt;
+  std::int64_t v = 0;
+  for (; i < s.size(); ++i) {
+    if (s[i] < '0' || s[i] > '9') return std::nullopt;
+    v = v * 10 + (s[i] - '0');
+    if (v > std::int64_t{1} << 32) v = std::int64_t{1} << 32;  // past every integer, kept from overflowing
+  }
+  if (negative) v = -v;
+  if (v < std::numeric_limits<std::int32_t>::min() || v > std::numeric_limits<std::int32_t>::max()) return std::nullopt;
+  return static_cast<std::int32_t>(v);
+}
+
+auto cannot_cast(Type t, std::string_view target) -> Outcome {
+  std::string_view name;
+  switch (t) {
+    case Type::Null: name = "null"; break;
+    case Type::Boolean: name = "boolean"; break;
+    case Type::Number: name = "numeric"; break;
+    case Type::String: name = "string"; break;
+    case Type::Array: name = "array"; break;
+    case Type::Object: name = "object"; break;
+  }
+  return data({kInvalidParameterValue, "cannot cast jsonb " + std::string{name} + " to type " + std::string{target}, "", "", ""});
+}
+
+// --------------------------------------------------------------- array_in
+
+constexpr int kMaxDim = 6;
+constexpr std::int64_t kMaxArraySize = 134217727;
+
+// PostgreSQL 17's array_in of a text[], each element handed to `put` as
+// its source range and whether it is NULL, quoted (no trimming, every
+// backslash quoting the next byte) or not. A NUL byte ends the text, as in C.
+class ArrayReader {
+public:
+  explicit ArrayReader(std::string_view text) : s_{text} {}
+
+  // Elements in order through put(begin, end, null); the error otherwise.
+  template <typename Put>
+  auto read(Put&& put) -> Outcome {
+    std::array<std::int64_t, kMaxDim> dim{};
+    dim.fill(-1);
+    int ndim = 0;
+    std::size_t p = 0;
+    // Dimensions: [n] or [m:n] items, whitespace between them.
+    for (;;) {
+      while (is_space(at(p))) ++p;
+      if (at(p) != '[') break;
+      ++p;
+      if (ndim >= kMaxDim) return too_many_dims();
+      std::int64_t lb = 1;
+      std::int64_t ub = 0;
+      auto q = p;
+      std::int64_t first = 0;
+      if (auto r = dimension_int(p, first); !r.ok()) return r;
+      if (p == q) return malformed("\"[\" must introduce explicitly-specified array dimensions.");
+      if (at(p) == ':') {
+        lb = first;
+        ++p;
+        q = p;
+        if (auto r = dimension_int(p, ub); !r.ok()) return r;
+        if (p == q) return malformed("Missing array dimension value.");
+      } else {
+        ub = first;
+      }
+      if (at(p) != ']') return malformed("Missing \"]\" after array dimensions.");
+      ++p;
+      if (ub < lb) return data({kArraySubscriptError, "upper bound cannot be less than lower bound", "", "", ""});
+      if (ub == std::numeric_limits<std::int32_t>::max()) {
+        return data({kProgramLimitExceeded, "array upper bound is too large: " + std::to_string(ub), "", "", ""});
+      }
+      auto size = ub - lb + 1;
+      if (size > std::numeric_limits<std::int32_t>::max()) {
+        return data({kProgramLimitExceeded, "array size exceeds the maximum allowed (" + std::to_string(kMaxArraySize) + ")", "", "", ""});
+      }
+      dim[static_cast<std::size_t>(ndim)] = size;
+      ++ndim;
+    }
+    auto specified = ndim != 0;
+    if (!specified) {
+      if (at(p) != '{') return malformed("Array value must start with \"{\" or dimension information.");
+    } else {
+      if (at(p) != '=') return malformed("Missing \"=\" after array dimensions.");
+      ++p;
+      while (is_space(at(p))) ++p;
+      if (at(p) != '{') return malformed("Array contents must start with \"{\".");
+    }
+    // ReadArrayStr's tokens, to the matching close brace.
+    std::array<std::int64_t, kMaxDim> nelems{};
+    int nest = 0;
+    auto frozen = specified;
+    auto expect_delim = false;
+    auto dimension_error = [&] {
+      return malformed(specified ? "Specified array dimensions do not match array contents."
+                                 : "Multidimensional arrays must have sub-arrays with matching dimensions.");
+    };
+    do {
+      Tok tok{};
+      std::size_t b = 0;
+      std::size_t e = 0;
+      auto quoted = false;
+      if (auto r = token(p, tok, b, e, quoted); !r.ok()) return r;
+      switch (tok) {
+        case Tok::LevelStart:
+          if (expect_delim) return malformed("Unexpected \"{\" character.");
+          if (nest >= kMaxDim) return too_many_dims();
+          nelems[static_cast<std::size_t>(nest)] = 0;
+          ++nest;
+          if (nest > ndim) {
+            if (frozen) return dimension_error();
+            ndim = nest;
+          }
+          break;
+        case Tok::LevelEnd: {
+          if (nelems[static_cast<std::size_t>(nest - 1)] > 0 && !expect_delim) return malformed("Unexpected \"}\" character.");
+          --nest;
+          if (nest > 0) ++nelems[static_cast<std::size_t>(nest - 1)];
+          auto& d = dim[static_cast<std::size_t>(nest)];
+          if (d < 0) {
+            d = nelems[static_cast<std::size_t>(nest)];
+          } else if (nelems[static_cast<std::size_t>(nest)] != d) {
+            return dimension_error();
+          }
+          expect_delim = true;
+          break;
+        }
+        case Tok::Delim:
+          if (!expect_delim) return malformed("Unexpected \",\" character.");
+          expect_delim = false;
+          break;
+        case Tok::Elem:
+        case Tok::ElemNull:
+          if (expect_delim) return malformed("Unexpected array element.");
+          if (auto r = put(b, e, tok == Tok::ElemNull, quoted); !r.ok()) return r;
+          frozen = true;
+          if (nest != ndim) return dimension_error();
+          ++nelems[static_cast<std::size_t>(nest - 1)];
+          expect_delim = true;
+          break;
+      }
+    } while (nest > 0);
+    while (p < s_.size() && s_[p] != '\0') {
+      if (!is_space(s_[p++])) return malformed("Junk after closing right brace.");
+    }
+    return {};
+  }
+
+private:
+  enum class Tok : std::uint8_t { LevelStart, LevelEnd, Delim, Elem, ElemNull };
+
+  [[nodiscard]] auto at(std::size_t i) const -> char { return i < s_.size() ? s_[i] : '\0'; }
+
+  [[nodiscard]] auto malformed(const char* detail) const -> Outcome {
+    return data({kInvalidTextRepresentation, "malformed array literal: \"" + std::string{s_.substr(0, std::min(s_.size(), s_.find('\0')))} + "\"",
+                 detail, "", ""});
+  }
+  static auto too_many_dims() -> Outcome {
+    return data({kProgramLimitExceeded, "number of array dimensions exceeds the maximum allowed (6)", "", "", ""});
+  }
+
+  // ReadDimensionInt: strtol's digits, only after a digit or a sign.
+  auto dimension_int(std::size_t& p, std::int64_t& v) const -> Outcome {
+    v = 0;
+    auto c = at(p);
+    if ((c < '0' || c > '9') && c != '-' && c != '+') return {};
+    auto q = p;
+    auto negative = false;
+    if (c == '-' || c == '+') {
+      negative = c == '-';
+      ++q;
+    }
+    if (at(q) < '0' || at(q) > '9') return {};  // strtol reads nothing
+    std::int64_t x = 0;
+    auto big = false;
+    while (at(q) >= '0' && at(q) <= '9') {
+      x = x * 10 + (at(q) - '0');
+      if (x > std::int64_t{1} << 40) {
+        big = true;
+        x = std::int64_t{1} << 40;
+      }
+      ++q;
+    }
+    if (negative) x = -x;
+    if (big || x > std::numeric_limits<std::int32_t>::max() || x < std::numeric_limits<std::int32_t>::min()) {
+      return data({kProgramLimitExceeded, "array bound is out of integer range", "", "", ""});
+    }
+    p = q;
+    v = x;
+    return {};
+  }
+
+  auto ending_error() const -> Outcome { return malformed("Unexpected end of input."); }
+
+  // ReadArrayToken. An element is [b, e) of the source, still escaped.
+  auto token(std::size_t& p, Tok& tok, std::size_t& b, std::size_t& e, bool& quoted) const -> Outcome {
+    for (;;) {
+      auto c = at(p);
+      if (c == '\0') return ending_error();
+      if (c == '{') {
+        ++p;
+        tok = Tok::LevelStart;
+        return {};
+      }
+      if (c == '}') {
+        ++p;
+        tok = Tok::LevelEnd;
+        return {};
+      }
+      if (c == ',') {
+        ++p;
+        tok = Tok::Delim;
+        return {};
+      }
+      if (c == '"') {
+        ++p;
+        quoted = true;
+        b = p;
+        for (;;) {
+          auto d = at(p);
+          if (d == '\0') return ending_error();
+          if (d == '\\') {
+            ++p;
+            if (at(p) == '\0') return ending_error();
+            ++p;
+            continue;
+          }
+          if (d == '"') {
+            e = p;
+            while (at(++p) != '\0') {
+              auto x = at(p);
+              if (x == ',' || x == '}' || x == '{') {
+                tok = Tok::Elem;
+                return {};
+              }
+              if (!is_space(x)) return malformed("Incorrectly quoted array element.");
+            }
+            return ending_error();
+          }
+          ++p;
+        }
+      }
+      if (is_space(c)) {
+        ++p;
+        continue;
+      }
+      break;
+    }
+    // Unquoted: trailing whitespace dropped, an escaped byte never.
+    b = p;
+    e = p;
+    auto escapes = false;
+    for (;;) {
+      auto c = at(p);
+      if (c == '\0') return ending_error();
+      if (c == '{') return malformed("Unexpected \"{\" character.");
+      if (c == '"') return malformed("Incorrectly quoted array element.");
+      if (c == '\\') {
+        ++p;
+        if (at(p) == '\0') return ending_error();
+        ++p;
+        e = p;
+        escapes = true;
+        continue;
+      }
+      if (c == ',' || c == '}') {
+        auto t = s_.substr(b, e - b);
+        auto null = !escapes && t.size() == 4 && (t[0] | 0x20) == 'n' && (t[1] | 0x20) == 'u' && (t[2] | 0x20) == 'l' &&
+                    (t[3] | 0x20) == 'l';
+        tok = null ? Tok::ElemNull : Tok::Elem;
+        return {};
+      }
+      ++p;
+      if (!is_space(c)) e = p;
+    }
+  }
+
+  std::string_view s_;
+};
+
+// An element's bytes, its backslashes taken off: each quotes the next byte.
+template <typename Put>
+void de_backslash(std::string_view src, Put&& put) {
+  for (std::size_t i = 0; i < src.size(); ++i) {
+    if (src[i] == '\\' && i + 1 < src.size()) ++i;
+    put(src[i]);
+  }
+}
+
+// One element of a path read in turn.
+struct PathCursor {
+  ByteView path;
+  std::size_t at{4};
+  // The next element: its bytes, or nullopt for NULL.
+  auto next() -> std::optional<std::string_view> {
+    auto len = rd32(path, at);
+    at += 4;
+    if (len == kPathNull) return std::nullopt;
+    std::string_view out{reinterpret_cast<const char*>(path.data()) + at, len};
+    at += len;
+    return out;
+  }
+};
+
+}  // namespace
+
+auto type_of(ByteView node, Type& type) -> Outcome {
+  auto tag = tag_of(node);
+  if (!tag) return corrupt("an empty node");
+  switch (*tag) {
+    case kTagNull: type = Type::Null; return {};
+    case kTagFalse:
+    case kTagTrue: type = Type::Boolean; return {};
+    case kTagNumber: type = Type::Number; return {};
+    case kTagString: type = Type::String; return {};
+    case kTagArray: type = Type::Array; return {};
+    case kTagObject: type = Type::Object; return {};
+    default: return corrupt("an unknown tag");
+  }
+}
+
+auto typeof_name(Type type) -> std::string_view {
+  switch (type) {
+    case Type::Null: return "null";
+    case Type::Boolean: return "boolean";
+    case Type::Number: return "number";
+    case Type::String: return "string";
+    case Type::Array: return "array";
+    case Type::Object: return "object";
+  }
+  return "null";
+}
+
+auto field(ByteView node, std::string_view key, std::optional<ByteView>& value) -> Outcome {
+  value.reset();
+  Type t{};
+  if (auto r = type_of(node, t); !r.ok()) return r;
+  if (t != Type::Object) return {};
+  return object_field(node, key, value);
+}
+
+auto element(ByteView node, std::int64_t i, std::optional<ByteView>& value) -> Outcome {
+  value.reset();
+  Type t{};
+  if (auto r = type_of(node, t); !r.ok()) return r;
+  switch (t) {
+    case Type::Object: return {};
+    case Type::Array: return array_element(node, i, value);
+    case Type::Null:
+    case Type::Boolean:
+    case Type::Number:
+    case Type::String:
+      if (i == 0 || i == -1) value = node;  // a raw scalar: an array of itself
+      return {};
+  }
+  return {};
+}
+
+auto parse_path(std::string_view text, Alloc out, std::span<std::byte>& path) -> Outcome {
+  ArrayReader reader{text};
+  // Pass 1 sizes the path, pass 2 writes it.
+  std::uint64_t size = 4;
+  std::uint64_t count = 0;
+  auto r = reader.read([&](std::size_t b, std::size_t e, bool null, bool) -> Outcome {
+    ++count;
+    size += 4;
+    if (!null) {
+      std::uint64_t n = 0;
+      de_backslash(text.substr(b, e - b), [&](char) { ++n; });
+      size += n;
+    }
+    return {};
+  });
+  if (!r.ok()) return r;
+  if (size > kMaxText) return data({kProgramLimitExceeded, "a path of more than 1073741823 bytes", "", "", ""});
+  auto* p = out.fn(out.self, static_cast<std::size_t>(size));
+  if (p == nullptr) return refused();
+  put_u32(p, static_cast<std::uint32_t>(count));
+  std::size_t at = 4;
+  (void)reader.read([&](std::size_t b, std::size_t e, bool null, bool) -> Outcome {
+    if (null) {
+      put_u32(p + at, kPathNull);
+      at += 4;
+      return {};
+    }
+    auto len_at = at;
+    at += 4;
+    std::uint32_t n = 0;
+    de_backslash(text.substr(b, e - b), [&](char c) {
+      p[at++] = static_cast<std::byte>(c);
+      ++n;
+    });
+    put_u32(p + len_at, n);
+    return {};
+  });
+  path = {p, static_cast<std::size_t>(size)};
+  return {};
+}
+
+auto path_size(ByteView path) -> std::optional<std::uint32_t> {
+  if (path.empty()) return 0;
+  if (path.size() < 4) return std::nullopt;
+  auto n = rd32(path, 0);
+  std::size_t at = 4;
+  for (std::uint32_t i = 0; i < n; ++i) {
+    if (path.size() - at < 4) return std::nullopt;
+    auto len = rd32(path, at);
+    at += 4;
+    if (len == kPathNull) continue;
+    if (path.size() - at < len) return std::nullopt;
+    at += len;
+  }
+  if (at != path.size()) return std::nullopt;
+  return n;
+}
+
+auto path_append_size(ByteView path, std::optional<ByteView> element) -> std::size_t {
+  auto body = path.empty() ? std::size_t{0} : path.size() - 4;
+  return 4 + body + 4 + (element ? element->size() : 0);
+}
+
+void path_append(ByteView path, std::uint32_t count, std::optional<ByteView> element, std::span<std::byte> out) {
+  auto body = path.empty() ? ByteView{} : path.subspan(4);
+  // memmove: `out` may overlap `path`.
+  if (!body.empty()) std::memmove(out.data() + 4, body.data(), body.size());
+  put_u32(out.data(), count + 1);
+  auto at = 4 + body.size();
+  put_u32(out.data() + at, element ? static_cast<std::uint32_t>(element->size()) : kPathNull);
+  if (element && !element->empty()) std::memcpy(out.data() + at + 4, element->data(), element->size());
+}
+
+auto at_path(ByteView node, ByteView path, std::optional<ByteView>& value) -> Outcome {
+  value.reset();
+  auto n = path_size(path);
+  if (!n) return corrupt("a path that does not decode");
+  Type t{};
+  if (auto r = type_of(node, t); !r.ok()) return r;
+  if (*n == 0) {
+    value = node;
+    return {};
+  }
+  PathCursor cur{path};
+  auto here = node;
+  for (std::uint32_t i = 0; i < *n; ++i) {
+    auto key = cur.next();
+    if (!key) return {};
+    std::optional<ByteView> found;
+    if (t == Type::Object) {
+      if (auto r = object_field(here, *key, found); !r.ok()) return r;
+    } else if (t == Type::Array) {
+      auto index = path_index(*key);
+      if (!index) return {};
+      if (auto r = array_element(here, *index, found); !r.ok()) return r;
+    } else {
+      return {};  // a scalar: no element to extract
+    }
+    if (!found) return {};
+    here = *found;
+    if (auto r = type_of(here, t); !r.ok()) return r;
+  }
+  value = here;
+  return {};
+}
+
+auto text_form(ByteView node, TextForm& form, ByteView& bytes) -> Outcome {
+  Type t{};
+  if (auto r = type_of(node, t); !r.ok()) return r;
+  switch (t) {
+    case Type::Null: form = TextForm::Null; return {};
+    case Type::String: {
+      auto body = node.subspan(1);
+      if (!utf8_valid(reinterpret_cast<const unsigned char*>(body.data()), body.size())) {
+        return corrupt("a string that is not UTF-8 or holds a NUL byte");
+      }
+      form = TextForm::Bytes;
+      bytes = body;
+      return {};
+    }
+    case Type::Boolean:
+    case Type::Number:
+    case Type::Array:
+    case Type::Object: form = TextForm::Text; return {};
+  }
+  return {};
+}
+
+auto array_length(ByteView node, std::int64_t& n) -> Outcome {
+  Type t{};
+  if (auto r = type_of(node, t); !r.ok()) return r;
+  if (t == Type::Object) return data({kInvalidParameterValue, "cannot get array length of a non-array", "", "", ""});
+  if (t != Type::Array) return data({kInvalidParameterValue, "cannot get array length of a scalar", "", "", ""});
+  Container c;
+  if (auto r = open_container(node, c); !r.ok()) return r;
+  n = c.n;
+  return {};
+}
+
+auto to_bool(ByteView node, bool& v) -> Outcome {
+  Type t{};
+  if (auto r = type_of(node, t); !r.ok()) return r;
+  if (t != Type::Boolean) return cannot_cast(t, "boolean");
+  if (node.size() != 1) return corrupt("a null or boolean longer than its tag");
+  v = std::to_integer<std::uint8_t>(node[0]) == kTagTrue;
+  return {};
+}
+
+auto to_integer(ByteView node, std::string_view target, std::optional<std::int64_t>& v) -> Outcome {
+  Type t{};
+  if (auto r = type_of(node, t); !r.ok()) return r;
+  if (t != Type::Number) return cannot_cast(t, target);
+  Number num;
+  if (auto r = read_number(node, 0, node.size(), num); !r.ok()) return r;
+  v = 0;
+  if (num.sign == 0 || num.weight < -1) return {};
+  if (num.weight >= 19) {
+    v.reset();
+    return {};
+  }
+  auto digit = [&](std::int64_t i) -> unsigned {
+    return i < static_cast<std::int64_t>(num.k) ? std::to_integer<unsigned>(num.digits[i]) - '0' : 0;
+  };
+  unsigned __int128 mag = 0;
+  for (std::int64_t i = 0; i <= num.weight; ++i) mag = mag * 10 + digit(i);
+  if (digit(std::int64_t{num.weight} + 1) >= 5) mag += 1;
+  constexpr auto kTop = static_cast<unsigned __int128>(std::numeric_limits<std::int64_t>::max());
+  if (num.sign == 2) {
+    if (mag > kTop + 1) {
+      v.reset();
+    } else if (mag == kTop + 1) {
+      v = std::numeric_limits<std::int64_t>::min();
+    } else {
+      v = -static_cast<std::int64_t>(mag);
+    }
+  } else if (mag > kTop) {
+    v.reset();
+  } else {
+    v = static_cast<std::int64_t>(mag);
+  }
+  return {};
+}
+
+auto to_numeric(ByteView node, std::string_view target, Memory mem, Alloc out, std::span<char>& text) -> Outcome {
+  Type t{};
+  if (auto r = type_of(node, t); !r.ok()) return r;
+  if (t != Type::Number) return cannot_cast(t, target);
+  return to_text(node, mem, out, text);
+}
+
+auto to_float(ByteView node, bool real, Memory mem, Alloc out, double& v) -> Outcome {
+  std::span<char> text;
+  if (auto r = to_numeric(node, real ? "real" : "double precision", mem, out, text); !r.ok()) return r;
+  const auto* b = text.data();
+  const auto* e = text.data() + text.size();
+  auto range = [&] {
+    return data({kNumericValueOutOfRange,
+                 "\"" + std::string{text.data(), text.size()} + "\" is out of range for type " + (real ? "real" : "double precision"),
+                 "", "", ""});
+  };
+  if (real) {
+    float f = 0;
+    auto [end, ec] = std::from_chars(b, e, f);
+    if (ec == std::errc::result_out_of_range) return range();
+    if (ec != std::errc{} || end != e) return corrupt("a number whose text is no float");
+    v = static_cast<double>(f);
+    return {};
+  }
+  double d = 0;
+  auto [end, ec] = std::from_chars(b, e, d);
+  if (ec == std::errc::result_out_of_range) return range();
+  if (ec != std::errc{} || end != e) return corrupt("a number whose text is no float");
+  v = d;
+  return {};
 }
 
 }  // namespace bytecask::sql::jsonb

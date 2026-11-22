@@ -294,6 +294,7 @@ auto use_of(const Expr& c, const Tables& here, const Tables& other) -> Use {
     case Expr::Kind::TextFn:
     case Expr::Kind::Extract:
     case Expr::Kind::JsonbCast:
+    case Expr::Kind::Jsonb:
     case Expr::Kind::Mod:
     case Expr::Kind::Neg:
     case Expr::Kind::Abs:
@@ -2371,6 +2372,7 @@ private:
         case Expr::Kind::TextFn:
         case Expr::Kind::Extract:
         case Expr::Kind::JsonbCast:
+        case Expr::Kind::Jsonb:
         case Expr::Kind::Mod:
         case Expr::Kind::Neg:
         case Expr::Kind::Abs:

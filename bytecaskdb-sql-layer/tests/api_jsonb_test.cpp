@@ -152,7 +152,10 @@ TEST_CASE("embedded API jsonb: what stage 1 refuses, each with PostgreSQL's SQLS
            Refusal{"CREATE TABLE k1 (v jsonb PRIMARY KEY)", "0A000"},
            Refusal{"CREATE TABLE k2 (id INTEGER PRIMARY KEY, v jsonb UNIQUE)", "0A000"},
            Refusal{"CREATE INDEX j_v ON j (v)", "0A000"},
-           // Operators and functions: stages 3 and 4; json: stage 1c.
+           // Operators and functions: stage 4; json: stage 1c; a cast to a
+           // DECIMAL(p, s).
+           Refusal{"SELECT v::numeric(10,2) FROM j", "0A000"},
+           Refusal{"SELECT '1'::jsonb::numeric(10,2)", "0A000"},
            Refusal{"SELECT v - 'a' FROM j", "0A000"},
            Refusal{"SELECT v || '[1]' FROM j", "0A000"},
            Refusal{"SELECT '[1]'::jsonb || '[2]'", "0A000"},
@@ -164,17 +167,10 @@ TEST_CASE("embedded API jsonb: what stage 1 refuses, each with PostgreSQL's SQLS
            Refusal{"SELECT '[1,2]'::jsonb - 1::smallint", "0A000"},
            Refusal{"SELECT '1'::jsonb - 'a'", "0A000"},
            Refusal{"SELECT '1'::jsonb - 'a'::text", "0A000"},
-           Refusal{"SELECT v -> 'a' FROM j", "0A000"},
-           Refusal{"SELECT '{\"a\":1}'::jsonb ->> 'a'", "0A000"},
-           Refusal{"SELECT v #> '{a}' FROM j", "0A000"},
            Refusal{"SELECT id FROM j WHERE v @> '{}'", "0A000"},
            Refusal{"SELECT id FROM j WHERE v ? 'a'", "0A000"},
-           Refusal{"SELECT jsonb_typeof(v) FROM j", "0A000"},
            Refusal{"SELECT to_jsonb(1)", "0A000"},
-           Refusal{"SELECT id FROM j WHERE jsonb_typeof(v) = 'object'", "0A000"},
            Refusal{"UPDATE j SET s = v", "0A000"},
-           Refusal{"SELECT v::integer FROM j", "0A000"},
-           Refusal{"SELECT '1'::jsonb::boolean", "0A000"},
            Refusal{"SELECT v::varchar(3) FROM j", "0A000"},
            Refusal{"CREATE TABLE k3 (v json)", "0A000"},
            Refusal{"SELECT '1'::json", "0A000"},
@@ -183,6 +179,24 @@ TEST_CASE("embedded API jsonb: what stage 1 refuses, each with PostgreSQL's SQLS
            Refusal{"INSERT INTO j (id, s) SELECT 1, v FROM j", "0A000"},
            // PostgreSQL's own refusals.
            Refusal{"SELECT v + 1 FROM j", "42883"},
+           // The accessors' resolution: stage 3 (docs/jsonb_design.md).
+           Refusal{"SELECT v -> 1::bigint FROM j", "42883"},
+           Refusal{"SELECT v -> 1.5 FROM j", "42883"},
+           Refusal{"SELECT v -> true FROM j", "42883"},
+           Refusal{"SELECT s -> 'a' FROM j", "42883"},
+           Refusal{"SELECT v #> 'a'::text FROM j", "42883"},
+           Refusal{"SELECT v #> ARRAY[1] FROM j", "42883"},
+           Refusal{"SELECT $1 -> 'a'", "42725"},
+           Refusal{"SELECT '{}' -> 'a'", "42725"},
+           Refusal{"SELECT '[1]' -> 0", "42725"},
+           Refusal{"SELECT jsonb_typeof(n) FROM j", "42883"},
+           Refusal{"SELECT jsonb_typeof(1)", "42883"},
+           Refusal{"SELECT v #> ARRAY[] FROM j", "42P18"},
+           Refusal{"SELECT v #> 'a' FROM j", "22P02"},
+           Refusal{"SELECT '[1]'::jsonb #> '{{a},{b,c}}'", "22P02"},
+           Refusal{"SELECT jsonb_array_length('{}')", "22023"},
+           Refusal{"SELECT '\"x\"'::jsonb::integer", "22023"},
+           Refusal{"SELECT '1e10'::jsonb::integer", "22003"},
            Refusal{"SELECT max(v) FROM j", "42883"},
            Refusal{"SELECT sum(v) FROM j", "42883"},
            Refusal{"SELECT id FROM j WHERE v = 1", "42883"},
@@ -242,4 +256,31 @@ TEST_CASE("embedded API jsonb: an assignment refusal reads as PostgreSQL's, with
   CHECK(state_of(*db, "INSERT INTO j (id, c) VALUES (4, '[1]'::jsonb)") == "22001");
   // jsonb || a typed text is text concatenation, as PostgreSQL's anynonarray || text.
   CHECK(db->execute("SELECT '[1]'::jsonb || 'a'::text").rows == Grid{{t("[1]a")}});
+}
+
+TEST_CASE("embedded API jsonb: the accessors and casts out of columns, parameters and constants (stage 3)", "[sql][api][jsonb]") {
+  sql_test::TempDir dir{"api_jsonb_accessors"};
+  auto db = Database::open(dir.path());
+  db->execute("CREATE TABLE j (id INTEGER PRIMARY KEY, v jsonb, s TEXT, n INTEGER)");
+  db->execute(R"(INSERT INTO j VALUES (1, '{"a": {"b": [1, "x"]}, "k": "v"}', 'k', 1), (2, '[10, 20.5]', 'a', -1), (3, NULL, 'k', 0))");
+  CHECK(db->execute("SELECT id, v -> 'a' ->> 'b', v ->> s, v -> n FROM j ORDER BY id").rows ==
+        Grid{{i(1), t("[1, \"x\"]"), t("v"), kNull}, {i(2), kNull, kNull, t("20.5")}, {i(3), kNull, kNull, kNull}});
+  // In WHERE, an evaluated filter; $n typed text, its path text[].
+  const auto& q = db->prepare("SELECT id FROM j WHERE v ->> 'k' = $1 OR v #>> $2 = '1'");
+  CHECK(q.param_types() == std::vector<PhysType>{PhysType::Bytes, PhysType::Bytes});
+  CHECK(q.params()[1].path);
+  CHECK_FALSE(q.params()[0].path);
+  CHECK(db->execute(q, {t("v"), t("{a,b,0}")}).rows == Grid{{i(1)}});
+  CHECK(db->execute(q, {t("w"), t("{0}")}).rows.empty());
+  CHECK(db->execute("SELECT id FROM j WHERE v #> ARRAY['a', $1] IS NOT NULL", {t("b")}).rows == Grid{{i(1)}});
+  CHECK(db->execute("SELECT jsonb_typeof(v), jsonb_array_length(v -> 'a' -> 'b') FROM j WHERE id = 1").rows ==
+        Grid{{t("object"), i(2)}});
+  CHECK(db->execute("SELECT (v -> 1)::integer, (v -> 0)::bigint FROM j WHERE id = 2").rows == Grid{{i(21), i(10)}});
+  CHECK(db->execute("SELECT sum((v -> 0)::integer) FROM j").rows == Grid{{i(10)}});
+  CHECK(db->execute("SELECT id FROM j ORDER BY v ->> 'k', id").rows == Grid{{i(1)}, {i(2)}, {i(3)}});
+  // Constants are folded, as PostgreSQL folds them.
+  CHECK(db->execute(R"(SELECT '{"a":[1,2]}'::jsonb #>> '{a,-1}', '5'::jsonb -> 0, '1.5'::jsonb::integer)").rows ==
+        Grid{{t("2"), t("5"), i(2)}});
+  CHECK(state_of(*db, "SELECT (v -> 'a')::integer FROM j") == "22023");
+  CHECK(state_of(*db, "SELECT v #> $1 FROM j", {t("a")}) == "22P02");
 }

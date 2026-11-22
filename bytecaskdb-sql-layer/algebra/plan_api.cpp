@@ -5593,6 +5593,311 @@ bc_view bc_jsonb_text(bc_ctx* cx, bc_jsonb j) {
   return {};
 }
 
+// ------------------------------------------------------ jsonb accessors
+
+extern "C++" {
+namespace {
+
+// A jsonb handle's node and its owner, for a slice that shares its lifetime.
+struct JsonbIn {
+  BytesView node;
+  std::uint32_t cursor{kNoCursor};
+  std::uint64_t step{0};
+};
+
+auto jsonb_arg(bc_ctx* cx, bc_jsonb j) -> std::optional<JsonbIn> {
+  if (!cx->ok()) return std::nullopt;
+  auto node = cx->resolve_jsonb(j);
+  if (!node) return std::nullopt;
+  auto [cursor, step] = cx->owner(bc_view{j.i, j.g});
+  return JsonbIn{*node, cursor, step};
+}
+
+template <typename T>
+auto out_arg(bc_ctx* cx, T* out) -> bool {
+  if (out != nullptr) return true;
+  cx->fail(BC_E_HANDLE, "a jsonb accessor's out pointer is NULL");
+  return false;
+}
+
+// A found node into *out: a slice of the source, with its owner.
+auto give_node(bc_ctx* cx, const JsonbIn& src, const std::optional<BytesView>& found, bc_jsonb* out) -> bool {
+  if (!found) return false;
+  auto h = cx->make_jsonb(found->data(), found->size(), src.cursor, src.step);
+  if (!cx->ok()) return false;
+  *out = h;
+  return true;
+}
+
+// ->> of a found node into *out: NULL for a JSON null, a string's own bytes,
+// or the node's text in the step's arena.
+auto give_text(bc_ctx* cx, const JsonbIn& src, const std::optional<BytesView>& found, bc_view* out) -> bool {
+  if (!found) return false;
+  jsonb::TextForm form{};
+  BytesView bytes;
+  if (auto r = jsonb::text_form(*found, form, bytes); !r.ok()) {
+    fail_jsonb(cx, r);
+    return false;
+  }
+  switch (form) {
+    case jsonb::TextForm::Null: return false;
+    case jsonb::TextForm::Bytes: {
+      auto v = cx->make_view(bytes.data(), bytes.size(), src.cursor, src.step);
+      if (!cx->ok()) return false;
+      *out = v;
+      return true;
+    }
+    case jsonb::TextForm::Text: {
+      ArenaOut arena{cx, &cx->arena};
+      std::span<char> text;
+      if (auto r = jsonb::to_text(*found, jsonb_memory(cx), {&arena, ArenaOut::alloc}, text); !r.ok()) {
+        fail_jsonb(cx, r);
+        return false;
+      }
+      auto v = cx->make_view(reinterpret_cast<const std::byte*>(text.data()), text.size());
+      if (!cx->ok()) return false;
+      *out = v;
+      return true;
+    }
+  }
+  return false;
+}
+
+auto lookup_field(bc_ctx* cx, const JsonbIn& src, bc_view key, std::optional<BytesView>& found) -> bool {
+  auto k = cx->resolve(key);
+  if (!k || !cx->ok()) return false;
+  if (auto r = jsonb::field(src.node, text_of(*k), found); !r.ok()) {
+    fail_jsonb(cx, r);
+    return false;
+  }
+  return true;
+}
+
+auto lookup_element(bc_ctx* cx, const JsonbIn& src, std::int64_t i, std::optional<BytesView>& found) -> bool {
+  if (auto r = jsonb::element(src.node, i, found); !r.ok()) {
+    fail_jsonb(cx, r);
+    return false;
+  }
+  return true;
+}
+
+auto lookup_path(bc_ctx* cx, const JsonbIn& src, bc_view path, std::optional<BytesView>& found) -> bool {
+  auto p = cx->resolve(path);
+  if (!p || !cx->ok()) return false;
+  if (!jsonb::path_size(*p)) {
+    cx->fail(BC_E_HANDLE, "a view that is no jsonb path: a path comes from bc_jsonb_path_in or bc_jsonb_path_add");
+    return false;
+  }
+  if (auto r = jsonb::at_path(src.node, *p, found); !r.ok()) {
+    fail_jsonb(cx, r);
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+}  // extern "C++"
+
+bool bc_jsonb_field(bc_ctx* cx, bc_jsonb j, bc_view key, bc_jsonb* out) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src || !out_arg(cx, out)) return false;
+  std::optional<BytesView> found;
+  return lookup_field(cx, *src, key, found) && give_node(cx, *src, found, out);
+  BC_GUARD_END(cx)
+  return false;
+}
+
+bool bc_jsonb_field_text(bc_ctx* cx, bc_jsonb j, bc_view key, bc_view* out) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src || !out_arg(cx, out)) return false;
+  std::optional<BytesView> found;
+  return lookup_field(cx, *src, key, found) && give_text(cx, *src, found, out);
+  BC_GUARD_END(cx)
+  return false;
+}
+
+bool bc_jsonb_element(bc_ctx* cx, bc_jsonb j, int64_t i, bc_jsonb* out) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src || !out_arg(cx, out)) return false;
+  std::optional<BytesView> found;
+  return lookup_element(cx, *src, i, found) && give_node(cx, *src, found, out);
+  BC_GUARD_END(cx)
+  return false;
+}
+
+bool bc_jsonb_element_text(bc_ctx* cx, bc_jsonb j, int64_t i, bc_view* out) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src || !out_arg(cx, out)) return false;
+  std::optional<BytesView> found;
+  return lookup_element(cx, *src, i, found) && give_text(cx, *src, found, out);
+  BC_GUARD_END(cx)
+  return false;
+}
+
+bc_view bc_jsonb_path_in(bc_ctx* cx, bc_view text) {
+  BC_GUARD_BEGIN
+  auto t = cx->resolve(text);
+  if (!t || !cx->ok()) return {};
+  ArenaOut out{cx, &cx->arena};
+  std::span<std::byte> path;
+  if (auto r = jsonb::parse_path(text_of(*t), {&out, ArenaOut::alloc}, path); !r.ok()) {
+    fail_jsonb(cx, r);
+    return {};
+  }
+  return cx->make_view(path.data(), path.size());
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_view bc_jsonb_path_add(bc_ctx* cx, bc_view path, bc_view element, bool null) {
+  BC_GUARD_BEGIN
+  auto p = cx->resolve(path);
+  auto e = null ? std::optional<BytesView>{BytesView{}} : cx->resolve(element);
+  if (!p || !e || !cx->ok()) return {};
+  auto n = jsonb::path_size(*p);
+  if (!n || *n == std::numeric_limits<std::uint32_t>::max()) {
+    cx->fail(BC_E_HANDLE, "a view that is no jsonb path: a path comes from bc_jsonb_path_in or bc_jsonb_path_add");
+    return {};
+  }
+  if (!null && e->size() >= jsonb::kPathNull) {
+    cx->fail(BC_E_DATA, bytecask::sql::kProgramLimitExceeded, "a path element of more than 4294967294 bytes");
+    return {};
+  }
+  auto element_bytes = null ? std::nullopt : std::optional<BytesView>{*e};
+  auto size = jsonb::path_append_size(*p, element_bytes);
+  if (!cx->take(size)) return {};
+  auto* d = cx->arena.alloc(size);
+  jsonb::path_append(*p, *n, element_bytes, {d, size});
+  return cx->make_view(d, size);
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bool bc_jsonb_path(bc_ctx* cx, bc_jsonb j, bc_view path, bc_jsonb* out) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src || !out_arg(cx, out)) return false;
+  std::optional<BytesView> found;
+  return lookup_path(cx, *src, path, found) && give_node(cx, *src, found, out);
+  BC_GUARD_END(cx)
+  return false;
+}
+
+bool bc_jsonb_path_text(bc_ctx* cx, bc_jsonb j, bc_view path, bc_view* out) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src || !out_arg(cx, out)) return false;
+  std::optional<BytesView> found;
+  return lookup_path(cx, *src, path, found) && give_text(cx, *src, found, out);
+  BC_GUARD_END(cx)
+  return false;
+}
+
+bc_view bc_jsonb_typeof(bc_ctx* cx, bc_jsonb j) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src) return {};
+  jsonb::Type t{};
+  if (auto r = jsonb::type_of(src->node, t); !r.ok()) {
+    fail_jsonb(cx, r);
+    return {};
+  }
+  auto name = jsonb::typeof_name(t);
+  return cx->arena_view(std::as_bytes(std::span{name.data(), name.size()}));
+  BC_GUARD_END(cx)
+  return {};
+}
+
+int64_t bc_jsonb_array_length(bc_ctx* cx, bc_jsonb j) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src) return 0;
+  std::int64_t n = 0;
+  if (auto r = jsonb::array_length(src->node, n); !r.ok()) {
+    fail_jsonb(cx, r);
+    return 0;
+  }
+  return n;
+  BC_GUARD_END(cx)
+  return 0;
+}
+
+bool bc_jsonb_to_bool(bc_ctx* cx, bc_jsonb j) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src) return false;
+  auto v = false;
+  if (auto r = jsonb::to_bool(src->node, v); !r.ok()) {
+    fail_jsonb(cx, r);
+    return false;
+  }
+  return v;
+  BC_GUARD_END(cx)
+  return false;
+}
+
+int64_t bc_jsonb_to_i64(bc_ctx* cx, bc_jsonb j, uint32_t int_type, uint32_t object_id) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src) return 0;
+  const char* target = nullptr;
+  switch (int_type) {
+    case BC_SMALLINT: target = "smallint"; break;
+    case BC_INTEGER: target = "integer"; break;
+    case BC_BIGINT: target = "bigint"; break;
+    default: cx->fail(BC_E_HANDLE, "bc_jsonb_to_i64: an unknown integer type"); return 0;
+  }
+  std::optional<std::int64_t> v;
+  if (auto r = jsonb::to_integer(src->node, target, v); !r.ok()) {
+    fail_jsonb(cx, r);
+    return 0;
+  }
+  if (!v) {
+    cx->raise(BC_C_RANGE, object_id, std::string{target} + " out of range");
+    return 0;
+  }
+  return bc_check_int(cx, *v, int_type, object_id);
+  BC_GUARD_END(cx)
+  return 0;
+}
+
+double bc_jsonb_to_f64(bc_ctx* cx, bc_jsonb j, bool real) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src) return 0.0;
+  // The number's text, read and released: the value is all that is kept.
+  BufferOut out{cx, {}};
+  double v = 0;
+  auto r = jsonb::to_float(src->node, real, jsonb_memory(cx), {&out, BufferOut::alloc}, v);
+  cx->release(out.held);
+  if (!r.ok()) {
+    fail_jsonb(cx, r);
+    return 0.0;
+  }
+  return v;
+  BC_GUARD_END(cx)
+  return 0.0;
+}
+
+bc_view bc_jsonb_to_num(bc_ctx* cx, bc_jsonb j) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src) return {};
+  ArenaOut out{cx, &cx->arena};
+  std::span<char> text;
+  if (auto r = jsonb::to_numeric(src->node, "numeric", jsonb_memory(cx), {&out, ArenaOut::alloc}, text); !r.ok()) {
+    fail_jsonb(cx, r);
+    return {};
+  }
+  return cx->make_view(reinterpret_cast<const std::byte*>(text.data()), text.size());
+  BC_GUARD_END(cx)
+  return {};
+}
+
 bc_view bc_number_text(bc_ctx* cx, int64_t v, uint32_t scale) {
   BC_GUARD_BEGIN
   if (scale > 18) {
@@ -6483,6 +6788,7 @@ int64_t bc_check_int(bc_ctx* cx, int64_t v, uint32_t int_type, uint32_t object_i
       if (v >= INT32_MIN && v <= INT32_MAX) return v;
       cx->raise(BC_C_RANGE, object_id, "integer out of range");
       return 0;
+    case BC_BIGINT: return v;
     default: cx->fail(BC_E_HANDLE, "bc_check_int: an unknown integer type"); return 0;
   }
   BC_GUARD_END(cx)

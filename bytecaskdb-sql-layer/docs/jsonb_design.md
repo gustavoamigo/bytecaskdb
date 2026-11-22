@@ -2,12 +2,14 @@
 
 Status: **design, approved by the owner on 2026-11-21 with these
 answers: Q1 binary, Q2–Q3, Q5, Q7–Q11 as recommended; Q4 and Q6 deferred
-to the next phase.** Stages 0 and 1 are built: runtime errors carry their
-SQLSTATE, DETAIL, HINT and CONTEXT (`BC_E_DATA`, plan API revision 20), and
+to the next phase.** Stages 0, 1, 3 built: runtime errors carry their
+SQLSTATE, DETAIL, HINT and CONTEXT (`BC_E_DATA`, plan API revision 20);
 the jsonb column type with its text in and out, casts with text, `DEFAULT`,
 `IS [NOT] NULL`, `COUNT`, `CASE` and `COALESCE` (`sql/jsonb.cppm`, plan API
-revision 21; *Stages of jsonb*, stage 1, says what it built and how it
-differs from this design). Stages 1b, 1c and 2 to 6 are not built.
+revision 21); and the accessors `->`, `->>`, `#>`, `#>>`, `jsonb_typeof`,
+`jsonb_array_length` and the casts to `boolean` and the numbers (plan API
+revision 22). *Stages of jsonb* says what each built and how it differs
+from this design. Stages 1b, 1c, 2 and 4 to 6 are not built.
 
 This document covers PostgreSQL's `jsonb` type, and `json` where it is
 cheap: what the layer matches exactly, how a value is stored, the plan API
@@ -1422,6 +1424,50 @@ estimates of changed lines, code and tests.
   checked reads, not a text scanner). Parser and binder operators, path
   arguments, `bc_jsonb_field` and the rest; `->>` in a `WHERE` needs stage
   P. Revision 22.
+  **As built.** Everything above, revision 22, with these choices the code
+  made:
+  - The lookups are `sql/jsonb.cppm`'s `field`, `element` and `at_path`,
+    each reading only the header and the end tables it needs, checked as
+    the walk checks them (a count past its extent, an end out of order or
+    past its area, a key end below its predecessor on the search); the
+    found node is a slice. `text_form` gives `->>`'s three outcomes, a
+    string's bytes checked UTF-8. A slice from a row shares the row's
+    owner, so it dies with its step (`BC_E_HANDLE` after).
+  - A path is `parse_path`, PostgreSQL 17's `array_in` (`ReadArrayDimensions`,
+    `ReadArrayStr`, `ReadArrayToken`) for a `text[]`, its messages and
+    DETAIL word for word, every dimension read flat; its form is the u32
+    count, then each element's u32 length (`0xFFFFFFFF` for NULL) and
+    bytes. A literal path is read by the binder and folded as that form
+    into a hidden parameter; a `$n` path is typed text and described as
+    `text[]` (`ParamInfo::path`, OID 1009), read at bind by `check_params`
+    for its error (as PostgreSQL's Bind reads it, whether a row reaches it
+    or not) and again by `bc_jsonb_path_in` in the plan; `ARRAY[…]` of
+    values builds the path with `bc_jsonb_path_add`, one element at a time.
+    `ARRAY[ARRAY[…]]` and a `::text[]` cast are not built (42601).
+  - The calls are the design's, but each that can give NULL takes an `out`
+    pointer and returns `false` for NULL. `bc_jsonb_to_i64(cx, j, int_type,
+    object_id)` takes `bc_int_type`, which gains `BC_BIGINT`, rather than a
+    SQL kind; `bc_jsonb_to_f64(cx, j, real)` reads the number's text with
+    `std::from_chars`, which keeps a denormal and refuses what rounds to
+    zero or infinity, as `float8in` and `float4in` do.
+  - Constants fold in the binder through the same functions, so
+    `'{"a":1}'::jsonb -> 'a'` is a constant, its error at prepare, as
+    PostgreSQL's planner folds it. A cast to `numeric` of no precision is
+    taken only from a jsonb (`jsonb_numeric`); to `numeric(p, s)` is 0A000.
+  - The binder's logical form is one expression kind, `Jsonb`, with its
+    function (`Field`, `Element`, `Path`, their `Text` forms, `Typeof`,
+    `ArrayLength`, `PathIn`, `PathArray`); the casts out widen
+    `JsonbCast`. Both are strict but `PathArray`, whose NULL element is the
+    path's.
+  - `'a' - 'b'`, two string literals under an arithmetic operator, is
+    PostgreSQL's 42725 (`operator is not unique: unknown - unknown`), so
+    `j -> 'a' - 'b'` is too.
+  - Over columns, the accessors go where the layer takes an expression
+    (the select list, `WHERE` and `ON` as stage P1a's filters, `ORDER BY`,
+    an aggregate's argument); `GROUP BY`, `DISTINCT` and `UPDATE … SET`
+    of one are the layer's limits for any expression.
+  - No benchmark: no speed-up is claimed. The binder's new branches run
+    only for the accessors' operator and function names.
 - **Stage 2: comparison and order** (about 1,300 lines). The sort key
   from a walk of the node, `bc_sub_has_jsonb`, the first-value aggregate
   slot and its own plan API test, binder lifts. Revision 23.

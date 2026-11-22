@@ -72,6 +72,13 @@ BINDER_STATES = frozenset(
 # UPDATE with an aggregate, so the statement does: a CREATE TABLE refused
 # with 0A000 is the layer's rule, kind "refused", never compared. The
 # planner's refusal, also 0A000, is told by its class (run_layer: NO_PLAN).
+# The data errors a plan raises as PostgreSQL's executor does (BC_E_DATA,
+# run_layer) and the binder raises for a literal: jsonb_in's, array_in's
+# and the jsonb accessors' and casts' (docs/jsonb_design.md). PostgreSQL's
+# are compared with them.
+DATA_STATES = frozenset({"22P02", "22P05", "22021", "22023", "2202E", "54000", "54001"})
+
+
 def layer_only(state: str, sql: str) -> bool:
     """Whether a refusal with this SQLSTATE is one of the layer's own rules."""
     return state == NOT_SUPPORTED and sql.lstrip().upper().startswith("CREATE TABLE")
@@ -83,7 +90,8 @@ def error_kind(state: str, sql: str) -> str:
     of the layer's own rules (layer_only)."""
     if layer_only(state, sql):
         return "refused"
-    known = state in SQLSTATE.values() or state in RANGE_STATES or state in BINDER_STATES or state == ABORTED
+    known = (state in SQLSTATE.values() or state in RANGE_STATES or state in BINDER_STATES or state in DATA_STATES
+             or state == ABORTED)
     return state if known else "refused"
 
 

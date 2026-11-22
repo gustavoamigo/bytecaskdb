@@ -1152,18 +1152,61 @@ stage 2: a comparison of it, of constants too (a literal beside it read
 first, 22P02), `IN`,
 `ORDER BY`, `GROUP BY`, `DISTINCT`, `COUNT(DISTINCT …)`, `UNION`,
 `INTERSECT`, `EXCEPT`, and a subquery of it; until the next phase: a key,
-`UNIQUE`, index or `FOREIGN KEY` column of it; until stages 3 and 4: the
-operators PostgreSQL has for it (`->`, `->>`, `#>`, `#>>`, `@>`, `<@`,
-`?`, `?|`, `?&`, `#-`, `@?`, `@@`, refused by the parser whatever the
-operands; `||` and `-` of a jsonb, by the binder) and the JSON functions
-(named `jsonb_…` or `json_…`, `to_json`, `to_jsonb`, `row_to_json`,
-`array_to_json`), its casts to `boolean` and the numbers, and to
-`varchar(n)`, `char` and `name`, which cut or pad; a jsonb column's value
+`UNIQUE`, index or `FOREIGN KEY` column of it; until stage 4: the
+operators PostgreSQL has for it but the accessors (`@>`, `<@`, `?`, `?|`,
+`?&`, `#-`, `@?`, `@@`, refused by the parser whatever the operands; `||`
+and `-` of a jsonb, by the binder) and the JSON functions but
+`jsonb_typeof` and `jsonb_array_length` (named `jsonb_…` or `json_…`,
+`to_json`, `to_jsonb`, `row_to_json`, `array_to_json`), its casts to
+`numeric(p, s)`, and to `varchar(n)`, `char` and `name`, which cut or pad; a jsonb column's value
 assigned to a string column (`INSERT … SELECT v::text` works); `json`
 (stage 1c), a domain, a procedure argument and a PL/pgSQL variable of
 jsonb. A form the parser takes for no type keeps its 42601 with jsonb:
 `IN`, `BETWEEN`, `IS DISTINCT FROM` and `LIKE` in a select list, `COLLATE`
 (PostgreSQL's is 42804), a cast in `UPDATE`'s `SET`.
+
+**jsonb's accessors and casts out** (`jsonb_design.md`, stage 3). `j -> k`
+and `j ->> k` with a text key or an integer index, `j #> p` and `j #>> p`
+with a path, `jsonb_typeof(j)` and `jsonb_array_length(j)` (also
+`pg_catalog.`-qualified), and casts of a jsonb to `boolean`, `smallint`,
+`integer`, `bigint`, `real`, `double precision` and `numeric` of no
+precision, of columns, `$n` and constants alike, wherever the select list
+takes a value: the select list, `WHERE` and `ON` as evaluated filters
+(*Expressions in WHERE, ON and HAVING (stage P)*), `ORDER BY` of an
+expression, and the argument of an aggregate (`sum((j -> 0)::int)`). `->`
+and `#>` give jsonb, the others text (`jsonb_array_length` an integer).
+Operands resolve as PostgreSQL 17's `oper_select_candidate`
+(`jsonb_design.md`, *Operator resolution for jsonb, with unknown literals
+and parameters*): an unknown literal or `$n` on the right of `->` is a text
+key, a `smallint` or `integer` an index, a string type (`varchar`, `name`,
+`char`) a key; `bigint`, `numeric` and any other type 42883 (`operator does
+not exist: jsonb -> bigint`), as is a left operand of another type (`text
+-> unknown`); a left `$n` or unknown literal 42725 (`operator is not
+unique: unknown -> unknown`). The path of `#>` (*Path arguments*) is a
+string literal read as `array_in` reads a `text[]` when the statement is
+prepared (22P02 `malformed array literal` with its DETAIL, 54000, 2202E),
+`ARRAY[…]` of text constants, text values and `$n` (each typed text; an
+empty `ARRAY[]` 42P18, an integer element 42883 `jsonb #> integer[]`), or a
+`$n` typed `text[]` (OID 1009 in Describe), read at bind, so its error
+comes whether a row reaches it or not; a typed `text` there is 42883. A
+constant expression is folded when the statement is prepared, as
+PostgreSQL folds it, its error then. The results are PostgreSQL's
+`jsonb_object_field`, `jsonb_array_element` and `jsonb_get_element`: NULL
+for a missing key, a key of a non-object, an index outside the array (from
+the end when negative), and for `#>` at a scalar mid-path, a NULL element
+or a non-integer index of an array; a scalar is an array of itself to `->
+i` (`'5'::jsonb -> 0` is `5`), not to `#>`; `->>` of a JSON null is SQL
+NULL and of a string its de-escaped text. Errors: 22023 `cannot get array
+length of a scalar` (`of a non-array`), 22023 `cannot cast jsonb string to
+type integer` and the rest, the target's 22003 range error
+(`integer out of range`, `"1e400" is out of range for type double
+precision`). A cast to an integer rounds half away from zero. An accessor
+names its column `?column?`, a cast of one its type (`int4`), as
+PostgreSQL does. Not built with them: `UPDATE … SET` of an accessor and a
+`GROUP BY`, `DISTINCT` or `COUNT(DISTINCT …)` of one, the layer's limits
+for any expression (42601, 0A000); `ORDER BY` of a jsonb result (stage 2);
+`ARRAY[ARRAY[…]]` and a cast to `text[]` (42601); `MAX` and `MIN` of text,
+which the layer has for no text value.
 
 **NAME.** `NAME` declares a column of PostgreSQL's identifier type
 (`types_design.md`, *NAME*): text of at most 63 bytes, a longer value cut
@@ -1189,8 +1232,10 @@ That includes:
   computed, aggregated (but by `COUNT`) or cast, or as a key (0A000,
   *NUMERIC without a precision*);
 - a jsonb value compared, ordered, grouped, `DISTINCT`, or as a key, every
-  operator and function of jsonb, its casts but those with text, and the
-  `json` type (0A000, *jsonb*; `jsonb_design.md`, *Stages of jsonb*);
+  operator and function of jsonb but its accessors, `jsonb_typeof` and
+  `jsonb_array_length`, its casts to `numeric(p, s)`, `varchar(n)`, `char`
+  and `name`, and the `json` type (0A000, *jsonb*, *jsonb's accessors and
+  casts out*; `jsonb_design.md`, *Stages of jsonb*);
 - `IS DISTINCT FROM`, and a predicate or a constant in `HAVING`; a
   `NULL` constant under `NOT`; in a `WHERE` or `ON`, `random()` (42601), an
   aggregate (42803), `expr IN (SELECT …)` of an expression, and `CURRENT_DATE`
@@ -1242,7 +1287,8 @@ That includes:
   parameter to `DECIMAL`, `VARCHAR(n)` or `CHAR(n)`, to a type another use
   of it does not give it, or, in `VALUES` or `SET`, to other than its
   column's type; a cast parameter inside an expression in `SET` or
-  `HAVING`, or in an aggregated select list; a numeric literal of more than 18 digits, a string literal in arithmetic, unary `-` or `abs`
+  `HAVING`, or in an aggregated select list; a numeric literal of more than 18 digits, a string literal in arithmetic (two string literals under one operator are
+  PostgreSQL's 42725, operator is not unique), unary `-` or `abs`
   of a parameter, and a constant beside an aggregate;
 - `EXTRACT(EPOCH FROM …)` and `EXTRACT(JULIAN FROM …)` of a timestamp,
   and `EXTRACT` of a unit given other than as a name or a string;
@@ -2219,7 +2265,8 @@ are the runtime's, filled by `bc_row_begin` (`catalog_design.md`).
   `FROM` (`SELECT $1::integer + 1`, `SELECT v + $2::bigint FROM t`): `T`, and
   its value is range-checked as a `T` before the plan runs (22003, 22P02
   for text that is no `T`). Alone in a select list it is named by its type
-  (`int4`), as PostgreSQL names it; an operator of it is `?column?`. A cast
+  (`int4`), as PostgreSQL names it; an operator of it is `?column?`; a
+  cast of the cast (`$1::jsonb::int`) by the outer type (`int4`). A cast
   to `DECIMAL`, `VARCHAR(n)` or `CHAR(n)` is not taken yet, nor one to a
   type other than another use of the parameter gives it (*Known
   differences*). A cast parameter as an operand anywhere else (`SET n =

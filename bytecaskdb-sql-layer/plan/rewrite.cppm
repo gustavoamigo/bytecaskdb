@@ -188,6 +188,7 @@ auto fold(Expr& e) -> bool {
     case Kind::TextFn:
     case Kind::Extract:
     case Kind::JsonbCast:
+    case Kind::Jsonb:
     case Kind::Mod:
     case Kind::Neg:
     case Kind::Abs:
