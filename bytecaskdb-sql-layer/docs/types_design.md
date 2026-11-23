@@ -186,8 +186,11 @@ are PostgreSQL's:
 - A value of more than `n` code points is cut when the excess is only
   spaces and refused otherwise (22001, `value too long for type
   character(n)`). This is PostgreSQL's rule; `VARCHAR(n)` refuses both.
-- The rules `LIKE`, `UNION`, `MIN`, `MAX` and parameters have for `TEXT` and
-  `VARCHAR` are not extended to `CHAR(n)` (below).
+- The rules `LIKE`, `UNION` and parameters have for `TEXT` and `VARCHAR`
+  are not extended to `CHAR(n)` (below). `MIN` and `MAX` of a `CHAR(n)`
+  column are PostgreSQL's `max(bpchar)`: `character` of no length, the
+  stored value compared without its trailing spaces and printed padded to
+  `n` (`frontend_design.md`, *MIN and MAX of text*).
 
 Refused with a message, each for a reason:
 
@@ -202,9 +205,11 @@ Refused with a message, each for a reason:
   trailing spaces, which the layer stores.
 - **A cast to `CHAR(n)`, `LIKE` on a `CHAR(n)`** (PostgreSQL's `bpchar`
   `LIKE` keeps the padding significant, which stored values do not),
-  **`MIN` and `MAX` of one, and a set operation** that meets one and a
-  different type.
-- **A `CHAR` of no length** (`bpchar`), which PostgreSQL leaves unbounded.
+  and **a set operation** that meets one and a different type.
+- **A `CHAR` of no length** (`bpchar`), which PostgreSQL leaves unbounded,
+  as a column's type. The one value of that type is `MIN` or `MAX` of a
+  `CHAR(n)` column, and a use that would lose the `n` it prints to is
+  refused (0A000).
 
 ## NAME
 

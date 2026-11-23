@@ -907,7 +907,7 @@ private:
     result_.clear();
     std::vector<Expr> out;
     for (const auto& o : outs) {
-      result_.push_back({o.name, o.expr.type});
+      result_.push_back(physical::result_column(o));
       out.push_back(o.expr);
     }
     return out;
@@ -2293,7 +2293,7 @@ private:
 
   void result(const SelectParts& s) {
     const auto& outs = s.project != nullptr ? s.project->exprs : s.aggregate->aggs;
-    for (const auto& o : outs) result_.push_back({o.name, o.expr.type});
+    for (const auto& o : outs) result_.push_back(physical::result_column(o));
   }
 
   // Each column the SELECT names is a column of one of its tables.
@@ -2742,7 +2742,7 @@ private:
     const auto g = group_parts(root);
     const auto& agg = *g.aggregate;
     for (const auto& o : agg.aggs) {
-      result_.push_back({o.name, o.expr.type});
+      result_.push_back(physical::result_column(o));
     }
     auto columns_of_exprs = [](const std::vector<Expr>& in, const char* what) {
       std::vector<ColumnRef> out;

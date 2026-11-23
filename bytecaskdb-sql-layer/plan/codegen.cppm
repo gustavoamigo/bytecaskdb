@@ -60,6 +60,7 @@ struct GeneratedPlan {
   // it: a column's own, or "count", a bigint; one of result_types each.
   std::vector<std::string> result_names;
   std::vector<SqlType> result_sql;
+  std::vector<std::uint32_t> result_pad;  // physical::ResultColumn::pad, each
   // What its bc_schema_ref lists (docs/catalog_design.md,
   // *Compatibility*): the objects and columns it depends on.
   std::uint64_t catalog_version{0};
@@ -2416,10 +2417,16 @@ private:
     }
     auto j = agg_index(g, e);
     auto count = e.fn == Expr::Fn::Count;
+    if (g.op->streamed && folds_bytes(e)) {
+      // In the stream's holder (stream).
+      auto at = "(cx, " + local("hg", g, 0) + ", " + std::to_string(holder_slot(g, j)) + ")";
+      return {"bc_agg_null" + at, "bc_agg_bytes" + at};
+    }
     if (g.op->streamed) return {count ? "" : "!" + local("xs", g, j), local("x", g, j)};
     auto slot = std::to_string(g.layout.agg_slot[j]);
+    auto read = folds_f64(e) ? "bc_agg_f64" : folds_bytes(e) ? "bc_agg_bytes" : "bc_agg_i64";
     return {count ? "" : "bc_agg_null(cx, " + g.handle + ", " + slot + ")",
-            std::string{folds_f64(e) ? "bc_agg_f64" : "bc_agg_i64"} + "(cx, " + g.handle + ", " + slot + ")"};
+            std::string{read} + "(cx, " + g.handle + ", " + slot + ")"};
   }
 
   // Whether the group fails a HAVING conjunct, as C: NULL on either side, or
@@ -2484,7 +2491,10 @@ private:
       return;
     }
     auto [is_null, value] = group_value(e);
-    auto type = e.kind == Expr::Kind::Column ? e.col.type : folds_f64(e) ? PhysType::F64 : PhysType::I64;
+    auto type = e.kind == Expr::Kind::Column ? e.col.type
+                : folds_f64(e)                ? PhysType::F64
+                : folds_bytes(e)              ? PhysType::Bytes
+                                              : PhysType::I64;
     auto emit = "bc_emit_" + suffix(type) + "(cx, " + value + ");";
     if (is_null.empty()) {
       w_.line(emit);
@@ -2614,6 +2624,19 @@ private:
     return a.fn != Expr::Fn::Count && !a.args.empty() && a.args[0].phys() == PhysType::F64;
   }
 
+  // Whether the aggregate folds bytes: a MIN or MAX of text, held beside
+  // its slot (bc_agg_min_bytes), in a stream in its holder (stream).
+  static auto folds_bytes(const Expr& a) -> bool {
+    return (a.fn == Expr::Fn::Min || a.fn == Expr::Fn::Max) && !a.args.empty() && a.args[0].phys() == PhysType::Bytes;
+  }
+
+  // A streamed group's holder's slot of aggregate j, which folds bytes: its
+  // place among the group's aggregates that do.
+  static auto holder_slot(const Group& g, std::size_t j) -> std::size_t {
+    return static_cast<std::size_t>(std::ranges::count_if(g.op->aggs.begin(), g.op->aggs.begin() + static_cast<std::ptrdiff_t>(j),
+                                                          [](const Expr& a) { return folds_bytes(a); }));
+  }
+
   // The statements folding the row in hand's argument of aggregate j, its
   // value `v`, into its slots of group `gg`.
   auto structure_fold(const Group& g, std::size_t j, const std::string& gg, const std::string& v) const
@@ -2625,8 +2648,8 @@ private:
     switch (a.fn) {
       case Expr::Fn::Count: return {"bc_agg_count(cx, " + gg + ", " + slot + ");"};
       case Expr::Fn::Sum: return {std::string{f64 ? "bc_agg_add_f64" : "bc_agg_add_i64"} + at};
-      case Expr::Fn::Min: return {std::string{f64 ? "bc_agg_min_f64" : "bc_agg_min_i64"} + at};
-      case Expr::Fn::Max: return {std::string{f64 ? "bc_agg_max_f64" : "bc_agg_max_i64"} + at};
+      case Expr::Fn::Min: return {std::string{f64 ? "bc_agg_min_f64" : folds_bytes(a) ? "bc_agg_min_bytes" : "bc_agg_min_i64"} + at};
+      case Expr::Fn::Max: return {std::string{f64 ? "bc_agg_max_f64" : folds_bytes(a) ? "bc_agg_max_bytes" : "bc_agg_max_i64"} + at};
       case Expr::Fn::Avg:
         return {std::string{f64 ? "bc_agg_add_f64" : "bc_agg_add_i64"} + at,
                 "bc_agg_count(cx, " + gg + ", " + std::to_string(g.layout.agg_slot[j] + 1) + ");"};
@@ -2716,9 +2739,20 @@ private:
       w_.line(c.type == PhysType::Bool ? "bool " + local("kv", g, j) + " = false;" : "int64_t " + local("kv", g, j) + " = 0;");
       if (c.nullable) w_.line("bool " + local("kn", g, j) + " = false;");
     }
+    // MIN and MAX of text are held in holder h<i>, one group under the
+    // empty key, hg<i>, cleared as each group ends: a local could not keep
+    // their bytes past the row that gave them.
+    const auto held = static_cast<std::size_t>(std::ranges::count_if(op.aggs, [](const Expr& a) { return folds_bytes(a); }));
+    const auto h = local("h", g, 0);
+    const auto hg = local("hg", g, 0);
+    if (held > 0) {
+      w_.line("bc_agg " + h + " = bc_agg_open(cx, " + std::to_string(held) + ");  // MIN and MAX of text of the group in hand");
+      w_.line("bc_group " + hg + " = bc_agg_group(cx, " + h + ", bc_empty(cx));");
+    }
     auto reset = [&](bool declare) {
       for (std::size_t j = 0; j < op.aggs.size(); ++j) {
         const auto& a = op.aggs[j];
+        if (folds_bytes(a)) continue;
         w_.line((declare ? (folds_f64(a) ? "double " : "int64_t ") : "") + local("x", g, j) + " = 0;");
         if (a.fn != Expr::Fn::Count) w_.line((declare ? "bool " : "") + local("xs", g, j) + " = false;");
         if (a.fn == Expr::Fn::Avg) w_.line((declare ? "int64_t " : "") + local("xc", g, j) + " = 0;");
@@ -2762,6 +2796,10 @@ private:
           reset(false);
           // The group's distinct values go with it.
           for (std::size_t m = 0; m < g.layout.distinct.size(); ++m) w_.line("bc_agg_clear(cx, " + local("d", g, m) + ");");
+          if (held > 0) {
+            w_.line("bc_agg_clear(cx, " + h + ");");
+            w_.line(hg + " = bc_agg_group(cx, " + h + ", bc_empty(cx));");
+          }
           w_.close();
           for (std::size_t j = 0; j < g.columns.size(); ++j) {
             w_.line(local("kv", g, j) + " = " + local("rk", g, j) + ";");
@@ -2789,6 +2827,10 @@ private:
   // count.
   static auto local_fold(const Group& g, std::size_t j, const std::string& v) -> std::vector<std::string> {
     const auto& a = g.op->aggs[j];
+    if (folds_bytes(a)) {
+      return {std::string{a.fn == Expr::Fn::Min ? "bc_agg_min_bytes" : "bc_agg_max_bytes"} + "(cx, " + local("hg", g, 0) + ", " +
+              std::to_string(holder_slot(g, j)) + ", " + v + ");"};
+    }
     const auto x = local("x", g, j);
     const auto xs = local("xs", g, j);
     const auto f64 = folds_f64(a);
@@ -3597,6 +3639,7 @@ auto print_plan(physical::Plan& p, const std::vector<PhysType>& param_types, std
     out.result_types.push_back(phys_type(r.sql));
     out.result_names.push_back(r.name);
     out.result_sql.push_back(r.sql);
+    out.result_pad.push_back(r.pad);
   }
   out.functions = subs + "\n" + comment_line(sql) + std::string{own ? "" : "static "} + "void " + std::string{fn} +
                   "(bc_ctx *cx) {\n" + w.body() + "}\n";
@@ -3676,7 +3719,7 @@ auto plan_for(const logical::Node& n, const Catalog& cat, const RowCounts& count
   p.set = set_tree(*set->node, cat, counts, memory_bytes, param_types, never_null, p);
   p.set_limit = set->limit;
   p.set_order = set->op->order;
-  for (const auto& o : set->op->outputs) p.result.push_back({o.name, o.expr.type});
+  for (const auto& o : set->op->outputs) p.result.push_back(physical::result_column(o));
   return p;
 }
 

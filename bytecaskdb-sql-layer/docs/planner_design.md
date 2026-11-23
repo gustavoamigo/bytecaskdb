@@ -1822,7 +1822,9 @@ integer sum, as `SUM`'s, with its 64-bit limit (`frontend_design.md`,
 ### Expressions in casts, group keys, DISTINCT, SET and text MIN/MAX (#904)
 
 Status: **approved** by the owner on 2026-11-22, with every recommendation
-in *Open questions on #904*; tracking issue #904. Nothing here is built yet. The dialect, PG 17's behaviour, the
+in *Open questions on #904*; tracking issue #904. Stage M1 (*MIN and MAX
+of text*) is built, with the as-built notes there; the other stages are
+not yet. The dialect, PG 17's behaviour, the
 refusals, the stages (M1, C0, C1, S1, G0, G1, G2) and the open questions are
 `frontend_design.md`, *Expressions in casts, GROUP BY, DISTINCT, SET and
 MIN/MAX of text (#904)*. This section is how the plan, the search, the
@@ -2127,6 +2129,39 @@ a scalar's text is at most a few dozen bytes. Each cast of fixed size
   comparison of one compares bytes as a column's does. `KeyAggregates`
   stays I64-only; reading a text `MIN` from an index's first key is a
   later optimisation (`bc_key_part_bytes`).
+
+As built (M1), where it departs from the above:
+
+- The calls take no `bc_agg`: `bc_agg_min_bytes(bc_ctx*, bc_group, uint32_t
+  slot, bc_view)`, `bc_agg_max_bytes(…)` and `bc_agg_bytes(bc_ctx*,
+  bc_group, uint32_t slot)`, as the integer and double folds do; the group
+  handle names its aggregate. `bc_agg_i64` or `bc_agg_f64` of a bytes slot,
+  and `bc_agg_bytes` of another kind's, is `BC_E_HANDLE`.
+- The held values are a vector the `Agg` makes on its first bytes value
+  (`std::unique_ptr<std::vector<Bytes>>`), so `Agg` keeps the size
+  `kAggBytes` charges and an aggregate of no text `MIN` or `MAX` is charged
+  nothing more. Charges: the vector, once made, its block
+  (`kAllocBytes` and its size); each value its bytes and `kAggHeldBytes`
+  (80: its block's header and its place in the vector, at twice its size).
+  A replacement takes the new size, copies, then releases the old size; a
+  failed take or copy leaves the old value held and its charge as it was.
+- A stream's holder is `h<i>_0`, one group under the empty key, `hg<i>_0`,
+  found once per group rather than on each row: when the stream opens it,
+  and again after the clear that ends a group. The group of no key is given
+  once, so its holder is never cleared; the reset releases it.
+- Each result column carries `pad` (`physical::ResultColumn`), the code
+  points a value is padded to: a `CHAR(n)`'s `n`, and for `MIN` or `MAX` of
+  a `CHAR(n)` column that column's. `Compiled::column_pads` keeps it and
+  `Database::padded` pads by it, so the result type stays `CHAR` of no
+  length for Describe (1042, typmod -1).
+- Tests: `tests/plan_api_text_minmax_test.cpp` (order, NULL, a read that
+  is a copy, kinds, exact charges, a budget sweep and an allocation sweep
+  that each assert the transitions they end), `codegen: MIN and MAX of text
+  fold into a slot's bytes in a structure, into a holder in a stream`, the
+  binder and embedded API cases, `proof: test_text_min_max_agree_with_postgresql`
+  and `tests/functional/cases/postgresql/aggregates.yaml`. No golden plan:
+  the golden schema has no text column, and adding one would change every
+  golden plan's catalog version.
 
 #### Memory of #904
 

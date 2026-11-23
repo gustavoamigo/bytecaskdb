@@ -6,8 +6,8 @@ which resolves names and types. It also covers the layer's known
 differences from PostgreSQL in what SQL means. The planner is
 `planner_design.md`. The TPROC-C statements the layer runs are in
 `testing_design.md`, *The TPROC-C statements*. *Expressions in casts,
-GROUP BY, DISTINCT, SET and MIN/MAX of text (#904)* is approved (2026-11-22),
-not built yet.
+GROUP BY, DISTINCT, SET and MIN/MAX of text (#904)* is approved (2026-11-22);
+its stage M1, `MIN` and `MAX` of text, is built, the other stages not yet.
 
 ## Standing rules
 
@@ -674,10 +674,16 @@ evaluated on each row a plan reads, never a key's bound.
   half away from zero. Its digits can pass 64 bits, so the plan divides
   them into the quotient's text (`bc_num_quotient`) and a result row
   carries the value as that text. NULL over no rows.
-- `MIN` and `MAX` are of the column's type, and NULL over no rows. They
-  take a numeric or temporal column.
-  - Of a `TEXT`, `VARCHAR` or `BYTEA` column they are refused (#534).
-    Keeping the least value seen needs a buffer the plan API doesn't have.
+- `MIN` and `MAX` are of the column's type, but as below for strings,
+  and NULL over no rows. They
+  take a numeric, temporal or string value.
+  - Of `TEXT`, `VARCHAR` and `NAME` they are `text`, PostgreSQL's
+    `max(text)`; of a `CHAR(n)` column `character` of no length, printed
+    padded to `n` (*MIN and MAX of text*, #904). Values compare bytewise,
+    as `COLLATE "C"`.
+  - Of `BYTEA`, `BOOLEAN` and jsonb, and `SUM` and `AVG` of a string, they
+    are PostgreSQL's 42883 `function max(bytea) does not exist`, with its
+    HINT.
   - `SUM`, `AVG`, `MIN` and `MAX` of a `REAL` column are refused (42601):
     PostgreSQL's `SUM` and `MIN` of one are `real`, summed in single
     precision.
@@ -1207,8 +1213,8 @@ names its column `?column?`, a cast of one its type (`int4`), as
 PostgreSQL does. Not built with them: `UPDATE … SET` of an accessor and a
 `GROUP BY`, `DISTINCT` or `COUNT(DISTINCT …)` of one, the layer's limits
 for any expression (42601, 0A000); `ORDER BY` of a jsonb result (stage 2);
-`ARRAY[ARRAY[…]]` and a cast to `text[]` (42601); `MAX` and `MIN` of text,
-which the layer has for no text value.
+`ARRAY[ARRAY[…]]` and a cast to `text[]` (42601). `MIN` and `MAX` of an
+accessor's text are built (#904, stage M1).
 
 **NAME.** `NAME` declares a column of PostgreSQL's identifier type
 (`types_design.md`, *NAME*): text of at most 63 bytes, a longer value cut
@@ -1282,8 +1288,13 @@ That includes:
   `REPLACE`, the regular-expression `SUBSTRING`, `bytea` string functions
   (#671);
 - a `CASE`, `COALESCE` or set operation whose result is a `NAME` made of
-  another string type's values (0A000, *NAME*); `MIN` and `MAX` of a
-  `NAME`, as of every string type;
+  another string type's values (0A000, *NAME*);
+- `MIN` and `MAX` of a `CHAR`-typed expression; of a `CHAR(n)` column in a
+  scalar subquery's value other than compared with a column, in a derived
+  relation or in `CREATE TABLE AS`, where its padding to `n` is lost; and
+  a `HAVING` comparing `MIN` or `MAX` of a `CHAR(n)`, or a grouped
+  `CHAR(n)` column, with a text value, which PostgreSQL compares as text,
+  trailing spaces counting (0A000, *MIN and MAX of text*, #904);
 - a cast of anything but a constant, a parameter, or a string value to
   `text` or `varchar` of no length (a `NAME` to `name`); a cast of a
   parameter to `DECIMAL`, `VARCHAR(n)` or `CHAR(n)`, to a type another use
@@ -2250,7 +2261,9 @@ WHERE" and "string function in a WHERE" gaps); `jsonb_design.md`,
 ### Expressions in casts, GROUP BY, DISTINCT, SET and MIN/MAX of text (#904)
 
 Status: **approved** by the owner on 2026-11-22, with every recommendation
-in *Open questions on #904*; tracking issue #904. Nothing here is built yet. It covers the six gaps #904 lists,
+in *Open questions on #904*; tracking issue #904. Stage M1, `MIN` and `MAX`
+of text, is built (*MIN and MAX of text*, its as-built notes); the other
+stages are not yet. It covers the six gaps #904 lists,
 found while building jsonb stage 3: a cast of an expression, `GROUP BY`
 of an expression, `SELECT DISTINCT` and `COUNT(DISTINCT …)` of an
 expression, an expression in `UPDATE … SET` (#896), `MIN`/`MAX` of text,
@@ -2702,6 +2715,33 @@ with `DISTINCT` (the same as without) and in `HAVING`. PG 17, each run:
 Each group holds at most one value per text `MIN` or `MAX`, as long as the
 longest it has seen; it is held in the statement's memory, and past its
 budget the statement fails with 54000.
+
+As built (M1):
+
+- The display width rides on the result column (`ResultColumn::pad` in
+  the physical plan, `Compiled::column_pads`), not on the type: every
+  result pads a `CHAR` value to it, a `CHAR(n)` column's `n` included.
+  Only a result column carries it, so a use of a `CHAR(n)`'s `MIN` or
+  `MAX` that would lose it is 0A000 rather than an unpadded value: a scalar
+  subquery of one other than compared with a column (`SELECT (SELECT
+  max(ch) …)`), a derived relation (a grouped view read by an outer
+  aggregate or join) with one among its columns, and `CREATE TABLE AS` of
+  one (PG makes a `bpchar` column, a type of no length the layer has no
+  column of). `INSERT … SELECT` of one into a `CHAR(n)` stays 0A000 with
+  #824. Compared with a column (`ch = (SELECT max(ch) …)`, `IN`) it is a
+  parameter and compares as a `CHAR(n)` does.
+- A `HAVING` comparison of a text `MIN` or `MAX` with `$n` types it `text`;
+  of a `CHAR(n)`'s, `$n` is refused as beside a `CHAR(n)` column (42601),
+  and a constant is folded as for the column. A text constant (`' '::text`,
+  `||`, `lower()`) beside a `CHAR(n)`'s `MIN` or `MAX`, or a grouped
+  `CHAR(n)` column, is 0A000: PostgreSQL resolves `text = text`, so
+  trailing spaces count, and a `HAVING` has no path that compares the
+  `CHAR` value as text (a `WHERE` does, `compared_values`). A `varchar`
+  constant compares as the `CHAR`, as PostgreSQL's `bpchar = bpchar`. The
+  grouped column's case was a wrong result before M1 (`HAVING c = ' '::text`
+  kept groups PostgreSQL drops).
+- Every 42883 refusal of an aggregate's argument type now has PG's message
+  and HINT (`function avg(date) does not exist`), not only jsonb's.
 
 #### ARRAY[ARRAY[…]] and casts to text[]
 
@@ -3305,7 +3345,7 @@ fail on them.
   refuses each (23503, 2BP01). The owner postponed enforcement, as several
   databases have shipped without it; its design is in #657.
 - **Strings compare bytewise, as `COLLATE "C"`**, constants as columns
-  do: `'B' < 'a'` is true. PostgreSQL orders them by the database's
+  do, and `MIN` and `MAX` of text order so: `'B' < 'a'` is true. PostgreSQL orders them by the database's
   collation, under which `'a' < 'B'` may be true instead. The layer has one
   collation (`types_design.md`).
 - **A constant's error is raised when the statement is compiled**: `SELECT

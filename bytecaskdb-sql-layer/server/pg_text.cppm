@@ -53,7 +53,8 @@ auto type_info(SqlType t) -> TypeInfo {
     case SqlKind::Bytea: return {17, -1, -1};
     case SqlKind::Text: return {25, -1, -1};
     case SqlKind::Varchar: return {1043, -1, static_cast<std::int32_t>(t.length) + 4};
-    case SqlKind::Char: return {1042, -1, static_cast<std::int32_t>(t.length) + 4};
+    // Of no length: MIN or MAX of a CHAR(n), PostgreSQL's bpchar.
+    case SqlKind::Char: return {1042, -1, t.length == 0 ? -1 : static_cast<std::int32_t>(t.length) + 4};
     case SqlKind::Name: return {19, 64, -1};
     case SqlKind::Decimal:
       // Precision 0 is unconstrained numeric: a SUM's type.

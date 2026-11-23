@@ -1245,8 +1245,8 @@ TEST_CASE("binder: COUNT, ORDER BY and column + parameter", "[sql][binder]") {
     CHECK(sql_type_name(sum.expr.type) == "numeric");  // of a BIGINT: no declared precision
   }
   CHECK(rejected(cat, "SELECT sum(name) FROM t WHERE id = $1") ==
-        std::pair<std::string, std::int32_t>{"SUM of a bytea column is not supported", 7});
-  CHECK(rejected(cat, "SELECT min(name) FROM t WHERE id = $1").first == "MIN of a bytea column is not supported");
+        std::pair<std::string, std::int32_t>{"function sum(bytea) does not exist", 7});
+  CHECK(rejected(cat, "SELECT min(name) FROM t WHERE id = $1").first == "function min(bytea) does not exist");
   CHECK(rejected(cat, "SELECT min(qty), id FROM t WHERE id = $1").first ==
         "column \"t.id\" must appear in the GROUP BY clause or be used in an aggregate function");
   CHECK(rejected(cat, "SELECT sum(qty) FROM t WHERE id = $1 FOR UPDATE").first ==
@@ -1438,7 +1438,7 @@ TEST_CASE("binder: each refusal carries PostgreSQL's SQLSTATE", "[sql][binder][s
   CHECK(state("SELECT sum(dbl) FROM u WHERE k = $1") == "bound");
   CHECK(state("SELECT min(DISTINCT dbl), avg(ALL dbl) FROM u WHERE k = $1") == "bound");
   CHECK(state("SELECT sum(DISTINCT s) FROM u WHERE k = $1") == "42883");
-  CHECK(state("SELECT min(s) FROM u WHERE k = $1") == "42601");
+  CHECK(state("SELECT min(s) FROM u WHERE k = $1") == "bound");  // bytewise (#904)
   CHECK(state("SELECT sum(tm) FROM u WHERE k = $1") == "42601");  // an interval sum there
   CHECK(state("SELEC 1") == "42601");
   // Two columns of one table: of one compared type, two numbers of no
@@ -1568,6 +1568,61 @@ TEST_CASE("binder: a set operation binds its arms alone and resolves their colum
   CHECK(find<logical::Get>(*top.right)->table->name == "u");
 }
 
+TEST_CASE("binder: MIN and MAX of text, varchar, name and a CHAR(n) column, typed as PostgreSQL 17's", "[sql][binder][group]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE m (k INT PRIMARY KEY, s TEXT, v VARCHAR(5), n NAME, ch CHAR(3), "
+                                        "b BYTEA, j JSONB)").stmt));
+  const auto& cat = f.cat();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what();
+    }
+    return "bound";
+  };
+  {
+    auto b = bind_sql(cat, "SELECT max(s), min(v), max(n), min(ch), max(j->>'k'), max(DISTINCT s) FROM m");
+    const auto& a = get<logical::Aggregate>(b);
+    REQUIRE(a.aggs.size() == 6);
+    // PostgreSQL has max(text) and max(bpchar): a VARCHAR's and a NAME's are text.
+    for (auto i : {0, 1, 2, 4, 5}) CHECK(a.aggs[static_cast<std::size_t>(i)].expr.type == SqlType{SqlKind::Text});
+    // A CHAR(n)'s is bpchar of no length; the result pads it to the column's n.
+    CHECK(a.aggs[3].expr.type == SqlType{SqlKind::Char});
+    CHECK(a.aggs[3].name == "min");
+    CHECK_FALSE(a.aggs[5].expr.distinct);  // MIN and MAX of the distinct values are of all
+  }
+  // HAVING compares MIN or MAX of text with a text parameter.
+  {
+    auto b = bind_sql(cat, "SELECT k FROM m GROUP BY k HAVING max(v) > $1");
+    REQUIRE(b.params.size() == 1);
+    CHECK(b.params[0].type == SqlType{SqlKind::Text});
+  }
+  CHECK(state("SELECT k FROM m GROUP BY k HAVING max(ch) > $1") == "42601 a parameter compared with a CHAR(n) column is not supported yet");
+  CHECK(state("SELECT k FROM m GROUP BY k HAVING max(ch) > 'a'") == "bound");
+  // PostgreSQL compares a CHAR beside a text constant as text, trailing
+  // spaces counting; a HAVING has no such comparison, so it is refused
+  // rather than compared as the CHAR. A varchar constant compares as the CHAR.
+  CHECK(state("SELECT k FROM m GROUP BY k HAVING max(ch) = ' '::text") ==
+        "0A000 HAVING comparing a CHAR(n) column, or MIN or MAX of one, with a text value is not supported yet");
+  CHECK(state("SELECT k FROM m GROUP BY k HAVING min(ch) < 'a' || ''").starts_with("0A000 "));
+  CHECK(state("SELECT ch FROM m GROUP BY ch HAVING ch = ' '::text").starts_with("0A000 "));
+  CHECK(state("SELECT k FROM m GROUP BY k HAVING max(ch) = 'ab '::varchar") == "bound");
+  // PostgreSQL's 42883 for what it has no aggregate of, at the call.
+  CHECK(rejected(cat, "SELECT max(b) FROM m") == std::pair<std::string, std::int32_t>{"function max(bytea) does not exist", 7});
+  CHECK(state("SELECT min(j) FROM m") == "42883 function min(jsonb) does not exist");
+  CHECK(state("SELECT sum(s) FROM m") == "42883 function sum(text) does not exist");
+  CHECK(state("SELECT avg(v) FROM m") == "42883 function avg(character varying) does not exist");
+  CHECK(state("SELECT sum(ch) FROM m") == "42883 function sum(character) does not exist");
+  // A CHAR-typed expression is not taken (#904, open question 9).
+  CHECK(rejected(cat, "SELECT max(coalesce(ch, ch)) FROM m") ==
+        std::pair<std::string, std::int32_t>{"MAX of a CHAR expression other than a column is not supported yet", 7});
+  CHECK(state("SELECT max(coalesce(ch, ch)) FROM m").starts_with("0A000 "));
+  // Where the n it is padded to would be lost: 0A000.
+  CHECK(state("SELECT (SELECT max(ch) FROM m)").starts_with("0A000 "));
+  CHECK(state("SELECT k FROM m WHERE ch = (SELECT max(ch) FROM m)") == "bound");
+}
+
 TEST_CASE("binder: GROUP BY, HAVING and the aggregates, as PostgreSQL binds them", "[sql][binder][group]") {
   sql_test::Fixture f;
   f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE g (k BIGINT PRIMARY KEY, a INTEGER, d NUMERIC(6,2), "
@@ -1637,8 +1692,7 @@ TEST_CASE("binder: GROUP BY, HAVING and the aggregates, as PostgreSQL binds them
         "FOR UPDATE is not allowed with HAVING clause");
   // The aggregates' types, as PostgreSQL refuses them: 42883 where it has no
   // such aggregate, 42601 where the layer does not take it yet.
-  CHECK(rejected(cat, "SELECT max(s) FROM g").first == "MAX of a text column is not supported");
-  CHECK(rejected(cat, "SELECT avg(day) FROM g").first == "AVG of a date column is not supported");
+  CHECK(rejected(cat, "SELECT avg(day) FROM g").first == "function avg(date) does not exist");
   {
     // SUM, AVG, MIN and MAX of a DOUBLE are a DOUBLE; DISTINCT stays on SUM and AVG, and
     // is no change to MIN and MAX.

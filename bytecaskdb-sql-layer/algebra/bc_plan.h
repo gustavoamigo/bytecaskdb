@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 22). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 23). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime
@@ -620,10 +620,13 @@ void      bc_agg_min_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);
 void      bc_agg_max_i64(bc_ctx *, bc_group, uint32_t slot, int64_t);
 void      bc_agg_min_f64(bc_ctx *, bc_group, uint32_t slot, double);
 void      bc_agg_max_f64(bc_ctx *, bc_group, uint32_t slot, double);
+void      bc_agg_min_bytes(bc_ctx *, bc_group, uint32_t slot, bc_view);  /* bytewise; the value copied and charged */
+void      bc_agg_max_bytes(bc_ctx *, bc_group, uint32_t slot, bc_view);
 void      bc_agg_count(bc_ctx *, bc_group, uint32_t slot);
 bool      bc_agg_next(bc_ctx *, bc_agg, bc_view *group_key, bc_group *g);
 int64_t   bc_agg_i64(bc_ctx *, bc_group, uint32_t slot);
 double    bc_agg_f64(bc_ctx *, bc_group, uint32_t slot);
+bc_view   bc_agg_bytes(bc_ctx *, bc_group, uint32_t slot);  /* a copy that lives until the step ends */
 bool      bc_agg_null(bc_ctx *, bc_group, uint32_t slot);   /* no value folded in: SUM, MIN, MAX, AVG are NULL */
 
 /* Writes: rows, with every index entry the runtime derives from them */

@@ -275,6 +275,8 @@ inline constexpr std::uint64_t kRowEntryBytes = 152;
 inline constexpr std::uint64_t kCursorEntryBytes = 408;
 inline constexpr std::uint64_t kGroupEntryBytes = 136;
 inline constexpr std::uint64_t kAggSlotBytes = 48;
+// Beside its bytes, each MIN or MAX of text an aggregate holds.
+inline constexpr std::uint64_t kAggHeldBytes = 80;
 inline constexpr std::uint64_t kSortEntryBytes = 128;
 inline constexpr std::uint64_t kHashEntryBytes = 240;
 inline constexpr std::uint64_t kHashIterEntryBytes = 32;
@@ -602,6 +604,9 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_agg_max_i64", fn_addr(bc_agg_max_i64)},
       {"bc_agg_min_f64", fn_addr(bc_agg_min_f64)},
       {"bc_agg_max_f64", fn_addr(bc_agg_max_f64)},
+      {"bc_agg_min_bytes", fn_addr(bc_agg_min_bytes)},
+      {"bc_agg_max_bytes", fn_addr(bc_agg_max_bytes)},
+      {"bc_agg_bytes", fn_addr(bc_agg_bytes)},
       {"bc_agg_count", fn_addr(bc_agg_count)},
       {"bc_agg_next", fn_addr(bc_agg_next)},
       {"bc_agg_clear", fn_addr(bc_agg_clear)},

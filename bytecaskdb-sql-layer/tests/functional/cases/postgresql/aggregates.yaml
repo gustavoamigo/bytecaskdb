@@ -579,3 +579,123 @@
       expected: [[1, 4], [2, 4]]
   teardown:
     - DROP TABLE d
+
+- name: MIN and MAX of text, varchar and name compare bytewise and are text
+  features: [E091-03, E091-04]
+  setup:
+    - CREATE TABLE mt (id INTEGER PRIMARY KEY, g INTEGER, t TEXT, v VARCHAR(10), n NAME)
+    - INSERT INTO mt VALUES (1, 1, 'a', 'a', 'a'), (2, 1, 'B', 'é', 'z'), (3, 2, NULL, NULL, NULL), (4, 2, 'z', 'Z', 'Z')
+  steps:
+    - sql: SELECT max(t), min(t), max(v), min(v), max(n), min(n) FROM mt
+      expected: [[z, B, é, Z, z, Z]]
+    - sql: SELECT g, max(t), min(v), count(*) FROM mt GROUP BY g ORDER BY g
+      expected: [[1, a, a, 2], [2, z, Z, 2]]
+    - sql: SELECT max(DISTINCT t), min(ALL n) FROM mt WHERE id >= $1
+      params: [2]
+      expected: [[z, Z]]
+    - sql: SELECT g FROM mt GROUP BY g HAVING max(t) > $1 ORDER BY g
+      params: [b]
+      expected: [[2]]
+    - sql: SELECT g FROM mt GROUP BY g HAVING min(v) = 'Z'
+      expected: [[2]]
+  teardown:
+    - DROP TABLE mt
+
+- name: MIN and MAX of text over no rows, or only NULLs, are NULL
+  features: [E091-03, E091-04]
+  setup:
+    - CREATE TABLE mt (id INTEGER PRIMARY KEY, g INTEGER, t TEXT)
+    - INSERT INTO mt VALUES (1, 1, NULL), (2, 1, NULL)
+  steps:
+    - sql: SELECT max(t), min(t), count(*) FROM mt
+      expected: [[null, null, 2]]
+    - sql: SELECT max(t), min(t), count(*) FROM mt WHERE id > $1
+      params: [5]
+      expected: [[null, null, 0]]
+    - sql: SELECT g, max(t) FROM mt GROUP BY g
+      expected: [[1, null]]
+    - sql: SELECT g, max(t) FROM mt WHERE id > $1 GROUP BY g
+      params: [5]
+      expected: []
+  teardown:
+    - DROP TABLE mt
+
+- name: MIN and MAX of a CHAR(n) column are printed padded to n
+  features: [E091-03, E091-04]
+  setup:
+    - CREATE TABLE mc (id INTEGER PRIMARY KEY, g INTEGER, ch CHAR(4))
+    - INSERT INTO mc VALUES (1, 1, 'b'), (2, 1, 'a '), (3, 2, NULL), (4, 2, 'ab')
+  steps:
+    - sql: SELECT max(ch), min(ch) FROM mc
+      expected: [["b   ", "a   "]]
+    - sql: SELECT g, max(ch) FROM mc GROUP BY g ORDER BY g
+      expected: [[1, "b   "], [2, "ab  "]]
+    - sql: SELECT max(ch) FROM mc WHERE id = $1
+      params: [1]
+      expected: [["b   "]]
+    - sql: SELECT id FROM mc WHERE ch = (SELECT max(ch) FROM mc)
+      expected: [[1]]
+  teardown:
+    - DROP TABLE mc
+
+- name: HAVING on MIN or MAX of a CHAR(n) compares as the CHAR beside an untyped or varchar constant
+  features: [E091-03, E091-04]
+  setup:
+    - CREATE TABLE mch (id INTEGER PRIMARY KEY, g INTEGER, c CHAR(4))
+    - INSERT INTO mch VALUES (1, 1, 'a'), (2, 1, 'ab'), (3, 2, NULL), (4, 2, '  '), (5, 3, '')
+  steps:
+    - sql: SELECT g FROM mch GROUP BY g HAVING max(c) = ' ' ORDER BY g
+      expected: [[2], [3]]
+    - sql: SELECT g FROM mch GROUP BY g HAVING max(c) = 'ab '::varchar ORDER BY g
+      expected: [[1]]
+  teardown:
+    - DROP TABLE mch
+
+- name: HAVING on MIN or MAX of a CHAR(n) beside a text constant compares as text
+  features: [E091-03, E091-04]
+  # PostgreSQL casts the CHAR to text, so trailing spaces count; the layer
+  # refuses it (0A000) rather than compare as the CHAR
+  unimplemented: true
+  setup:
+    - CREATE TABLE mch (id INTEGER PRIMARY KEY, g INTEGER, c CHAR(4))
+    - INSERT INTO mch VALUES (1, 1, 'a'), (2, 1, 'ab'), (3, 2, NULL), (4, 2, '  '), (5, 3, '')
+  steps:
+    - sql: SELECT g FROM mch GROUP BY g HAVING max(c) = ' '::text ORDER BY g
+      expected: []
+    - sql: SELECT g FROM mch GROUP BY g HAVING min(c) < 'a '::text ORDER BY g
+      expected: [[1], [2], [3]]
+    - sql: SELECT g FROM mch GROUP BY g HAVING max(c) = 'ab '::text ORDER BY g
+      expected: []
+    - sql: SELECT g FROM mch GROUP BY c, g HAVING c = ' '::text ORDER BY g
+      expected: []
+  teardown:
+    - DROP TABLE mch
+
+- name: MIN and MAX of a jsonb field's text
+  features: [E091-03, E091-04]
+  setup:
+    - CREATE TABLE mj (id INTEGER PRIMARY KEY, g INTEGER, props JSONB)
+    - "INSERT INTO mj VALUES (1, 1, '{\"k\": \"x\"}'), (2, 1, '{\"k\": \"é\"}'), (3, 2, '{}'), (4, 2, '{\"k\": \"Z\"}')"
+  steps:
+    - sql: SELECT max(props->>'k'), min(props->>'k') FROM mj
+      expected: [[é, Z]]
+    - sql: SELECT g, min(props->>'k') FROM mj GROUP BY g ORDER BY g
+      expected: [[1, x], [2, Z]]
+  teardown:
+    - DROP TABLE mj
+
+- name: MIN and MAX of bytea and jsonb, and SUM of text, do not exist
+  features: [E091-03, E091-04]
+  setup:
+    - CREATE TABLE mx (id INTEGER PRIMARY KEY, b BYTEA, j JSONB, t TEXT)
+  steps:
+    - sql: SELECT max(b) FROM mx
+      error: "42883"
+    - sql: SELECT min(j) FROM mx
+      error: "42883"
+    - sql: SELECT sum(t) FROM mx
+      error: "42883"
+    - sql: SELECT avg(t) FROM mx
+      error: "42883"
+  teardown:
+    - DROP TABLE mx

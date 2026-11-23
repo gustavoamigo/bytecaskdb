@@ -399,6 +399,7 @@ private:
     std::unique_ptr<TccPlan> code;
     std::vector<std::string> columns;
     std::vector<SqlType> column_types;
+    std::vector<std::uint32_t> column_pads;  // what each column's values are padded to (GeneratedPlan::result_pad)
     // Each compared parameter's SQL type (bound::Bound::param_sql) and its
     // column's table: a value outside it is BC_C_RANGE on that table,
     // checked before the plan runs, whatever the plan would read.
@@ -1622,7 +1623,7 @@ private:
   // session's slots filled from `r`.
   static auto plan_params(const Compiled& c, const std::vector<Value>& params, const Reading& r) -> std::vector<Value>;
   static auto results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows;
-  static auto padded(const std::vector<SqlType>& types, std::vector<Value> values) -> std::vector<Value>;
+  static auto padded(const std::vector<std::uint32_t>& pads, std::vector<Value> values) -> std::vector<Value>;
   // CREATE TABLE AS's query, of a constant whose folding threw `error`:
   // compiled at `cat` with each such constant NULL
   // (bound::null_failing_constant), for the statement's parameters only: it
@@ -2331,6 +2332,8 @@ void Database::link(Compiled& compiled, bool compile) {
   c->column_types = c->plan->result_sql;
   c->columns.resize(c->columns.size() - c->key_columns);
   c->column_types.resize(c->column_types.size() - c->key_columns);
+  c->column_pads = c->plan->result_pad;
+  c->column_pads.resize(c->column_pads.size() - c->key_columns);
   c->result_codes = result_type_codes(c->plan->result_types);
   c->result_layout = make_result_layout(c->plan->result_types);
   if (compile) {
@@ -2843,6 +2846,12 @@ auto ctas_columns(const ast::CreateTableAs& ctas, const std::vector<std::string>
                                 "\", a numeric of no declared precision, is not supported yet" +
                                 (c.sql.kind == SqlKind::Decimal ? ": cast it to NUMERIC(p, s)" : ""));
     }
+    if (c.sql.kind == SqlKind::Char && c.sql.length == 0) {
+      // MIN or MAX of a CHAR(n): PostgreSQL's bpchar of no length, a type
+      // no column of the layer has.
+      throw FeatureNotSupported(std::string{what} + " of column \"" + c.name +
+                                "\", a character of no length, is not supported yet");
+    }
     if (!sql_type_valid(c.sql)) {
       throw FeatureNotSupported(std::string{what} + " of column \"" + c.name + "\" of type " +
                                 sql_type_name(c.sql) + " is not supported");
@@ -3161,7 +3170,7 @@ auto Database::results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows {
         bc_ctx_reset(cx);
         throw ExecError("malformed result row: column " + std::to_string(values.error()), BC_E_CORRUPT);
       }
-      out.rows.push_back(padded(out.types, std::move(*values)));
+      out.rows.push_back(padded(c.column_pads, std::move(*values)));
     }
   }
   bc_ctx_reset(cx);
@@ -3169,13 +3178,14 @@ auto Database::results(bc_ctx* cx, const Compiled& c, Rows out) -> Rows {
 }
 
 // A CHAR(n) is stored without its trailing spaces and returned padded with
-// spaces to n code points, as PostgreSQL returns it.
-auto Database::padded(const std::vector<SqlType>& types, std::vector<Value> values) -> std::vector<Value> {
-  for (std::size_t i = 0; i < values.size() && i < types.size(); ++i) {
+// spaces to n code points, as PostgreSQL returns it; so is MIN or MAX of
+// one (physical::ResultColumn::pad).
+auto Database::padded(const std::vector<std::uint32_t>& pads, std::vector<Value> values) -> std::vector<Value> {
+  for (std::size_t i = 0; i < values.size() && i < pads.size(); ++i) {
     auto* b = std::get_if<Bytes>(&values[i]);
-    if (types[i].kind != SqlKind::Char || b == nullptr) continue;
+    if (pads[i] == 0 || b == nullptr) continue;
     auto have = utf8_code_points(*b).value_or(b->size());
-    if (have < types[i].length) b->insert(b->end(), types[i].length - have, std::byte{' '});
+    if (have < pads[i]) b->insert(b->end(), pads[i] - have, std::byte{' '});
   }
   return values;
 }
@@ -3387,7 +3397,9 @@ auto Database::run_procedure(const CompiledProcedure& p, const Procedure& def, c
     out.types.push_back(def.args[i].type);
     row.push_back(px.slots.values[i]);
   }
-  if (!out.columns.empty()) out.rows.push_back(padded(out.types, std::move(row)));
+  std::vector<std::uint32_t> pads;
+  for (const auto& t : out.types) pads.push_back(t.kind == SqlKind::Char ? t.length : 0);
+  if (!out.columns.empty()) out.rows.push_back(padded(pads, std::move(row)));
   return out;
 }
 

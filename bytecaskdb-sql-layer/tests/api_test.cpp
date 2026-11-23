@@ -5624,3 +5624,67 @@ TEST_CASE("embedded API: an expression filter raises only for rows it evaluates"
   CHECK(db->execute("DELETE FROM ef WHERE a + 1 > 2").affected == 1);
   CHECK(rows("SELECT id FROM ef WHERE b = 7") == V{2});
 }
+
+TEST_CASE("embedded API: MIN and MAX of text, varchar, name and CHAR(n), bytewise, as PostgreSQL 17's under C",
+          "[sql][api][aggregate]") {
+  sql_test::TempDir dir{"api_text_minmax"};
+  auto db = Database::open(dir.path());
+  auto run = [&](std::string_view sql, const std::vector<Value>& params = {}) { return db->execute(sql, params).rows; };
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    } catch (const FeatureNotSupported&) {
+      return "0A000";
+    }
+    return "ran";
+  };
+  (void)run("CREATE TABLE mt (id INTEGER PRIMARY KEY, g INTEGER, t TEXT, v VARCHAR(10), n NAME, ch CHAR(4), j JSONB)");
+  (void)run("INSERT INTO mt VALUES (1, 1, 'a', 'a', 'a', 'b', '{\"k\": \"x\"}'), (2, 1, 'B', 'é', 'z', 'a ', '{\"k\": \"é\"}'), "
+            "(3, 2, NULL, NULL, NULL, NULL, NULL), (4, 2, 'z', 'Z', 'Z', 'ab', '{\"k\": \"Z\"}')");
+  // Bytewise: a after B, é after z. A CHAR(n)'s is printed padded to n.
+  CHECK(run("SELECT max(t), min(t), max(v), min(v), max(n), min(n), max(ch), min(ch), max(j->>'k') FROM mt") ==
+        Grid{{bytes("z"), bytes("B"), bytes("é"), bytes("Z"), bytes("z"), bytes("Z"), bytes("b   "), bytes("a   "), bytes("é")}});
+  CHECK(run("SELECT g, max(t), min(ch), max(j->>'k') FROM mt GROUP BY g ORDER BY g") ==
+        Grid{{i(1), bytes("a"), bytes("a   "), bytes("é")}, {i(2), bytes("z"), bytes("ab  "), bytes("Z")}});
+  // NULLs skipped; over no rows, or only NULLs, NULL.
+  CHECK(run("SELECT max(t), min(ch) FROM mt WHERE id = 3") == Grid{{Value{}, Value{}}});
+  CHECK(run("SELECT max(t), min(ch), count(*) FROM mt WHERE id > 10") == Grid{{Value{}, Value{}, i(0)}});
+  CHECK(run("SELECT g FROM mt GROUP BY g HAVING max(t) > $1 ORDER BY g", {bytes("b")}) == Grid{{i(2)}});
+  CHECK(run("SELECT g FROM mt GROUP BY g HAVING max(ch) = 'ab  '") == Grid{{i(2)}});
+  CHECK(run("SELECT id FROM mt WHERE ch = (SELECT max(ch) FROM mt)") == Grid{{i(1)}});
+  // Described as PostgreSQL describes them: text, and bpchar of no length.
+  const auto& st = db->prepare("SELECT max(v), max(ch) FROM mt");
+  REQUIRE(st.columns().size() == 2);
+  CHECK(st.columns()[0].type == SqlType{SqlKind::Text});
+  CHECK(st.columns()[1].type == SqlType{SqlKind::Char});
+  CHECK(state("SELECT max(j) FROM mt") == "42883");
+  CHECK(state("SELECT sum(t) FROM mt") == "42883");
+  CHECK(state("SELECT max(coalesce(ch, ch)) FROM mt") == "0A000");
+  CHECK(state("CREATE TABLE mc AS SELECT max(ch) FROM mt") == "0A000");
+}
+
+TEST_CASE("embedded API: a held MIN or MAX of text is charged to the statement, and past its budget is 54000",
+          "[sql][api][aggregate][memory]") {
+  sql_test::TempDir dir{"api_text_minmax_mem"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  (void)db->execute("CREATE TABLE mb (id INTEGER PRIMARY KEY, g INTEGER, t TEXT)");
+  auto txn = db->begin();
+  const std::string wide(12000, 'x');
+  for (int k = 0; k < 6; ++k) (void)txn.execute("INSERT INTO mb VALUES ($1, $2, $3)", {i(k), i(k), Value{bytes(wide + std::to_string(k))}});
+  (void)txn.commit();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  // One value held at a time fits; one per group, six of 12 KB, does not.
+  CHECK(state("SELECT max(t) FROM mb") == "ran");
+  CHECK(state("SELECT g, max(t) FROM mb GROUP BY g") == "54000");
+}
