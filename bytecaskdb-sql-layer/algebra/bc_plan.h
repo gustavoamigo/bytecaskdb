@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 21). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 22). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime
@@ -346,7 +346,7 @@ int64_t bc_f64_to_i64(bc_ctx *, double);        /* NaN or out of range → error
 int64_t bc_add_bigint(bc_ctx *, int64_t, int64_t, uint32_t object_id);   /* leaves BIGINT: BC_E_CONSTRAINT,
                                                    BC_C_RANGE on object_id, "bigint out of range" */
 int64_t bc_sub_bigint(bc_ctx *, int64_t, int64_t, uint32_t object_id);
-enum bc_int_type { BC_SMALLINT = 2, BC_INTEGER = 4 };
+enum bc_int_type { BC_SMALLINT = 2, BC_INTEGER = 4, BC_BIGINT = 8 };
 int64_t bc_check_int(bc_ctx *, int64_t v, uint32_t int_type, uint32_t object_id);  /* v outside the type:
                                                    BC_E_CONSTRAINT, BC_C_RANGE on object_id; else v */
 double  bc_i64_to_f64(int64_t);                 /* always defined */
@@ -383,6 +383,49 @@ bc_view bc_concat(bc_ctx *, bc_view a, bc_view b);
    allocated. */
 bc_jsonb bc_jsonb_in(bc_ctx *, bc_view text);
 bc_view  bc_jsonb_text(bc_ctx *, bc_jsonb);
+/* jsonb's accessors and casts out (docs/jsonb_design.md, stage 3). Each that
+   can give SQL NULL returns false for it, with nothing written to *out; a
+   NULL out is BC_E_HANDLE. A value found is a slice of j, with j's
+   lifetime and no copy; a lookup reads only what it needs, O(log n) by key
+   and O(1) by index, and a damaged value is BC_E_CORRUPT. A node is a
+   jsonb value of its own: a scalar is an array of itself to an index.
+   - bc_jsonb_field: j -> key, NULL for no such key or j no object;
+   - bc_jsonb_element: j -> i, i from the end when negative (-1 the last);
+     NULL outside the array or for an object;
+   - the _text forms, ->> : a string's own bytes, de-escaped, with no copy;
+     NULL for a JSON null; the text (jsonb_out's) of any other value;
+   - bc_jsonb_path_in: a text[]'s text, read as array_in reads it, as a path
+     (every dimension flat): 22P02 "malformed array literal" with its
+     DETAIL, 54000, 2202E or 22003 as array_in (BC_E_DATA); the empty view
+     is the empty path;
+   - bc_jsonb_path_add: the path with one more element, NULL when `null`;
+   - bc_jsonb_path: j #> path, as jsonb_get_element walks it: a key of an
+     object, an index of an array (its text as strtoint reads it), NULL at a
+     scalar, a NULL element or a missing step; the empty path is j. A view
+     that is no path is BC_E_HANDLE;
+   - bc_jsonb_typeof: jsonb_typeof's name, a new view;
+   - bc_jsonb_array_length: its elements; a scalar or an object is
+     BC_E_DATA 22023, "cannot get array length of a scalar" ("of a non-array");
+   - the casts: a value of another type is BC_E_DATA 22023, "cannot cast
+     jsonb string to type integer"; bc_jsonb_to_i64 rounds half away from
+     zero, and outside `int_type` (enum bc_int_type) raises BC_C_RANGE on
+     object_id, as bc_check_int; bc_jsonb_to_f64 reads the number's text as
+     float8in (float4in, `real`), its range error BC_E_DATA 22003;
+     bc_jsonb_to_num gives its text, numeric_out's (BC_T_NUM). */
+bool     bc_jsonb_field(bc_ctx *, bc_jsonb j, bc_view key, bc_jsonb *out);
+bool     bc_jsonb_field_text(bc_ctx *, bc_jsonb j, bc_view key, bc_view *out);
+bool     bc_jsonb_element(bc_ctx *, bc_jsonb j, int64_t i, bc_jsonb *out);
+bool     bc_jsonb_element_text(bc_ctx *, bc_jsonb j, int64_t i, bc_view *out);
+bc_view  bc_jsonb_path_in(bc_ctx *, bc_view text);
+bc_view  bc_jsonb_path_add(bc_ctx *, bc_view path, bc_view element, bool null);
+bool     bc_jsonb_path(bc_ctx *, bc_jsonb j, bc_view path, bc_jsonb *out);
+bool     bc_jsonb_path_text(bc_ctx *, bc_jsonb j, bc_view path, bc_view *out);
+bc_view  bc_jsonb_typeof(bc_ctx *, bc_jsonb j);
+int64_t  bc_jsonb_array_length(bc_ctx *, bc_jsonb j);
+bool     bc_jsonb_to_bool(bc_ctx *, bc_jsonb j);
+int64_t  bc_jsonb_to_i64(bc_ctx *, bc_jsonb j, uint32_t int_type, uint32_t object_id);
+double   bc_jsonb_to_f64(bc_ctx *, bc_jsonb j, bool real);
+bc_view  bc_jsonb_to_num(bc_ctx *, bc_jsonb j);
 bc_view bc_number_text(bc_ctx *, int64_t v, uint32_t scale);
 /* PostgreSQL's AVG of an integer or a DECIMAL, as numeric text (BC_T_NUM):
    numeric_div of sum (a total at `scale`) by count, at the scale

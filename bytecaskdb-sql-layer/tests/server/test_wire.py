@@ -488,6 +488,38 @@ def test_literals_are_no_parameters_and_their_columns_have_postgresqls_types(ser
     assert data(run(c, sql)) == [["2016-03-26", "t", "5"]]
 
 
+def test_the_jsonb_accessors_describe_as_postgresql_17(server):
+    """jsonb's accessors (docs/jsonb_design.md, stage 3): -> and #> give
+    jsonb (3802), ->> and jsonb_typeof text (25); a key's $n is text, a
+    path's $n text[] (1009), as PostgreSQL 17 describes them."""
+    c = connect(server)
+    c.send(query("CREATE TABLE jw (k INTEGER PRIMARY KEY, v jsonb)"))
+    c.until_ready()
+    sql = "SELECT v -> $1, v ->> 'a', v #> $2, jsonb_typeof(v), (v -> 0)::int FROM jw WHERE v #>> ARRAY[$3] = $4"
+    c.send(parse(sql, "q"), describe("S", "q"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"1tTZ"
+    assert struct.unpack("!hiiii", out[1][1]) == (4, 25, 1009, 25, 25)
+    assert row_description(out[2][1]) == [("?column?", 3802), ("?column?", 25), ("?column?", 3802), ("jsonb_typeof", 25),
+                                          ("int4", 23)]
+    assert states(run(c, "INSERT INTO jw VALUES (1, '{\"a\": [1, 2], \"b\": {\"c\": \"x\"}}')")) == []
+    assert data(run(c, sql, ["a", "{a,1}", "b", '{"c": "x"}'])) == [['[1, 2]', '[1, 2]', '2', 'object', None]]
+    assert states(run(c, sql, ["a", "{a", "b", "x"])) == ["22P02"]
+    assert states(run(c, "SELECT (v -> 'a')::int FROM jw")) == ["22023"]
+
+
+def test_a_cast_of_a_cast_parameter_is_named_by_the_outer_type(server):
+    """PostgreSQL's FigureColname: a cast's name is its operand's when that
+    names it, and an inner cast's is weak, so $1::jsonb::int is int4."""
+    c = connect(server)
+    sql = "SELECT $1::jsonb::int, ($1::jsonb)::numeric, CAST($1::jsonb AS bigint), (CAST($1 AS jsonb))::int, $1::jsonb"
+    c.send(parse(sql, "q"), describe("S", "q"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"1tTZ"
+    assert row_description(out[2][1]) == [("int4", 23), ("numeric", 1700), ("int8", 20), ("int4", 23), ("jsonb", 3802)]
+    assert data(run(c, sql, ["7"])) == [["7", "7", "7", "7", "7"]]
+
+
 def test_a_parameter_cast_in_a_select_without_from_takes_the_cast_s_type(server):
     c = connect(server)
     sql = "SELECT $1::integer, $1::integer + 1"

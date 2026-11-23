@@ -895,6 +895,7 @@ private:
       case Expr::Kind::TextFn:
       case Expr::Kind::Extract:
       case Expr::Kind::JsonbCast:
+      case Expr::Kind::Jsonb:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
       case Expr::Kind::Abs:
@@ -943,6 +944,7 @@ private:
       case Expr::Kind::TextFn:
       case Expr::Kind::Extract:
       case Expr::Kind::JsonbCast:
+      case Expr::Kind::Jsonb:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
       case Expr::Kind::Abs:
@@ -1729,11 +1731,25 @@ private:
       case Expr::Kind::TextFn: return eval_text(e);
       case Expr::Kind::Extract: return eval_extract(e);
       case Expr::Kind::JsonbCast: {
-        // jsonb_out's text, or text read by jsonb_in: the only two crossings.
+        // jsonb_out's text, or text read by jsonb_in: the only two crossings;
+        // or a jsonb to a boolean or a number.
         auto v = eval(e.args[0]);
-        if (e.phys() == PhysType::Jsonb) return guarded("bc_jsonb", "", v.null, "bc_jsonb_in(cx, " + v.value + ")", PhysType::Jsonb);
-        return guarded("bc_view", "bc_empty(cx)", v.null, "bc_jsonb_text(cx, " + v.value + ")", PhysType::Bytes);
+        switch (e.phys()) {
+          case PhysType::Jsonb: return guarded("bc_jsonb", "", v.null, "bc_jsonb_in(cx, " + v.value + ")", PhysType::Jsonb);
+          case PhysType::Bytes: return guarded("bc_view", "bc_empty(cx)", v.null, "bc_jsonb_text(cx, " + v.value + ")", PhysType::Bytes);
+          case PhysType::Bool: return guarded("bool", "0", v.null, "bc_jsonb_to_bool(cx, " + v.value + ")", PhysType::Bool);
+          case PhysType::I64: {
+            auto width = e.type.kind == SqlKind::SmallInt ? "BC_SMALLINT" : e.type.kind == SqlKind::Integer ? "BC_INTEGER" : "BC_BIGINT";
+            return guarded("int64_t", "0", v.null, "bc_jsonb_to_i64(cx, " + v.value + ", " + width + ", 0)", PhysType::I64);
+          }
+          case PhysType::F64:
+            return guarded("double", "0.0", v.null,
+                           "bc_jsonb_to_f64(cx, " + v.value + ", " + (e.type.kind == SqlKind::Real ? "1" : "0") + ")", PhysType::F64);
+          case PhysType::Num: return guarded("bc_view", "bc_empty(cx)", v.null, "bc_jsonb_to_num(cx, " + v.value + ")", PhysType::Num);
+        }
+        throw std::logic_error{"physical plan: a jsonb cast codegen does not print"};
       }
+      case Expr::Kind::Jsonb: return eval_jsonb(e);
       case Expr::Kind::Random: {
         auto lo = eval(e.args[0]);
         auto hi = eval(e.args[1]);
@@ -1838,6 +1854,7 @@ private:
       case Expr::Kind::TextFn:
       case Expr::Kind::Extract:
       case Expr::Kind::JsonbCast:
+      case Expr::Kind::Jsonb:
       case Expr::Kind::Random:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
@@ -1847,6 +1864,64 @@ private:
       call = "bc_check_int(cx, " + call + ", " + (e.type.kind == SqlKind::SmallInt ? "BC_SMALLINT" : "BC_INTEGER") + ", 0)";
     }
     return guarded("int64_t", "0", either(a.null, b.null), call, PhysType::I64);
+  }
+
+  // A jsonb accessor (docs/jsonb_design.md, stage 3): a call that writes
+  // its result through a pointer and returns false for SQL NULL, after its
+  // operands' own NULL tests; jsonb_typeof and jsonb_array_length, strict.
+  // A path is a folded one's parameter, a parameter's text read by
+  // bc_jsonb_path_in, or ARRAY[…]'s elements added in turn.
+  auto eval_jsonb(const Expr& e) -> Val {
+    using J = Expr::Jsonb;
+    switch (e.jsonb) {
+      case J::Typeof:
+      case J::ArrayLength: {
+        auto x = eval(e.args[0]);
+        if (e.jsonb == J::Typeof) return guarded("bc_view", "bc_empty(cx)", x.null, "bc_jsonb_typeof(cx, " + x.value + ")", PhysType::Bytes);
+        return guarded("int64_t", "0", x.null, "bc_jsonb_array_length(cx, " + x.value + ")", PhysType::I64);
+      }
+      case J::PathIn: {
+        auto x = eval(e.args[0]);
+        return guarded("bc_view", "bc_empty(cx)", x.null, "bc_jsonb_path_in(cx, " + x.value + ")", PhysType::Bytes);
+      }
+      case J::PathArray: {
+        auto id = std::to_string(exprs_++);
+        w_.line("bc_view v" + id + " = bc_empty(cx);");
+        for (const auto& a : e.args) {
+          auto x = eval(a);
+          // A NULL element's value is not read: a NULL parameter has none.
+          auto null = x.null.empty() ? std::string{"0"} : "(" + x.null + ")";
+          auto value = x.null.empty() ? x.value : null + " ? bc_empty(cx) : " + x.value;
+          w_.line("v" + id + " = bc_jsonb_path_add(cx, v" + id + ", " + value + ", " + null + ");");
+        }
+        return {"", "v" + id, PhysType::Bytes};
+      }
+      case J::Field:
+      case J::FieldText:
+      case J::Element:
+      case J::ElementText:
+      case J::Path:
+      case J::PathText: break;
+    }
+    auto x = eval(e.args[0]);
+    auto k = eval(e.args[1]);
+    auto text = e.jsonb == J::FieldText || e.jsonb == J::ElementText || e.jsonb == J::PathText;
+    auto fn = std::string{e.jsonb == J::Field || e.jsonb == J::FieldText       ? "bc_jsonb_field"
+                          : e.jsonb == J::Element || e.jsonb == J::ElementText ? "bc_jsonb_element"
+                                                                               : "bc_jsonb_path"} +
+              (text ? "_text" : "");
+    auto id = std::to_string(exprs_++);
+    auto type = text ? PhysType::Bytes : PhysType::Jsonb;
+    w_.line(text ? "bc_view v" + id + " = bc_empty(cx);" : declared(type, "v" + id));
+    auto null = either(x.null, k.null);
+    auto call = "!" + fn + "(cx, " + x.value + ", " + k.value + ", &v" + id + ")";
+    if (null.empty()) {
+      w_.line("bool n" + id + " = " + call + ";");
+    } else {
+      w_.line("bool n" + id + " = " + null + ";");
+      w_.line("if (!n" + id + ") n" + id + " = " + call + ";");
+    }
+    return {"n" + id, "v" + id, type};
   }
 
   // EXTRACT(field FROM x): the plan API's bc_extract, its field the

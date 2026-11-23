@@ -69,10 +69,15 @@ struct ColumnRef {
 // expressions) only.
 struct Expr {
   enum class Kind { Column, Param, Const, Add, Sub, Mul, Div, Compare, Aggregate, And, Or, Not, IsNull, Like, Truth, InSet, Case, Coalesce,
-                    Concat, Substr, Random, Mod, Neg, Abs, TextFn, Extract, JsonbCast };
+                    Concat, Substr, Random, Mod, Neg, Abs, TextFn, Extract, JsonbCast, Jsonb };
   enum class Fn { Count, Sum, Min, Max, Avg };
   // TextFn's function: PostgreSQL's of the same name, over UTF-8 text.
   enum class Text { Upper, Lower, CharLength, OctetLength, Btrim, Ltrim, Rtrim, Position };
+  // Jsonb's function (docs/jsonb_design.md, stage 3): -> and ->> by key
+  // (Field) and by index (Element), #> and #>> (Path), jsonb_typeof,
+  // jsonb_array_length; PathIn and PathArray make the path #> takes, from a
+  // text[]'s text or from ARRAY[…]'s text elements, and are never a value.
+  enum class Jsonb { Field, FieldText, Element, ElementText, Path, PathText, Typeof, ArrayLength, PathIn, PathArray };
   Kind kind{Kind::Param};
   SqlType type{};
   ColumnRef col{};              // Column
@@ -83,6 +88,7 @@ struct Expr {
   Op op{Op::Eq};                // Compare
   Fn fn{Fn::Count};             // Aggregate
   Text text{Text::Upper};       // TextFn
+  Jsonb jsonb{Jsonb::Field};    // Jsonb
   bool distinct{false};         // Aggregate: COUNT(DISTINCT arg)
   bool fold{false};             // Like: ILIKE, ASCII letters matched in either case
   std::vector<Expr> args;       // Add, Sub, Mul, Div, Compare: two; Aggregate: none (COUNT(*)) or its argument;
@@ -95,7 +101,11 @@ struct Expr {
                                 // Neg, Abs: one, of the result's type; TextFn: the text, then the trim's
                                 // characters if given, or POSITION's needle; Extract: one, a DATE, TIME,
                                 // TIMESTAMP or TIMESTAMPTZ; JsonbCast: one, a jsonb to its text (the
-                                // expression's type TEXT) or a string read as jsonb (type jsonb)
+                                // expression's type TEXT), a string read as jsonb (type jsonb), or a jsonb
+                                // to BOOLEAN, an integer, REAL, DOUBLE PRECISION or NUMERIC;
+                                // Jsonb: the jsonb, then the key (text), the index (an integer) or the path
+                                // (a PathIn of text or a PathArray of text elements, any NULL); Typeof and
+                                // ArrayLength: the jsonb alone
 
   [[nodiscard]] auto phys() const -> PhysType { return phys_type(type); }
 

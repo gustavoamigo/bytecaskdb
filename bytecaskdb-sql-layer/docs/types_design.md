@@ -132,10 +132,13 @@ A column declared `jsonb` holds any JSON value PostgreSQL 17's `jsonb_in`
 accepts, in the binary layout `jsonb_design.md` describes, and returns
 `jsonb_out`'s text byte for byte. Everything about the type, its input
 grammar, normalisation, output, layout, limits and stages, is in
-`jsonb_design.md`; this section says where it meets the codec. Stage 1 is
-built: the column, its text in and out, casts with text, `DEFAULT`, `IS
-[NOT] NULL`, `COUNT`, `CASE` and `COALESCE`. `json` is stage 1c and refused
-(0A000).
+`jsonb_design.md`; this section says where it meets the codec. Stages 1
+and 3 are built: the column, its text in and out, casts with text,
+`DEFAULT`, `IS [NOT] NULL`, `COUNT`, `CASE` and `COALESCE`; the accessors
+`->`, `->>`, `#>`, `#>>`, `jsonb_typeof`, `jsonb_array_length`, and casts
+to `boolean`, the integers, `real`, `double precision` and `numeric`
+(`frontend_design.md`, *jsonb's accessors and casts out*). `json` is stage
+1c and refused (0A000).
 
 - **Physical type.** `PhysType::Jsonb` (6), `BC_T_JSONB` in the plan API,
   a variable column (`is_fixed` is false), never a key part (`keyable` is
@@ -146,7 +149,9 @@ built: the column, its text in and out, casts with text, `DEFAULT`, `IS
   (22P02 and the rest, as `BC_E_DATA`), and `bc_row_set_jsonb` writes a
   node after the full check of the layout; `bc_col_jsonb` checks the
   format byte and hands the node out as a `bc_jsonb`. A row never holds the
-  text.
+  text. An accessor reads only the tables it needs from the stored node, a
+  key by binary search and an index by one table read, and gives a slice of
+  it with the row's lifetime; `->>` of a string is its stored bytes.
 - **Catalog.** A default is held in memory as the stored value the rows
   take, and written to the table record as its canonical text, parsed again
   at load; text that does not parse, or is not canonical, is a damaged

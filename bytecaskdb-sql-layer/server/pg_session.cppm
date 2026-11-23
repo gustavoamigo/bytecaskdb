@@ -2047,7 +2047,7 @@ private:
       auto infos = p.record ? p.record->params : std::vector<ParamInfo>{};
       out_.begin('t');
       out_.i16(static_cast<std::int16_t>(infos.size()));
-      for (const auto& i : infos) out_.i32(type_info(i.type).oid);
+      for (const auto& i : infos) out_.i32(i.path ? 1009 : type_info(i.type).oid);  // a jsonb path: text[]
       out_.end();
       describe_result(p);
     } else if (what == 'P') {

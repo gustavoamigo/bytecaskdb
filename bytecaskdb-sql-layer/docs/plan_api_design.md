@@ -1,6 +1,11 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 21 (revision 21 with `BC_T_JSONB`, the `bc_jsonb`
+Status: **built**, revision 22 (revision 22 with jsonb's accessors and casts
+out, `bc_jsonb_field`, `bc_jsonb_element`, `bc_jsonb_path` and their `_text`
+forms, `bc_jsonb_path_in`, `bc_jsonb_path_add`, `bc_jsonb_typeof`,
+`bc_jsonb_array_length` and `bc_jsonb_to_bool`, `_to_i64`, `_to_f64` and
+`_to_num`, and `BC_BIGINT` (`jsonb_design.md`, stage 3, *jsonb accessors in
+the plan API* below); revision 21 with `BC_T_JSONB`, the `bc_jsonb`
 handle and its calls `bc_col_jsonb`, `bc_row_set_jsonb`, `bc_param_jsonb`,
 `bc_jsonb_in`, `bc_jsonb_text` and `bc_emit_jsonb`, for the jsonb column
 type (`jsonb_design.md`, stage 1, *jsonb in the plan API* below); revision 20 with `BC_E_DATA`, a SQLSTATE
@@ -626,6 +631,50 @@ sorter carries a jsonb through its text (`bc_jsonb_text`, read back with
 `bc_jsonb_in`), and no other key, sort key, group key or subquery takes one
 (`BC_E_HANDLE`, or `std::logic_error` in the compiler).
 
+### jsonb accessors in the plan API
+
+Revision 22 (`jsonb_design.md`, stage 3). Each call that can give SQL NULL
+returns `false` for it and writes nothing to `*out`; a NULL `out` is
+`BC_E_HANDLE`. A node found is a slice of its source, a `bc_jsonb` with the
+source's lifetime (a row's dies with its step) and no copy. A lookup reads
+only what it needs, bounds-checked as the full check reads it: a key by
+binary search over the object's sorted keys (O(log n)), an index by one
+table read (O(1)); a damaged value is `BC_E_CORRUPT` at the read that meets
+it.
+
+```c
+bool     bc_jsonb_field(bc_ctx *, bc_jsonb j, bc_view key, bc_jsonb *out);
+bool     bc_jsonb_field_text(bc_ctx *, bc_jsonb j, bc_view key, bc_view *out);
+bool     bc_jsonb_element(bc_ctx *, bc_jsonb j, int64_t i, bc_jsonb *out);
+bool     bc_jsonb_element_text(bc_ctx *, bc_jsonb j, int64_t i, bc_view *out);
+bc_view  bc_jsonb_path_in(bc_ctx *, bc_view text);
+bc_view  bc_jsonb_path_add(bc_ctx *, bc_view path, bc_view element, bool null);
+bool     bc_jsonb_path(bc_ctx *, bc_jsonb j, bc_view path, bc_jsonb *out);
+bool     bc_jsonb_path_text(bc_ctx *, bc_jsonb j, bc_view path, bc_view *out);
+bc_view  bc_jsonb_typeof(bc_ctx *, bc_jsonb j);
+int64_t  bc_jsonb_array_length(bc_ctx *, bc_jsonb j);
+bool     bc_jsonb_to_bool(bc_ctx *, bc_jsonb j);
+int64_t  bc_jsonb_to_i64(bc_ctx *, bc_jsonb j, uint32_t int_type, uint32_t object_id);
+double   bc_jsonb_to_f64(bc_ctx *, bc_jsonb j, bool real);
+bc_view  bc_jsonb_to_num(bc_ctx *, bc_jsonb j);
+```
+
+| Function | What it does |
+|---|---|
+| `bc_jsonb_field` | `j -> key`: NULL for no such key, or `j` no object. |
+| `bc_jsonb_element` | `j -> i`, from the end when negative (-1 the last): NULL outside the array or for an object; a scalar is an array of itself. |
+| `_text` forms | `->>`: NULL for a JSON null; a string's stored bytes, de-escaped, with no copy (checked UTF-8 without a NUL byte); any other value's text, `jsonb_out`'s, in the step's storage. |
+| `bc_jsonb_path_in` | A `text[]`'s text read as `array_in` reads it, every dimension flat, as a path: a u32 count, then each element's u32 length (`0xFFFFFFFF` for NULL) and bytes, the step's. Its errors are `BC_E_DATA` with `array_in`'s SQLSTATE and DETAIL (22P02, 54000, 2202E). The empty view is the empty path. |
+| `bc_jsonb_path_add` | The path with one more element (NULL when `null`): `ARRAY[…]`'s. |
+| `bc_jsonb_path` | `j #> path`, as `jsonb_get_element` walks it: an object takes the element as a key, an array as an index (its text as `strtoint` reads it), a scalar, a NULL element or a missing step ends it with NULL; the empty path is `j`. A view that is no path is `BC_E_HANDLE`. |
+| `bc_jsonb_typeof` | `jsonb_typeof`'s name of the value. |
+| `bc_jsonb_array_length` | Its elements; a scalar or an object is `BC_E_DATA` 22023. |
+| `bc_jsonb_to_bool`, `_to_i64`, `_to_f64`, `_to_num` | The casts out: a value of another type is `BC_E_DATA` 22023 (`cannot cast jsonb string to type integer`). `_to_i64` rounds half away from zero and, outside `int_type` (`BC_SMALLINT`, `BC_INTEGER`, `BC_BIGINT`), raises `BC_C_RANGE` on `object_id` as `bc_check_int` does; `_to_f64` reads the number's text as `float8in` (`float4in` for `real`, its `float`'s value), its range error `BC_E_DATA` 22003; `_to_num` is the number's text, `BC_T_NUM`. |
+
+Every text these make, and every path, is charged to the statement's budget
+before it is allocated (`BC_E_LIMIT` past it); a lookup allocates nothing
+but its handle.
+
 A plan's constants are ids, emitted by the compiler from the catalog
 (`Catalog::constants`) and named from ids too, so that no SQL name has to be
 a C identifier:
@@ -769,7 +818,7 @@ int64_t bc_div(bc_ctx *, int64_t, int64_t);     /* zero divisor, INT64_MIN / -1 
 int64_t bc_mod(bc_ctx *, int64_t, int64_t);
 int64_t bc_neg(bc_ctx *, int64_t);              /* INT64_MIN → error */
 int64_t bc_f64_to_i64(bc_ctx *, double);        /* NaN or out of range → error; truncates */
-enum bc_int_type { BC_SMALLINT = 2, BC_INTEGER = 4 };
+enum bc_int_type { BC_SMALLINT = 2, BC_INTEGER = 4, BC_BIGINT = 8 };  /* BC_BIGINT: every v (revision 22) */
 int64_t bc_check_int(bc_ctx *, int64_t v, uint32_t int_type, uint32_t object_id);  /* outside the type: BC_C_RANGE */
 double  bc_i64_to_f64(int64_t);                 /* always defined */
 double  bc_add_f64(bc_ctx *, double, double);   /* PostgreSQL's float8 sum: finite operands that overflow → error */

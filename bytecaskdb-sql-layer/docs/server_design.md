@@ -803,6 +803,11 @@ Each `SqlType` has an OID, a length and a modifier, as `pg_type` and
 | `TIME WITH TIME ZONE` | 1266 | 12 | -1 |
 | `jsonb` | 3802 | -1 | -1 |
 
+A parameter a jsonb path takes (`j #> $1`, `jsonb_design.md`, *Path
+arguments*) is described as `text[]`, OID 1009; it is no layer type, and
+its value is its text, read by `array_in`'s rules at bind (22P02 for a
+malformed one, whatever rows the plan reaches) and again by the plan.
+
 A result column's type is the one the compiler gives it
 (`Compiled::column_types`), so the server only reports it:
 - a column, its declared type;

@@ -2079,6 +2079,45 @@ def test_a_jsonb_column_returns_postgresqls_text_on_both_targets(dsn):
         m.teardown()
 
 
+def test_the_jsonb_accessors_agree_with_postgresql_on_both_targets(dsn):
+    """jsonb's accessors and casts out (docs/jsonb_design.md, stage 3): ->,
+    ->>, #>, #>>, jsonb_typeof, jsonb_array_length and the casts, of a
+    column, over keys, indexes and paths drawn from a seeded generator, as
+    parameters and as literals; in the select list and in WHERE. Each result
+    and each SQLSTATE is PostgreSQL 17's, embedded and over the wire."""
+    import random
+
+    m = keyless_machine(dsn)()
+    try:
+        assert m.both("CREATE TABLE j1 (k BIGINT PRIMARY KEY, v jsonb, s TEXT)").error is None
+        docs = ['{"a": {"b": [1, "x", null, 2.50]}, "k": "v\\n", "n": null, "": 0}', "[10, -20.5, [30], {\"a\": 1}]",
+                '"str"', "5", "null", "true", None, '{"a": [], "ab": {"a": "deep"}}']
+        for k, v in enumerate(docs):
+            assert m.both("INSERT INTO j1 (k, v, s) VALUES ($1, $2, $3)", [k, v, "a" if k % 2 else "k"]).error is None
+        rng = random.Random(20261122)
+        keys = ["a", "b", "k", "n", "", "ab", "zz"]
+        paths = ["{}", "{a}", "{a,b}", "{a,b,1}", "{a,b,-1}", "{ab,a}", "{0}", "{2,0}", "{3,a}", "{a,NULL}", "{{a},{b}}", "{x"]
+        for _ in range(60):
+            key, i, p = rng.choice(keys), rng.randint(-5, 5), rng.choice(paths)
+            for sql, params in [
+                ("SELECT k, v -> $1, v ->> $1 FROM j1 ORDER BY k", [key]),
+                (f"SELECT k, v -> {i}, v ->> {i}, v -> s FROM j1 ORDER BY k", []),
+                ("SELECT k, v #> $1, v #>> $1 FROM j1 ORDER BY k", [p]),
+                ("SELECT k FROM j1 WHERE v ->> $1 IS NOT NULL ORDER BY k", [key]),
+                ("SELECT k FROM j1 WHERE v #> ARRAY[$1, 'b'] IS NOT NULL ORDER BY k", [key]),
+            ]:
+                m.both(sql, params)
+        for sql in ["SELECT k, jsonb_typeof(v), jsonb_typeof(v -> 'a') FROM j1 ORDER BY k",
+                    "SELECT jsonb_array_length(v) FROM j1 WHERE k = 1", "SELECT jsonb_array_length(v) FROM j1",
+                    "SELECT (v -> 0)::integer, (v -> 1)::bigint, (v -> 1)::float8, (v -> 1)::numeric FROM j1 WHERE k = 1",
+                    "SELECT (v -> 'a')::integer FROM j1", "SELECT v::boolean FROM j1 WHERE k = 5",
+                    "SELECT v -> 1::bigint FROM j1", "SELECT $1 -> 'a'"]:
+            m.both(sql, ["{}"] if "$1" in sql else [])
+        assert o.run_pg(m.pg.conn, "DROP TABLE j1").error is None
+    finally:
+        m.teardown()
+
+
 def test_a_table_without_a_primary_key_keeps_duplicates_across_a_reopen(dsn):
     """Row ids after a reopen start past the rows the data holds: an insert
     then adds a row, never collides with one (23505) or replaces it."""

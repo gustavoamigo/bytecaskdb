@@ -264,6 +264,7 @@ struct Filter {
     case Expr::Kind::TextFn:
     case Expr::Kind::Extract:
     case Expr::Kind::JsonbCast:
+    case Expr::Kind::Jsonb:
     case Expr::Kind::Mod:
     case Expr::Kind::Neg:
     case Expr::Kind::Abs:
@@ -304,6 +305,7 @@ struct Filter {
     case Expr::Kind::TextFn:
     case Expr::Kind::Extract:
     case Expr::Kind::JsonbCast:
+    case Expr::Kind::Jsonb:
     case Expr::Kind::Mod:
     case Expr::Kind::Neg:
     case Expr::Kind::Abs:
@@ -901,13 +903,20 @@ private:
       case Expr::Kind::Not:
       case Expr::Kind::Neg:
       case Expr::Kind::Abs: operands(1, 1); break;
-      case Expr::Kind::JsonbCast:
+      case Expr::Kind::JsonbCast: {
         operands(1, 1);
-        if (!((e.phys() == PhysType::Jsonb && e.args[0].phys() == PhysType::Bytes) ||
-              (e.phys() == PhysType::Bytes && e.args[0].phys() == PhysType::Jsonb))) {
-          broken("a jsonb cast of other than jsonb to text or text to jsonb");
+        auto from = e.args[0].phys();
+        auto out_of = from == PhysType::Jsonb && (e.phys() == PhysType::Bytes || e.phys() == PhysType::Bool ||
+                                                  e.phys() == PhysType::I64 || e.phys() == PhysType::F64 ||
+                                                  e.phys() == PhysType::Num);
+        if (!((e.phys() == PhysType::Jsonb && from == PhysType::Bytes) || out_of) ||
+            (e.phys() == PhysType::I64 && e.type.kind != SqlKind::SmallInt && e.type.kind != SqlKind::Integer &&
+             e.type.kind != SqlKind::BigInt)) {
+          broken("a jsonb cast of other than jsonb to text, a boolean or a number, or text to jsonb");
         }
         break;
+      }
+      case Expr::Kind::Jsonb: jsonb_value(e); break;
       case Expr::Kind::And:
       case Expr::Kind::Or: operands(2, e.args.size()); break;
       case Expr::Kind::Coalesce: operands(2, e.args.size()); break;
@@ -977,6 +986,41 @@ private:
       }
     }
     for (const auto& a : e.args) value(a);
+  }
+
+  // A jsonb accessor or function: its operands as codegen prints them.
+  void jsonb_value(const Expr& e) const {
+    using J = Expr::Jsonb;
+    auto first_jsonb = !e.args.empty() && e.args[0].phys() == PhysType::Jsonb;
+    auto ok = false;
+    switch (e.jsonb) {
+      case J::Field:
+      case J::FieldText:
+        ok = e.args.size() == 2 && first_jsonb && e.args[1].phys() == PhysType::Bytes;
+        break;
+      case J::Element:
+      case J::ElementText:
+        ok = e.args.size() == 2 && first_jsonb && e.args[1].phys() == PhysType::I64;
+        break;
+      case J::Path:
+      case J::PathText: {
+        // A path: a folded one's parameter, or PathIn or PathArray.
+        const auto& p = e.args.size() == 2 ? e.args[1] : e.args[0];
+        ok = e.args.size() == 2 && first_jsonb && p.phys() == PhysType::Bytes &&
+             (p.kind == Expr::Kind::Param || (p.kind == Expr::Kind::Jsonb && (p.jsonb == J::PathIn || p.jsonb == J::PathArray)));
+        break;
+      }
+      case J::Typeof:
+      case J::ArrayLength: ok = e.args.size() == 1 && first_jsonb; break;
+      case J::PathIn: ok = e.args.size() == 1 && e.args[0].phys() == PhysType::Bytes; break;
+      case J::PathArray:
+        ok = !e.args.empty() && std::ranges::all_of(e.args, [](const Expr& a) { return a.phys() == PhysType::Bytes; });
+        break;
+    }
+    auto text = e.jsonb == J::FieldText || e.jsonb == J::ElementText || e.jsonb == J::PathText || e.jsonb == J::Typeof ||
+                e.jsonb == J::PathIn || e.jsonb == J::PathArray;
+    auto type_ok = e.jsonb == J::ArrayLength ? e.phys() == PhysType::I64 : text ? e.phys() == PhysType::Bytes : e.phys() == PhysType::Jsonb;
+    if (!ok || !type_ok) broken("a jsonb accessor of operands codegen does not print");
   }
 
   // IN of a subquery: of a column of its subquery's set's type.
@@ -1083,6 +1127,7 @@ private:
       case Expr::Kind::TextFn:
       case Expr::Kind::Extract:
       case Expr::Kind::JsonbCast:
+      case Expr::Kind::Jsonb:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
       case Expr::Kind::Abs:

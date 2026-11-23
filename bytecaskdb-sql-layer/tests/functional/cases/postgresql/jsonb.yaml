@@ -1,5 +1,5 @@
-# jsonb (docs/jsonb_design.md): stage 1 builds the type; the cases of stages 2 to 5 are marked
-# unimplemented until their stage lands. Results recorded from PostgreSQL 17.
+# jsonb (docs/jsonb_design.md): stages 1 and 3 build the type, its accessors and casts out; the
+# cases of stages 2, 4 and 5 are marked unimplemented until their stage lands. Results recorded from PostgreSQL 17.
 
 - name: "a jsonb column takes any JSON value and returns jsonb_out's text"
   features: [pg:jsonb]
@@ -312,8 +312,6 @@
 
 - name: "-> and ->> by key and by index, on objects, arrays and scalars"
   features: [pg:jsonb]
-  # jsonb's accessors and casts out are stage 3 of docs/jsonb_design.md (0A000)
-  unimplemented: true
   steps:
     - sql: "SELECT '{\"a\": {\"b\": [1, \"x\"]}}'::jsonb -> 'a', '{\"a\": {\"b\": [1, \"x\"]}}'::jsonb -> 'a' -> 'b' ->> 1"
       expected: [["{\"b\": [1, \"x\"]}", x]]
@@ -324,16 +322,12 @@
 
 - name: "#> and #>> with a text[] path"
   features: [pg:jsonb]
-  # jsonb's accessors and casts out are stage 3 of docs/jsonb_design.md (0A000)
-  unimplemented: true
   steps:
     - sql: "SELECT '{\"a\":{\"b\":[1,2]}}'::jsonb #> '{a,b,1}', '{\"a\":{\"b\":[1,2]}}'::jsonb #>> '{a,b}', '\"x\"'::jsonb #>> '{}', '1'::jsonb #> '{0}'"
       expected: [[2, "[1, 2]", x, null]]
 
 - name: "jsonb_typeof, jsonb_array_length and the casts to boolean and numbers"
   features: [pg:jsonb]
-  # jsonb's accessors and casts out are stage 3 of docs/jsonb_design.md (0A000)
-  unimplemented: true
   steps:
     - sql: "SELECT jsonb_typeof('[]'), jsonb_typeof('1.5'), jsonb_typeof('null'), jsonb_array_length('[1,[2],3]')"
       expected: [[array, number, "null", 3]]
@@ -397,5 +391,63 @@
       expected: [["{\"a\": [2], \"b\": null}"]]
     - sql: "SELECT COALESCE(jsonb_agg(j) FILTER (WHERE j IS NOT NULL AND id > 9), '[]') FROM jb"
       expected: [["[]"]]
+  teardown:
+    - "DROP TABLE jb"
+
+- name: "the accessors resolve their right operand as PostgreSQL 17"
+  features: [pg:jsonb]
+  steps:
+    - sql: "SELECT '{\"a\":1}'::jsonb -> 'a'::varchar, '{\"1\":5}'::jsonb -> '1', '[1,2]'::jsonb -> NULL"
+      expected: [[1, 5, null]]
+    - sql: "SELECT '[1,2]'::jsonb -> 1::bigint"
+      error: "42883"
+    - sql: "SELECT '[1,2]'::jsonb -> 1.5"
+      error: "42883"
+    - sql: "SELECT '{}' -> 'a'"
+      error: "42725"
+    - sql: "SELECT '{\"a\":1}'::jsonb -> 'a' - 'b'"
+      error: "42725"
+    - sql: "SELECT '{\"a\":1}'::jsonb ->> 'a'::int"
+      error: "22P02"
+    - sql: "SELECT 'x'::text -> 'a'"
+      error: "42883"
+
+- name: "a path is read as array_in reads a text[]"
+  features: [pg:jsonb]
+  steps:
+    - sql: "SELECT '{\"a\":{\"b\":1}}'::jsonb #> '{{a},{b}}', '{\"a b\":1}'::jsonb #> '{ a b }', '{\"a\":{\"b\":[1,2]}}'::jsonb #> '[1:2]={a,b}', '{\"a\":1}'::jsonb #> ARRAY['a'], '{\"a\":1}'::jsonb #> ARRAY['a', NULL]"
+      expected: [[1, 1, "[1, 2]", 1, null]]
+    - sql: "SELECT '[1]'::jsonb #> 'a'"
+      error: "22P02"
+    - sql: "SELECT '[1]'::jsonb #> '{{a,b},{c}}'"
+      error: "22P02"
+    - sql: "SELECT '[1]'::jsonb #> '{{{{{{{a}}}}}}}'"
+      error: "54000"
+    - sql: "SELECT '[1]'::jsonb #> '[3:1]={a,b}'"
+      error: "2202E"
+    - sql: "SELECT '[1]'::jsonb #> ARRAY[1]"
+      error: "42883"
+
+- name: "the accessors over columns, in the select list, WHERE, ORDER BY and aggregates"
+  features: [pg:jsonb]
+  setup:
+    - "CREATE TABLE jb (id INTEGER PRIMARY KEY, j jsonb, s TEXT)"
+  steps:
+    - sql: "INSERT INTO jb VALUES (1, '{\"k\": \"v\", \"n\": [1, 2.5]}', 'k'), (2, '[3, 4]', 'n'), (3, NULL, 'k'), (4, '{\"k\": \"w\", \"n\": []}', 'n')"
+      rowcount: 4
+    - sql: "SELECT id, j ->> s, j #> '{n,1}', jsonb_typeof(j) FROM jb ORDER BY id"
+      expected: [[1, v, 2.5, object], [2, null, null, array], [3, null, null, null], [4, "[]", null, object]]
+      ordered: true
+    - sql: "SELECT id FROM jb WHERE j ->> 'k' = 'w'"
+      expected: [[4]]
+    - sql: "SELECT id FROM jb ORDER BY j ->> 'k' DESC, id"
+      expected: [[2], [3], [4], [1]]
+      ordered: true
+    - sql: "SELECT sum((j -> 0)::integer), count(j -> 'k') FROM jb"
+      expected: [[3, 2]]
+    - sql: "SELECT (j -> 'n' -> 1)::numeric, (j -> 'n' -> 1)::float8, (j -> 'n' -> 1)::integer FROM jb WHERE id = 1"
+      expected: [["2.5", 2.5, 3]]
+    - sql: "SELECT jsonb_array_length(j) FROM jb"
+      error: "22023"
   teardown:
     - "DROP TABLE jb"

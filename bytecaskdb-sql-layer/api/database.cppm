@@ -2966,6 +2966,20 @@ void Database::check_params(const Compiled& c, const std::vector<Value>& params)
       }
     }
   }
+  // A jsonb path's $n is a text[]: read by array_in at bind, as PostgreSQL
+  // reads it, so its error comes whether or not a row reaches it
+  // (docs/jsonb_design.md, *Path arguments*). The plan reads it again.
+  for (std::size_t i = 0; i < params.size() && i < c.params.size(); ++i) {
+    const auto* text = std::get_if<Bytes>(&params[i]);
+    if (!c.params[i].path || text == nullptr) continue;
+    std::vector<std::byte> path;
+    std::span<std::byte> out;
+    auto r = jsonb::parse_path({reinterpret_cast<const char*>(text->data()), text->size()}, jsonb::vector_out(path), out);
+    if (r.status == jsonb::Status::Data) {
+      const auto& e = *r.error;
+      throw ExecError(e.message, BC_E_DATA, e.state.packed(), e.detail, e.hint, e.context);
+    }
+  }
 }
 
 // The time as a value of each clock slot's type: the day, the time of day, or
