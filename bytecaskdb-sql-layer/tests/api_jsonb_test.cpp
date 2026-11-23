@@ -170,13 +170,11 @@ TEST_CASE("embedded API jsonb: what stage 1 refuses, each with PostgreSQL's SQLS
            Refusal{"SELECT id FROM j WHERE v @> '{}'", "0A000"},
            Refusal{"SELECT id FROM j WHERE v ? 'a'", "0A000"},
            Refusal{"SELECT to_jsonb(1)", "0A000"},
-           Refusal{"UPDATE j SET s = v", "0A000"},
            Refusal{"SELECT v::varchar(3) FROM j", "42601"},
            Refusal{"CREATE TABLE k3 (v json)", "0A000"},
            Refusal{"SELECT '1'::json", "0A000"},
            Refusal{"CREATE DOMAIN d AS jsonb", "0A000"},
            Refusal{"CREATE PROCEDURE p(x jsonb) LANGUAGE plpgsql AS $$ BEGIN END $$", "0A000"},
-           Refusal{"INSERT INTO j (id, s) SELECT 1, v FROM j", "0A000"},
            // PostgreSQL's own refusals.
            Refusal{"SELECT v + 1 FROM j", "42883"},
            // The accessors' resolution: stage 3 (docs/jsonb_design.md).
@@ -248,8 +246,11 @@ TEST_CASE("embedded API jsonb: an assignment refusal reads as PostgreSQL's, with
     CHECK(message.find("but expression is of type") != std::string::npos);
     CHECK(hint == kHint);
   }
-  // A jsonb column's value into a string column: not built (0A000).
-  CHECK(error_of("UPDATE j SET s = v").first == "assigning a jsonb value to a column of type text is not supported yet");
+  // A jsonb column's value into a string column is its text, PostgreSQL's
+  // I/O assignment cast, length-checked against a VARCHAR(n) (#904 S1).
+  CHECK(error_of("UPDATE j SET s = v WHERE id = 1").first.empty());
+  CHECK(db->execute("SELECT s FROM j WHERE id = 1").rows == Grid{{t("[1]")}});
+  CHECK(error_of("UPDATE j SET c = v WHERE id = 1").first.starts_with("value too long for type character varying(1)"));
   // A jsonb constant into a string column is its text, length-checked as PostgreSQL's assignment cast is.
   db->execute("INSERT INTO j (id, s) VALUES (3, '{\"a\": 1}'::jsonb)");
   CHECK(db->execute("SELECT s FROM j WHERE id = 3").rows == Grid{{t("{\"a\": 1}")}});

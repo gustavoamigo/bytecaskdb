@@ -1808,13 +1808,13 @@ private:
     // A BIGINT sum fails with that type's range error; a SMALLINT or INTEGER
     // result is checked against its own range, as PostgreSQL's operators of
     // those types are (the operands are held in 64 bits, so these cannot
-    // overflow first). The object a range error names is none.
+    // overflow first). The object a range error names is range_object_.
     std::string call;
     switch (e.kind) {
       case Expr::Kind::Add:
       case Expr::Kind::Sub: {
         auto fn = std::string{e.kind == Expr::Kind::Add ? "bc_add" : "bc_sub"};
-        call = e.type.kind == SqlKind::BigInt ? fn + "_bigint(cx, " + x + ", " + y + ", 0)" : fn + "(cx, " + x + ", " + y + ")";
+        call = e.type.kind == SqlKind::BigInt ? fn + "_bigint(cx, " + x + ", " + y + ", " + range_object_ + ")" : fn + "(cx, " + x + ", " + y + ")";
         break;
       }
       case Expr::Kind::Mul: call = "bc_mul(cx, " + x + ", " + y + ")"; break;
@@ -1845,7 +1845,7 @@ private:
       case Expr::Kind::Abs: throw std::logic_error{"physical plan: not an arithmetic expression"};
     }
     if (e.type.kind == SqlKind::SmallInt || e.type.kind == SqlKind::Integer) {
-      call = "bc_check_int(cx, " + call + ", " + (e.type.kind == SqlKind::SmallInt ? "BC_SMALLINT" : "BC_INTEGER") + ", 0)";
+      call = "bc_check_int(cx, " + call + ", " + (e.type.kind == SqlKind::SmallInt ? "BC_SMALLINT" : "BC_INTEGER") + ", " + range_object_ + ")";
     }
     return guarded("int64_t", "0", either(a.null, b.null), call, PhysType::I64);
   }
@@ -1944,11 +1944,11 @@ private:
     }
     std::string neg;
     switch (e.type.kind) {
-      case SqlKind::BigInt: neg = "bc_sub_bigint(cx, 0, " + x.value + ", 0)"; break;
+      case SqlKind::BigInt: neg = "bc_sub_bigint(cx, 0, " + x.value + ", " + range_object_ + ")"; break;
       case SqlKind::SmallInt:
       case SqlKind::Integer:
         neg = "bc_check_int(cx, bc_sub(cx, 0, " + x.value + "), " +
-              (e.type.kind == SqlKind::SmallInt ? "BC_SMALLINT" : "BC_INTEGER") + ", 0)";
+              (e.type.kind == SqlKind::SmallInt ? "BC_SMALLINT" : "BC_INTEGER") + ", " + range_object_ + ")";
         break;
       case SqlKind::Decimal: neg = "bc_sub(cx, 0, " + x.value + ")"; break;
       case SqlKind::Real:
@@ -2034,7 +2034,7 @@ private:
         return view(to.kind == K::Name ? "bc_text_in_bytes(cx, " + text + ", BC_TYPE_NAME)" : text);
       }
       if (to.kind == K::Boolean) return call("bool", "0", "bc_jsonb_to_bool(cx, " + v.value + ")");
-      if (is_int(to.kind)) return i64("bc_jsonb_to_i64(cx, " + v.value + ", " + int_type_code(to.kind) + ", 0)");
+      if (is_int(to.kind)) return i64("bc_jsonb_to_i64(cx, " + v.value + ", " + int_type_code(to.kind) + ", " + range_object_ + ")");
       if (is_float(to.kind)) return f64("bc_jsonb_to_f64(cx, " + v.value + ", " + (to.kind == K::Real ? "1" : "0") + ")");
       if (to.kind == K::Numeric) return view("bc_jsonb_to_num(cx, " + v.value + ")");
       throw std::logic_error{"physical plan: a jsonb cast codegen does not print"};
@@ -2060,7 +2060,7 @@ private:
     if (is_text(from.kind)) {
       if (is_int(to.kind) || is_time(to.kind) || to.kind == K::Decimal) {
         return i64("bc_text_in_i64(cx, " + v.value + ", " + sql_type_code(to.kind) + ", " + n(to.precision) + ", " +
-                   n(to.scale) + ", 0)");
+                   n(to.scale) + ", " + range_object_ + ")");
       }
       if (is_float(to.kind)) return f64("bc_text_in_f64(cx, " + v.value + ", " + sql_type_code(to.kind) + ")");
       if (to.kind == K::Boolean) return call("bool", "0", "bc_text_in_bool(cx, " + v.value + ")");
@@ -2077,10 +2077,10 @@ private:
     if (from.kind == K::Boolean) return i64(v.value + " ? 1 : 0");
     if (to.kind == K::Boolean) return call("bool", "0", v.value + " != 0");
     if (is_float(from.kind)) {
-      if (is_int(to.kind)) return i64("bc_f64_to_int(cx, " + v.value + ", " + int_type_code(to.kind) + ", 0)");
+      if (is_int(to.kind)) return i64("bc_f64_to_int(cx, " + v.value + ", " + int_type_code(to.kind) + ", " + range_object_ + ")");
       if (to.kind == K::Decimal) {
         return i64("bc_f64_to_decimal(cx, " + v.value + ", " + (from.kind == K::Real ? "1" : "0") + ", " + n(to.precision) +
-                   ", " + n(to.scale) + ", 0)");
+                   ", " + n(to.scale) + ", " + range_object_ + ")");
       }
       return f64(to.kind == K::Real ? "bc_f64_to_f32(cx, " + v.value + ")" : v.value);
     }
@@ -2094,10 +2094,10 @@ private:
     if (from.kind != K::Decimal && is_int(to.kind)) {
       // Widening is the value; narrowing is range-checked, never wrapped.
       auto narrows = to.kind == K::SmallInt || (to.kind == K::Integer && from.kind == K::BigInt);
-      return i64(narrows ? "bc_check_int(cx, " + v.value + ", " + int_type_code(to.kind) + ", 0)" : v.value);
+      return i64(narrows ? "bc_check_int(cx, " + v.value + ", " + int_type_code(to.kind) + ", " + range_object_ + ")" : v.value);
     }
     return i64("bc_decimal_rescale(cx, " + v.value + ", " + n(decimal_scale(from)) + ", " + sql_type_code(to.kind) + ", " +
-               n(to.precision) + ", " + n(to.scale) + ", 0)");
+               n(to.precision) + ", " + n(to.scale) + ", " + range_object_ + ")");
   }
 
   // a || b: text with text, an integer or a DECIMAL through its text. NULL if
@@ -3239,17 +3239,7 @@ private:
     const Sink sink = [&](Writer& w, const Row& row) {
       w.open("");
       w.line("bc_row r = bc_row_begin(cx, " + w.tbl(s.table) + ");");
-      for (std::size_t i = 0; i < s.columns.size(); ++i) {
-        const auto& col = s.columns[i].column;
-        const auto& v = row[i];
-        // An integer into a DOUBLE or REAL column: physical::check allows no other pair of types.
-        auto value = v.type == col.type ? v.value : "bc_i64_to_f64(" + v.value + ")";
-        w.open("if (" + v.null + ")");
-        w.line("bc_row_set_null(cx, r, " + w.col(col) + ");");
-        w.otherwise();
-        w.line("bc_row_set_" + carry_suffix(col.type) + "(cx, r, " + w.col(col) + ", " + value + ");");
-        w.close();
-      }
+      for (std::size_t i = 0; i < s.columns.size(); ++i) store(w, s.columns[i].column, row[i]);
       for (const auto& [col, e] : s.fixed) {
         w.line("bc_row_set_param(cx, r, " + w.col(col) + ", " + std::to_string(e.param) + ");");
       }
@@ -3318,43 +3308,38 @@ private:
     rows_ = std::move(outer);
   }
 
-  // SET col = e, from the row as read: a parameter as given, NULL included;
-  // a column, or column ± a parameter or a constant, NULL if an operand is.
+  // SET col = e, from the row as read (`old`): a parameter as given, NULL
+  // included; any other value evaluated and stored (store). A range error
+  // its arithmetic or casts raise names the updated table, as the row
+  // builder's does.
   void set(const ColumnRef& col, const Expr& e) {
     if (e.kind == Expr::Kind::Param) {
       w_.line("bc_row_set_param(cx, r, " + w_.col(col) + ", " + std::to_string(e.param) + ");");
       return;
     }
-    auto store = "bc_row_set_" + carry_suffix(col.type) + "(cx, r, " + w_.col(col) + ", ";
-    const auto& src = e.kind == Expr::Kind::Column ? e.col : e.args[0].col;
-    std::string value, null_if;
-    auto null_src = src.nullable ? col_null(src) : "";
-    if (e.kind == Expr::Kind::Column) {
-      value = read_col(src);
-      null_if = null_src;
-    } else {
-      const auto& rhs = e.args[1];
-      auto fn = std::string{e.kind == Expr::Kind::Add ? "bc_add" : "bc_sub"};
-      auto by_const = rhs.kind == Expr::Kind::Const;
-      // A BIGINT sum, the one integer sum that can leave int64, fails with
-      // the type's range error, on the table its helper names. PostgreSQL
-      // types the sum by the column read; a DECIMAL of scale 0 has BIGINT's
-      // physical type, but its operand is held to 18 digits.
-      auto bigint = e.type.kind == SqlKind::BigInt;
-      value = fn + (bigint ? "_bigint" : "") + "(cx, " + read_col(src) + ", " +
-              (by_const ? constant(rhs.constant) : param(PhysType::I64, rhs.param)) +
-              (bigint ? ", " + w_.tbl(col.table) : "") + ")";
-      null_if = by_const ? null_src : (null_src.empty() ? "" : null_src + " || ") + param_null(rhs.param);
-    }
-    if (null_if.empty()) {
-      w_.line(store + value + ");");
+    auto rows = std::exchange(rows_, std::vector<Binding>{{col.table, "old"}});
+    auto object = std::exchange(range_object_, w_.tbl(col.table));
+    auto v = eval(e);
+    range_object_ = std::move(object);
+    rows_ = std::move(rows);
+    store(w_, col, v);
+  }
+
+  // A value into column `col` of the row `r` being built: NULL as NULL, else
+  // by its physical type, which is the column's (physical::assigns); the row
+  // builder copies it and checks its range and length.
+  static void store(Writer& w, const ColumnRef& col, const Val& v) {
+    if (v.type != col.type) throw std::logic_error{"physical plan: a value stored into a column held as another type"};
+    auto line = "bc_row_set_" + carry_suffix(col.type) + "(cx, r, " + w.col(col) + ", " + v.value + ");";
+    if (v.null.empty()) {
+      w.line(line);
       return;
     }
-    w_.open("if (" + null_if + ")");
-    w_.line("bc_row_set_null(cx, r, " + w_.col(col) + ");");
-    w_.otherwise();
-    w_.line(store + value + ");");
-    w_.close();
+    w.open("if (" + v.null + ")");
+    w.line("bc_row_set_null(cx, r, " + w.col(col) + ");");
+    w.otherwise();
+    w.line(line);
+    w.close();
   }
 
   // The loop condition's prefix a LIMIT makes: limit_ and " && ", or empty.
@@ -3368,6 +3353,7 @@ private:
   bool loop_{false};             // inside a loop: a miss is `continue`
   std::string limit_;            // a LIMIT's condition, n < its count, or empty
   const Sink* sink_{nullptr};    // an arm of a set operation: where its result rows go
+  std::string range_object_{"0"};  // the object a range error eval prints names: SET's table, else none
   std::string base_limit_;       // an arm's: the statement's LIMIT, which every loop of the arm also stops at
   int open_{0};                  // an arm's: the `if` blocks its misses opened
   int exprs_{0};                 // the locals the expressions over columns printed: v<i>, n<i>, d<i>

@@ -1830,7 +1830,9 @@ fixes `from_text` shares (`integer_from`, `float_from`'s `real`,
 `frontend_design.md`: the runtime cast helpers below inherit them, so
 `bc_text_in_*` and `bc_f64_to_decimal` need no input code of their own.
 Stage C1, casts of any expression, is built, with its as-built notes under
-*Plan API calls for runtime casts*. The other stages are not yet. The dialect, PG 17's behaviour, the
+*Plan API calls for runtime casts*, and so is stage S1, expressions in
+`UPDATE … SET`, with its as-built notes under *UPDATE SET of an
+expression*. The other stages are not yet. The dialect, PG 17's behaviour, the
 refusals, the stages (M1, C0, C1, S1, G0, G1, G2) and the open questions are
 `frontend_design.md`, *Expressions in casts, GROUP BY, DISTINCT, SET and
 MIN/MAX of text (#904)*. This section is how the plan, the search, the
@@ -2137,6 +2139,29 @@ a scalar's text is at most a few dozen bytes. Each cast of fixed size
   range, length and UTF-8 checks (`catalog.cppm:1681-1750`) give 22003 and
   22001 as today. `ON CONFLICT DO UPDATE` calls the same `set()` with
   `{table, "old"}` (:3041-3050).
+
+As built (S1), where it departs from the above:
+
+- `physical::Update` keeps its `(ColumnRef, Expr)` pairs and gains no
+  declared type: the binder makes every value either one the row builder
+  stores as it is (its column's type, an integer into an integer, a
+  string into a string type) or a `Cast` to the column's type, so
+  `set_list` checks that each value is held as its column is, reads only
+  the updated table's columns, passes `value()` and `params()`, and sets
+  each column once. `physical::assigns`, which `InsertFrom` still checks
+  with its declared types, is that same rule.
+- Codegen has one `store(w, col, v)`, which `set()` and `INSERT …
+  SELECT`'s sink both call: `bc_row_set_null` for a NULL, else the
+  column's `bc_row_set_*`. Its integer-to-float conversion went into the
+  binder's `Cast`. `set()` evaluates with the row source `{table, "old"}`
+  and `range_object_` set to the table, which `eval` passes to
+  `bc_add_bigint`, `bc_sub_bigint`, `bc_check_int`, `bc_jsonb_to_i64` and
+  the cast helpers, `0` elsewhere.
+- `col ± $n` is now `eval`'s arithmetic: the golden plans of the TPROC-C
+  updates evaluate the sum into a local before the store, and a constant
+  operand (`d_next_o_id + 1`) is a fixed parameter. A SMALLINT or INTEGER
+  sum is checked by `bc_check_int` on the table, as the row builder
+  checked it.
 
 #### MIN and MAX of text
 

@@ -16,10 +16,15 @@ void plan(bc_ctx *cx) {
     return;
   }
   bc_row r = bc_row_from(cx, TBL_1, old);
-  if (bc_col_null(cx, old, COL_1_2) || bc_param_null(cx, 1)) {
+  int64_t v0 = 0;
+  bool n0 = bc_col_null(cx, old, COL_1_2) || bc_param_null(cx, 1);
+  if (!n0) {
+    v0 = bc_sub_bigint(cx, bc_col_i64(cx, old, COL_1_2), bc_param_i64(cx, 1), TBL_1);
+  }
+  if (n0) {
     bc_row_set_null(cx, r, COL_1_2);
   } else {
-    bc_row_set_i64(cx, r, COL_1_2, bc_sub_bigint(cx, bc_col_i64(cx, old, COL_1_2), bc_param_i64(cx, 1), TBL_1));
+    bc_row_set_i64(cx, r, COL_1_2, v0);
   }
   bc_update(cx, TBL_1, old, bc_row_end(cx, r));
   bc_emit_count(cx, 1);

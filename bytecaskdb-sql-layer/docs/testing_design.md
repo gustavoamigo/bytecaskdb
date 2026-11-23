@@ -160,7 +160,15 @@ The rules, by what they test.
   PostgreSQL's side `$n` is cast to the column's type, as PostgreSQL
   types it. BIGINT's edges are int64 itself. The machine does not draw a
   target other than the column read; `test_column_plus_parameter_across_bigint_and_scale_0_decimal`
-  does, for a BIGINT beside a NUMERIC(18, 0).
+  does, for a BIGINT beside a NUMERIC(18, 0), and a SMALLINT target of a
+  BIGINT sum.
+- **SET col = an expression over the row** (#904 stage S1, `set_an_expression`):
+  of one keyed row, into a column of each kind no primary key or unique
+  index holds (not a VARCHAR(n), whose excess spaces are a known
+  difference), from a column of another kind (an integer's, a DECIMAL's,
+  a boolean's or a bytea's text, a float rounded to an integer, a
+  DECIMAL rescaled) or an expression of its own kind, compared on
+  SQLSTATE where either side raises.
 
 **Integer literals and joins by key:**
 - **SET col = col ± n**, n an integer literal, on the same columns: small

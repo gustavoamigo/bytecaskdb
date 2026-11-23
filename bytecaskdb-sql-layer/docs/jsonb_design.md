@@ -1380,12 +1380,11 @@ estimates of changed lines, code and tests.
     jsonb and json* sorts them: to `boolean` and the numbers is stage 3
     (0A000), to `varchar(n)`, `char` and `name` 0A000, to anything else
     42846.
-  - Not built in stage 1, each 0A000: a jsonb column's value assigned to
-    a string column (an assignment cast; `INSERT … SELECT v::text` works,
-    and a jsonb constant is assigned as its text), `||` of a jsonb column
-    with text (of a constant it is text concatenation). `UPDATE … SET` of
-    a cast is the layer's 42601 for a cast in `SET`, any type (#904 stage
-    S1).
+  - Not built in stage 1, 0A000: `||` of a jsonb column with text (of a
+    constant it is text concatenation). A jsonb column's value assigned to
+    a string column is its text, PostgreSQL's I/O assignment cast, in
+    `SET` and `INSERT … SELECT` alike, and `UPDATE … SET` takes any
+    expression, casts included (#904 stage S1).
   - Constants are refused as columns are: a comparison, `||` or `-` of
     jsonb constants is 0A000 after an unknown literal beside the jsonb is
     read by `jsonb_in` (its 22P02 first), and a pair PostgreSQL has no

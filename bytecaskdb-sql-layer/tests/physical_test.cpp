@@ -173,11 +173,17 @@ TEST_CASE("physical: check refuses what codegen can't print", "[sql][physical]")
   refused(plan(node(physical::Insert{1, {}})), "an insert of no row");
   refused(plan(node(physical::Insert{1, {{}}})), "sets no column");
   refused(plan(node(physical::Update{get({p(0)}), 1, {}})), "sets no column");
+  // A SET value is any value over the row as read, held as its column is,
+  // each column set once.
   auto d_minus = logical::binary(logical::Expr::Kind::Sub, logical::column(kD, SqlType{SqlKind::Double}), p(1),
                                  SqlType{SqlKind::Double});
-  refused(plan(node(physical::Update{get({p(0)}), 1, {{kD, d_minus}}})), "other than an integer");
+  CHECK(refusal(plan(node(physical::Update{get({p(0)}), 1, {{kD, d_minus}}}))).empty());
   refused(plan(node(physical::Update{get({p(0)}), 1, {{kId, logical::column(kD, SqlType{SqlKind::Double})}}})),
-          "of another type");
+          "held as another type");
+  refused(plan(node(physical::Update{get({p(0)}), 1, {{kD, d_minus}, {kD, d_minus}}})), "sets a column twice");
+  auto other = kD;
+  other.table = 2;
+  refused(plan(node(physical::Update{get({p(0)}), 1, {{other, p(1)}}})), "of another table");
   // INSERT … SELECT checks each value's SQL type against its column's
   // declared one, not only how both are held: a DECIMAL of another scale, a
   // DATE into an integer or TIMESTAMP into TIMESTAMPTZ (all I64) never reach
@@ -190,18 +196,22 @@ TEST_CASE("physical: check refuses what codegen can't print", "[sql][physical]")
   };
   const SqlType dec2{SqlKind::Decimal, 0, 10, 2};
   const SqlType dec3{SqlKind::Decimal, 0, 10, 3};
+  // Stored as it is: an integer into another, which the row builder checks;
+  // a string into another string type. The binder casts every other pair
+  // to the column's own type (#904 S1).
   CHECK(refusal(insert_from(SqlType{SqlKind::Integer}, SqlType{SqlKind::BigInt})).empty());
-  CHECK(refusal(insert_from(dec2, SqlType{SqlKind::Decimal, 0, 6, 2})).empty());
-  CHECK(refusal(insert_from(SqlType{SqlKind::Double}, SqlType{SqlKind::Integer})).empty());
-  CHECK(refusal(insert_from(SqlType{SqlKind::Real}, SqlType{SqlKind::Double}, kD)).empty());
   CHECK(refusal(insert_from(SqlType{SqlKind::Varchar, 5}, SqlType{SqlKind::Text}, kB)).empty());
+  CHECK(refusal(insert_from(SqlType{SqlKind::Char, 3}, SqlType{SqlKind::Text}, kB)).empty());
   const auto no_convert = "of a type it does not convert to";
+  refused(insert_from(dec2, SqlType{SqlKind::Decimal, 0, 6, 2}), no_convert);
+  refused(insert_from(SqlType{SqlKind::Double}, SqlType{SqlKind::Integer}), no_convert);
+  refused(insert_from(SqlType{SqlKind::Real}, SqlType{SqlKind::Double}, kD), no_convert);
+  refused(insert_from(SqlType{SqlKind::Text}, SqlType{SqlKind::Char, 3}, kB), no_convert);
   refused(insert_from(dec3, dec2), no_convert);
   refused(insert_from(SqlType{SqlKind::Integer}, dec2), no_convert);
   refused(insert_from(SqlType{SqlKind::BigInt}, SqlType{SqlKind::Date}), no_convert);
   refused(insert_from(SqlType{SqlKind::TimestampTz}, SqlType{SqlKind::Timestamp}), no_convert);
   refused(insert_from(SqlType{SqlKind::Double}, dec2), no_convert);
-  refused(insert_from(SqlType{SqlKind::Char, 3}, SqlType{SqlKind::Text}, kB), no_convert);
   // A target held otherwise than its stated type says, or a column than its
   // declared type says.
   auto stated = insert_from(SqlType{SqlKind::BigInt}, SqlType{SqlKind::BigInt});

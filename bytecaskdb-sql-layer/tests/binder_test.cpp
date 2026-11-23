@@ -180,8 +180,8 @@ TEST_CASE("binder: anything outside the scope is rejected with a message and pos
   }
   CHECK(rejected(cat, "SELECT id FROM t WHERE id = $2").first ==
         "could not determine data type of parameter $1");
-  CHECK(rejected(cat, "UPDATE t SET name = name - $1 WHERE id = $2").first ==
-        "operator - is only supported on an integer or DECIMAL column of the assigned column's type");
+  // A SET value is any value expression, $n typed by its operator.
+  CHECK(rejected(cat, "UPDATE t SET name = name - $1 WHERE id = $2").first == "operator does not exist: bytea - unknown");
   {
     // A primary key column is set as any other: the runtime moves the row.
     auto b = bind_sql(cat, "UPDATE t SET id = $1 WHERE id = $2");
@@ -475,8 +475,9 @@ TEST_CASE("binder: comparisons of constants fold to a BOOLEAN; a string literal 
   CHECK(bind_sql(cat, "INSERT INTO ct VALUES ($1, DATE '1970-01-03', DATE '1970-01-03')").fixed ==
         std::vector<Datum>{std::int64_t{2}, sql_test::bytes("1970-01-03")});
   CHECK(bind_sql(cat, "SELECT k FROM ct WHERE dt >= '1970-01-03'::date").fixed == std::vector<Datum>{std::int64_t{2}});
-  CHECK(rejected(cat, "INSERT INTO ct (k, dt) VALUES ($1, TIMESTAMP '2020-01-01 00:00:00')").first ==
-        "a timestamp without time zone constant assigned to a date column is not supported yet");
+  // PostgreSQL's assignment cast, folded (#904 S1).
+  CHECK(bind_sql(cat, "INSERT INTO ct (k, dt) VALUES ($1, TIMESTAMP '2020-01-02 10:00:00')").fixed.back() ==
+        Datum{std::int64_t{18263}});
 }
 
 TEST_CASE("binder: SELECT DISTINCT is a GROUP BY of the selected columns", "[sql][binder]") {
@@ -1237,7 +1238,8 @@ TEST_CASE("binder: COUNT, ORDER BY and column + parameter", "[sql][binder]") {
   CHECK(rejected(cat, "SELECT count(*) FROM t WHERE id = $1 ORDER BY id").first ==
         "column \"t.id\" must appear in the GROUP BY clause or be used in an aggregate function");
   CHECK(rejected(cat, "SELECT id FROM t WHERE id = $1 ORDER BY nope").first == "column \"nope\" does not exist");
-  CHECK(rejected(cat, "UPDATE t SET qty = count(*) WHERE id = $1").first == "aggregate functions are not allowed here");
+  CHECK(rejected(cat, "UPDATE t SET qty = count(*) WHERE id = $1").first == "aggregate functions are not allowed in UPDATE");
+  CHECK(rejected(cat, "UPDATE t SET qty = qty + count(*) WHERE id = $1").first == "aggregate functions are not allowed in UPDATE");
   // SUM and MIN take a column held as an int64_t; SUM an exact number.
   {
     auto b = bind_sql(cat, "SELECT sum(qty) FROM t WHERE name = $1");
@@ -1257,9 +1259,9 @@ TEST_CASE("binder: COUNT, ORDER BY and column + parameter", "[sql][binder]") {
   sql_test::Fixture g;
   g.ddl(std::get<Ddl>(bind_sql(g.cat(), "CREATE TABLE s (k BIGINT PRIMARY KEY, b BIGINT, a SMALLINT)").stmt));
   CHECK(rejected(g.cat(), "UPDATE s SET b = $1, a = a + $1 WHERE k = $2").first ==
-        "parameter $1 is assigned to b (bigint) and added to a (smallint)");
+        "inconsistent types deduced for parameter $1");  // PostgreSQL's 42P08
   CHECK(rejected(g.cat(), "UPDATE s SET a = a - $1, b = $1 WHERE k = $2").first ==
-        "parameter $1 is subtracted from a (smallint) and assigned to b (bigint)");
+        "parameter $1 is combined with a (smallint) and assigned to b (bigint)");
   CHECK(rejected(g.cat(), "UPDATE s SET b = $1 WHERE a = $1").first ==
         "parameter $1 is assigned to b (bigint) and compared with a (smallint)");
   CHECK_NOTHROW(bind_sql(g.cat(), "UPDATE s SET b = b + $1 WHERE k = $1"));
@@ -1314,11 +1316,19 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
     CHECK(big.params.at(1).type == SqlType{SqlKind::BigInt});
   }
   {
-    // A literal is in its column's representation: a DECIMAL's scaled.
+    // A SET value is the select list's expression, a literal its constant;
+    // the items are in the table's column order, whatever the written one.
     auto b = bind_sql(cat, "UPDATE u SET d = d + 1, qty = qty - 2 WHERE k = $1");
     const auto& up = get<logical::Update>(b);
-    CHECK(up.set[0].second.args[1].constant == 100);
-    CHECK(up.set[1].second.args[1].constant == 2);
+    REQUIRE(up.set.size() == 2);
+    CHECK(up.set[0].first.col < up.set[1].first.col);
+    // qty - 2 is a bigint, stored as it is; d + 1 a numeric of d's scale,
+    // cast to d's DECIMAL(10, 2), which checks its precision.
+    CHECK(up.set[0].second.kind == logical::Expr::Kind::Sub);
+    const auto& d = up.set[1].second;
+    CHECK(d.kind == logical::Expr::Kind::Cast);
+    CHECK(d.type == SqlType{SqlKind::Decimal, 0, 10, 2});
+    CHECK(d.args[0].kind == logical::Expr::Kind::Add);
   }
   //                       0         1         2         3         4
   //                       01234567890123456789012345678901234567890123456789
@@ -1429,12 +1439,13 @@ TEST_CASE("binder: each refusal carries PostgreSQL's SQLSTATE", "[sql][binder][s
 
   // PostgreSQL runs these: the layer refuses a form it does not support, and
   // does not claim a code. Syntax errors are 42601 too.
-  CHECK(state("UPDATE u SET dbl = qty WHERE k = $1") == "42601");  // bigint to double precision
-  CHECK(state("UPDATE u SET s = qty WHERE k = $1") == "42601");    // any type to text
-  CHECK(state("UPDATE u SET qty = dbl WHERE k = $1") == "42601");
+  CHECK(state("UPDATE u SET dbl = qty WHERE k = $1") == "bound");  // PostgreSQL 17's assignment casts (#904 S1)
+  CHECK(state("UPDATE u SET s = qty WHERE k = $1") == "bound");
+  CHECK(state("UPDATE u SET qty = dbl WHERE k = $1") == "bound");
+  CHECK(state("UPDATE u SET s = dbl WHERE k = $1") == "0A000");  // a float's text is not float8out's yet
   CHECK(state("SELECT k FROM u WHERE d = $1 AND dbl = $1") == "42601");
-  CHECK(state("UPDATE u SET dbl = $1, qty = $1 WHERE k = $2") == "42601");  // 42P08 there: not claimed
-  CHECK(state("UPDATE u SET s = $1, qty = $1 WHERE k = $2") == "42601");
+  CHECK(state("UPDATE u SET dbl = $1, qty = $1 WHERE k = $2") == "42P08");  // PostgreSQL's (#904 S1)
+  CHECK(state("UPDATE u SET s = $1, qty = $1 WHERE k = $2") == "42P08");
   CHECK(state("UPDATE u SET s = $1 WHERE qty = $1") == "42601");  // PostgreSQL types the WHERE's $1 first
   CHECK(state("UPDATE u SET qty = qty + $1 WHERE ts = $1") == "42601");
   CHECK(state("SELECT sum(dbl) FROM u WHERE k = $1") == "bound");
@@ -2054,10 +2065,15 @@ TEST_CASE("binder: $n::T in a value types $n as T; a SELECT without FROM binds a
     CHECK(b.params[1].type == SqlType{SqlKind::BigInt});
   }
   CHECK(state("UPDATE t SET qty = $1::bigint WHERE id = 1") == "bound");
-  CHECK(state("UPDATE t SET qty = $1::integer WHERE id = 1") ==
+  CHECK(state("UPDATE t SET qty = qty::bigint WHERE id = 1") == "bound");
+  CHECK(state("INSERT INTO t VALUES ($1::integer, NULL, 1)") ==
         "42601 a cast of a parameter to other than its column's type is not supported yet");
-  CHECK(state("UPDATE t SET qty = qty::bigint WHERE id = 1") ==
-        "42601 a cast of a value expression in SET (#904 stage S1) is not supported yet");
+  {
+    // $n::T of another type than its column's is a T, assigned (#904 S1).
+    auto b = bind_sql(cat, "UPDATE t SET qty = $1::integer WHERE id = 1");
+    REQUIRE(!b.params.empty());
+    CHECK(b.params[0].type == SqlType{SqlKind::Integer});
+  }
   // An operator is ?column?, % among them, as PostgreSQL names it.
   CHECK(get<logical::Project>(bind_sql(cat, "SELECT qty % 2 FROM t")).exprs[0].name == "?column?");
   CHECK(get<logical::Project>(bind_sql(cat, "SELECT (SELECT 1) % 2")).exprs[0].name == "?column?");
@@ -2545,4 +2561,144 @@ TEST_CASE("binder: a cast of an expression binds by the cast table", "[sql][bind
     CHECK(got == std::vector<std::string>{"s", "upper", "coalesce", "text", "int8", "int4", "int4", "k", "text", "y",
                                           "?column?", "nullif", "s", "text", "coalesce", "int4"});
   }
+}
+
+TEST_CASE("binder: a SET value is any value expression, assigned by PostgreSQL 17's assignment casts", "[sql][binder]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(),
+                               "CREATE TABLE s (id INT PRIMARY KEY, a SMALLINT, n INT, d NUMERIC(5,2), f DOUBLE PRECISION, "
+                               "t TEXT, v VARCHAR(3), ch CHAR(3), nm NAME, bo BOOLEAN, dt DATE, tm TIME, ts TIMESTAMP, "
+                               "j JSONB, num NUMERIC)")
+                        .stmt));
+  const auto& cat = f.cat();
+  // SQLSTATE, message, position and HINT, or "bound".
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      auto out = std::string{e.sqlstate()} + " " + e.what() + " @" + std::to_string(e.pos());
+      if (!e.hint().empty()) out += " | " + std::string{e.hint()};
+      return out;
+    }
+    return "bound";
+  };
+  constexpr std::string_view kHint = " | You will need to rewrite or cast the expression.";
+  auto set_of = [&](std::string_view sql) { return get<logical::Update>(bind_sql(cat, sql)).set; };
+
+  // Stored as it is: its own type, an integer into another integer, a
+  // string into another string type (the row builder checks each).
+  for (auto sql : {"UPDATE s SET n = n * 2", "UPDATE s SET a = n + 100000", "UPDATE s SET v = t || 'x'",
+                   "UPDATE s SET ch = lower(t)", "UPDATE s SET nm = t", "UPDATE s SET num = num"}) {
+    INFO(sql);
+    auto set = set_of(sql);
+    REQUIRE(set.size() == 1);
+    CHECK(set[0].second.kind != logical::Expr::Kind::Cast);
+  }
+  // A cast to the column's type where the value changes.
+  for (auto sql : {"UPDATE s SET t = n", "UPDATE s SET t = bo", "UPDATE s SET t = j", "UPDATE s SET t = ch",
+                   "UPDATE s SET v = d", "UPDATE s SET n = f", "UPDATE s SET n = d", "UPDATE s SET d = n * 1.005",
+                   "UPDATE s SET f = n", "UPDATE s SET dt = ts", "UPDATE s SET ts = dt", "UPDATE s SET nm = bo",
+                   "UPDATE s SET n = (j->>'n')::bigint"}) {
+    INFO(sql);
+    auto set = set_of(sql);
+    REQUIRE(set.size() == 1);
+    CHECK(set[0].second.kind == logical::Expr::Kind::Cast);
+  }
+  CHECK(set_of("UPDATE s SET nm = bo")[0].second.type == SqlType{SqlKind::Name});  // boolout's t
+  CHECK(set_of("UPDATE s SET v = d")[0].second.type == SqlType{SqlKind::Text});
+  CHECK(set_of("UPDATE s SET d = n")[0].second.type == SqlType{SqlKind::Decimal, 0, 5, 2});
+  // No assignment cast: PostgreSQL's 42804 with its HINT, at the value.
+  //                0         1         2
+  //                0123456789012345678901234
+  CHECK(state("UPDATE s SET n = t") ==
+        "42804 column \"n\" is of type integer but expression is of type text @17" + std::string{kHint});
+  CHECK(state("UPDATE s SET bo = n") ==
+        "42804 column \"bo\" is of type boolean but expression is of type integer @18" + std::string{kHint});
+  CHECK(state("UPDATE s SET n = bo").starts_with("42804"));
+  CHECK(state("UPDATE s SET j = t").starts_with("42804"));
+  CHECK(state("UPDATE s SET n = j").starts_with("42804"));
+  CHECK(state("UPDATE s SET tm = dt") == "42804 column \"tm\" is of type time without time zone but expression is of type "
+                                         "date @18" + std::string{kHint});
+  CHECK(state("UPDATE s SET ts = tm").starts_with("42804"));
+  CHECK(state("UPDATE s SET n = $1::text").starts_with("42804"));
+  // Not taken yet: a float's text, NUMERIC of no precision.
+  CHECK(state("UPDATE s SET t = f").starts_with("0A000"));
+  CHECK(state("UPDATE s SET n = num").starts_with("0A000"));
+  CHECK(state("UPDATE s SET num = n").starts_with("0A000"));
+  // What a SET value may not hold.
+  CHECK(state("UPDATE s SET n = sum(n)") == "42803 aggregate functions are not allowed in UPDATE @17");
+  CHECK(state("UPDATE s SET n = (SELECT 1)").starts_with("42601"));
+  CHECK(state("UPDATE s SET n = n + (SELECT 1)").starts_with("42601"));
+  CHECK(state("INSERT INTO s (id, n) VALUES (1, n + 1)").starts_with("42601 INSERT values must be parameters or constants"));
+  CHECK(state("INSERT INTO s (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = s.n + excluded.n")
+            .starts_with("42601 EXCLUDED in an expression is not supported yet"));
+  CHECK(state("INSERT INTO s (id, n) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = s.n * 2, t = upper(s.t)") == "bound");
+  // $n::T of another type than its column's types $n as T; $n beside a
+  // column is typed by it, as in a select list.
+  {
+    auto b = bind_sql(cat, "UPDATE s SET t = $1::int, n = n + $2, v = $3 || t");
+    REQUIRE(b.params.size() >= 3);
+    CHECK(b.params[0].type == SqlType{SqlKind::Integer});
+    CHECK(b.params[1].type == SqlType{SqlKind::Integer});
+    CHECK(b.params[2].type == SqlType{SqlKind::Text});
+  }
+  // Every item reads the row as read, stored in the table's column order.
+  {
+    auto set = set_of("UPDATE s SET t = t || n, n = n + 1, a = a - 1");
+    REQUIRE(set.size() == 3);
+    CHECK(set[0].first.col < set[1].first.col);
+    CHECK(set[1].first.col < set[2].first.col);
+  }
+  // Two classes of error: a literal's input error is raised as met, in
+  // written order, with its position; a folded constant's (1/0, a constant
+  // out of its column's type) is the lowest-numbered column's, after the
+  // statement is analysed, with none.
+  CHECK(state("UPDATE s SET n = 'zz', a = 99999") == "22P02 invalid input syntax for type integer: \"zz\" @17");
+  CHECK(state("UPDATE s SET a = '99999', n = 1/0") == "22003 value \"99999\" is out of range for type smallint @17");
+  CHECK(state("UPDATE s SET n = 1/0, a = 99999") == "22003 smallint out of range @-1");
+  CHECK(state("UPDATE s SET a = 99999, n = 1/0") == "22003 smallint out of range @-1");
+  CHECK(state("UPDATE s SET n = n + 1/0, d = 1000") == "22012 division by zero @-1");
+  CHECK(state("UPDATE s SET n = 1/0 WHERE id = 'zz'").starts_with("22P02"));
+  CHECK(state("UPDATE s SET n = 1/0 RETURNING nosuch").starts_with("42703"));
+  // A column assigned twice: PostgreSQL's rewriter's 42601, after every
+  // analysis error and before a folding error, with no position.
+  CHECK(state("UPDATE s SET n = 1, n = 2") == "42601 multiple assignments to same column \"n\" @-1");
+  CHECK(state("UPDATE s SET n = n + 1, n = 2") == "42601 multiple assignments to same column \"n\" @-1");
+  CHECK(state("UPDATE s SET n = 1/0, n = 2") == "42601 multiple assignments to same column \"n\" @-1");
+  CHECK(state("UPDATE s SET n = 1, n = 2 WHERE nosuch = 1").starts_with("42703"));
+  CHECK(state("UPDATE s SET n = 1, zz = 2") == "42703 column \"zz\" of relation \"s\" does not exist @20");
+  CHECK(state("INSERT INTO s (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET n = 1/0, n = 2") ==
+        "42601 multiple assignments to same column \"n\" @-1");
+  // A constant of any assignment PostgreSQL has, folded by C1's cast.
+  for (auto sql : {"UPDATE s SET n = 2.5::float8", "UPDATE s SET d = 2.5::float8", "UPDATE s SET a = 2.5::real",
+                   "UPDATE s SET dt = '2024-01-01 10:00'::timestamp", "INSERT INTO s (id, n) VALUES (1, 2.5::float8)",
+                   "UPDATE s SET nm = true"}) {
+    INFO(sql);
+    CHECK(state(sql) == "bound");
+  }
+  CHECK(state("UPDATE s SET n = '1e30'::float8 WHERE false") == "22003 integer out of range @-1");
+  CHECK(state("UPDATE s SET d = 1e10::float8").starts_with("22003 numeric field overflow"));
+  // An untyped $n a SET list or a VALUES row types two ways: PostgreSQL's
+  // 42P08 with its DETAIL, at the bare $n it coerces last.
+  auto deduced = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what() + " @" + std::to_string(e.pos()) + " | " + std::string{e.detail()};
+    }
+    return "bound";
+  };
+  //                 0         1         2         3
+  //                 0123456789012345678901234567890123456789
+  CHECK(deduced("UPDATE s SET a = $1, n = $1 + 1") ==
+        "42P08 inconsistent types deduced for parameter $1 @17 | integer versus smallint");
+  CHECK(deduced("UPDATE s SET nm = $1, a = $1") == "42P08 inconsistent types deduced for parameter $1 @26 | name versus smallint");
+  CHECK(deduced("UPDATE s SET a = $1, t = lower($1)").starts_with("42P08"));
+  CHECK(deduced("INSERT INTO s (id, a, n) VALUES (8, $1, $1)") ==
+        "42P08 inconsistent types deduced for parameter $1 @40 | smallint versus integer");
+  // Not where PostgreSQL types $1 first elsewhere, nor where it runs.
+  CHECK(deduced("UPDATE s SET a = $1, n = $1 + 1 WHERE n = $1").starts_with("42601"));
+  CHECK(deduced("UPDATE s SET n = $1 + 1, a = $1").starts_with("42601"));
+  CHECK(deduced("UPDATE s SET n = $1::int, a = $1::smallint").starts_with("42601"));
+  CHECK(deduced("UPDATE s SET a = $1, nm = $1, n = $1 + 1").starts_with("42601"));
 }

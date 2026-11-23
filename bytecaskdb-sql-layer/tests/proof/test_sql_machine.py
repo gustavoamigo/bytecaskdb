@@ -1366,6 +1366,44 @@ class SqlMachine(Sides, RuleBasedStateMachine):
         where = " AND ".join(f"{k} = {o.sql_literal(t.column(k).type, v)}" for k, v in zip(t.pk, key))
         self.both(f"SELECT {', '.join(exprs)} FROM {t.name} WHERE {where}")
 
+    @precondition(lambda self: any(c.name not in t.pk for t in self.tables.values() for c in t.columns))
+    @rule(data=st.data())
+    def set_an_expression(self, data):
+        # UPDATE … SET col = an expression over the row, assigned to col's
+        # type by PostgreSQL 17's assignment cast (#904 stage S1): integers
+        # narrowed, floats rounded (rint), DECIMALs rescaled, any value's
+        # text, of one keyed row. Where either side raises, both must, with
+        # one SQLSTATE, and neither writes. Not into a primary key or unique
+        # column (a value moved among rows is a known difference), nor a
+        # VARCHAR(n) (its excess spaces are), nor a float's text (refused).
+        t = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
+        keys = self.existing_keys(t)
+        unique = {c for ix in t.indexes if ix.unique for c, _ in ix.columns}
+        targets = [c for c in t.columns
+                   if c.name not in t.pk and c.name not in unique and not c.unique
+                   and not (c.type.kind == "text" and c.type.length)]
+        if not keys or not targets:
+            return
+        key = data.draw(st.sampled_from(keys), label="key")
+        target = data.draw(st.sampled_from(targets), label="set")
+        forms = {
+            "int": {"int": ["{c} + 1", "({c} % 7) * 3", "coalesce({c}, 0) - 2"], "decimal": ["{c}", "{c} * 2"],
+                    "float": ["{c}"], "real": ["{c}"]},
+            "decimal": {"int": ["{c}", "{c} - 1"], "decimal": ["{c} + 1", "{c} * 2"]},
+            "float": {"int": ["{c}"], "decimal": ["{c}"], "float": ["{c}"], "real": ["{c}"]},
+            "real": {"int": ["{c}"], "decimal": ["{c}"], "float": ["{c}"], "real": ["{c}"]},
+            "bool": {"int": ["{c} > 0"], "bool": ["NOT {c}"]},
+            "text": {"int": ["{c}"], "decimal": ["{c}"], "bool": ["{c}"], "bytes": ["{c}"],
+                     "text": ["lower({c})", "{c} || 'x'"]},
+            "bytes": {"bytes": ["{c}"]},
+        }[target.type.kind]
+        choices = [f.format(c=c.name) for c in t.columns for f in forms.get(c.type.kind, [])]
+        if not choices:
+            return
+        expr = data.draw(st.sampled_from(choices), label="value")
+        where = " AND ".join(f"{k} = {o.sql_literal(t.column(k).type, v)}" for k, v in zip(t.pk, key))
+        self.both(f"UPDATE {t.name} SET {target.name} = {expr} WHERE {where} RETURNING {target.name}")
+
     @precondition(lambda self: self.tables)
     @rule(data=st.data())
     def count_by_key(self, data):
@@ -3113,9 +3151,11 @@ def test_column_plus_parameter_across_bigint_and_scale_0_decimal(dsn):
         assert m.add("t0", "c2", "+", d(big), (1,), target="c1").error is None  # 2 * (10^18 - 1)
         assert m.add("t0", "c2", "-", d(big), (2,), target="c1").error is None
         assert m.add("t0", "c2", "+", None, (1,), target="c1").error is None
+        # A SMALLINT target of a BIGINT col: the bigint sum, assigned (#904
+        # stage S1), range-checked as the column's.
         sql = "UPDATE t0 SET c3 = c1 + $1 WHERE c0 = $2"
-        out = o.run_layer(m.db, sql, (1, 3))
-        assert out.error == "refused" and "assigned column's type" in out.detail, out
+        assert m.both(sql, (1, 3)).error is None  # 6
+        assert m.both(sql, (100000, 3)).error == "22003"
         m.check()
     finally:
         m.teardown()
@@ -3268,11 +3308,11 @@ def test_forms_the_layer_does_not_support_are_refused_without_a_sqlstate(dsn):
     PostgreSQL's run leaves the two sides alike."""
     m = binder_machine(dsn)
     try:
+        # PostgreSQL 17's assignment casts, which SET now makes (#904 stage S1).
+        for sql in ("UPDATE t0 SET c2 = c6 WHERE c0 = $1", "UPDATE t0 SET c6 = c2 WHERE c0 = $1",
+                    "UPDATE t0 SET c1 = c6 WHERE c0 = $1", "UPDATE t0 SET c1 = c3 WHERE c0 = $1"):
+            assert o.run_layer(m.db, sql, (99,)).error is None, sql
         for sql, params in (
-            ("UPDATE t0 SET c2 = c6 WHERE c0 = $1", (99,)),  # bigint to double precision
-            ("UPDATE t0 SET c6 = c2 WHERE c0 = $1", (99,)),
-            ("UPDATE t0 SET c1 = c6 WHERE c0 = $1", (99,)),  # any type to text
-            ("UPDATE t0 SET c1 = c3 WHERE c0 = $1", (99,)),
             ("SELECT c0 FROM t0 WHERE c5 = $1 AND c2 = $1", (1,)),  # numeric and double precision
             ("SELECT c0 FROM t0 WHERE c2 = $1 AND c6 = $1", (1.5,)),
             ("UPDATE t0 SET c1 = $1 WHERE c6 = $1 AND c0 = $2", (1, 99)),  # PostgreSQL types the WHERE's $1 first
@@ -3283,11 +3323,11 @@ def test_forms_the_layer_does_not_support_are_refused_without_a_sqlstate(dsn):
             assert pg.error is None, (sql, pg)
             assert layer.error == "refused" and layer.sqlstate == "42601", (sql, layer)
         # PostgreSQL refuses an untyped $1 assigned to two columns of different types
-        # (42P08, not 42804): the layer does not claim a code for it either.
+        # with 42P08, which the layer now claims too (#904 stage S1).
         sql = "UPDATE t0 SET c2 = $1, c6 = $1 WHERE c0 = $2"
         layer = o.run_layer(m.db, sql, (2.0, 99))
         pg = o.run_pg_numbered(m.pg.conn, sql, (2.0, 99))
-        assert layer.sqlstate == "42601" and pg.sqlstate == "42P08", (sql, layer, pg)
+        assert layer.sqlstate == "42P08" and pg.sqlstate == "42P08", (sql, layer, pg)
         m.check()
     finally:
         m.teardown()
@@ -3312,16 +3352,18 @@ def test_create_table_of_an_existing_name_refuses_in_postgresqls_order(dsn):
 def test_a_parameter_used_with_two_types_is_refused(dsn):
     """SET c1 = $1, c2 = c2 + $1, with c1 BIGINT and c2 SMALLINT: the layer
     refuses a $n used with two SQL types, in either order (docs/testing_design.md,
-    *Known differences*); PostgreSQL infers one and runs it. One parameter per
-    column runs on both."""
+    *Known differences*): written so, PostgreSQL's 42P08 for an untyped $1;
+    the other order, which PostgreSQL runs, 42601. One parameter per column
+    runs on both."""
     m = fixed(dsn)
     try:
         m.create(Table("t0", [Column("c0", o.BIGINT, nullable=False), Column("c1", o.BIGINT), Column("c2", o.SMALLINT)],
                        ["c0"]))
         m.insert("t0", {"c0": 1, "c1": 0, "c2": -30000}, all_columns=True)
-        for sql in ("UPDATE t0 SET c1 = $1, c2 = c2 + $1 WHERE c0 = $2", "UPDATE t0 SET c2 = c2 + $1, c1 = $1 WHERE c0 = $2"):
-            out = o.run_layer(m.db, sql, (40000, 1))
-            assert out.error == "refused" and "parameter $1 is" in out.detail, out
+        out = o.run_layer(m.db, "UPDATE t0 SET c1 = $1, c2 = c2 + $1 WHERE c0 = $2", (40000, 1))
+        assert out.error == "refused" and out.sqlstate == "42P08", out
+        out = o.run_layer(m.db, "UPDATE t0 SET c2 = c2 + $1, c1 = $1 WHERE c0 = $2", (40000, 1))
+        assert out.error == "refused" and "parameter $1 is" in out.detail, out
         sql = "UPDATE t0 SET c1 = $1, c2 = c2 + $2 WHERE c0 = $3"
         assert m.both(sql, (40000, 32000, 1)).affected == 1
         assert m.both(sql, (40000, 32000, 1)).error == "22003"  # 2000 + 32000 leaves SMALLINT

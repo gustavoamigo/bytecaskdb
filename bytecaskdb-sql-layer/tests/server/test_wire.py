@@ -537,6 +537,28 @@ def test_a_cast_of_an_expression_is_described_and_named_as_postgresql_17(server)
     assert states(run(c, "SELECT $1::text::int", ["zz"])) == ["22P02"]
 
 
+def test_a_set_expression_types_its_parameters_as_postgresql_17(server):
+    """UPDATE … SET of an expression (#904 stage S1): $1::int assigned to a
+    text column describes $1 as int4 (23) and writes its value's text, so
+    '007' is stored as 7; $2 beside an integer column is int4; text into a
+    SMALLINT is 42804; a value outside the column's type is 22003 for the
+    row, and a statement that raises writes nothing."""
+    c = connect(server)
+    c.send(query("CREATE TABLE sw (k INTEGER PRIMARY KEY, a SMALLINT, n INTEGER, t TEXT)"))
+    c.until_ready()
+    sql = "UPDATE sw SET t = $1::int, n = n + $2 WHERE k = $3 RETURNING t, n"
+    c.send(parse(sql, "q"), describe("S", "q"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"1tTZ"
+    assert struct.unpack("!hiii", out[1][1]) == (3, 23, 23, 23)
+    assert row_description(out[2][1]) == [("t", 25), ("n", 23)]
+    assert states(run(c, "INSERT INTO sw VALUES (1, 5, 5, 'x')")) == []
+    assert data(run(c, sql, ["007", "2", "1"])) == [["7", "7"]]
+    assert states(run(c, "UPDATE sw SET a = $1 || t")) == ["42804"]
+    assert states(run(c, "UPDATE sw SET a = n + $1 WHERE k = 1", ["100000"])) == ["22003"]
+    assert data(run(c, "SELECT a, n, t FROM sw")) == [["5", "7", "7"]]
+
+
 def test_text_min_and_max_describe_as_postgresql_17(server):
     """MIN and MAX of text (#904, stage M1): of a VARCHAR text (25), of a
     CHAR(n) column bpchar of no length (1042, typmod -1), its value padded
