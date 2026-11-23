@@ -1564,6 +1564,574 @@ until then.
   aggregated query or under `DISTINCT`, an expression in the `ORDER BY` of
   a grouped or aggregated query, in `GROUP BY`, `SET` or a `WHERE`.
 
+### Expressions in WHERE, ON and HAVING (stage P)
+
+Status: **design, approved by the owner on 2026-11-22 with every
+recommendation under *Owner's decisions on stage P*.** Nothing in this section
+is built. It is a dependency of `jsonb_design.md` (*Expressions in WHERE
+and ON*; stage 3's `->>` in a `WHERE`) and of Mattermost (#889). The
+planner's part is `planner_design.md`, *Expression filters (stage P)*.
+Behaviour observed on PostgreSQL 17.12 is cited as "PG 17"; every PG 17
+claim was run with `\set VERBOSITY verbose`. Code citations are to
+`gustavoamigo/sql-jsonb-type` at fd4fe482.
+
+#### What a WHERE takes today, and the gap
+
+A `WHERE` or `ON` conjunct compares a bare column with a parameter, a
+`$n::T` of the column's type, a constant expression (folded), `$n ± k`
+beside an INTEGER column, another column, a scalar subquery or the clock
+(`Binder::compare`, `sql/binder.cppm:4363-4445`). `IS NULL` and `LIKE`
+take a column only (:4285, :4223); a `HAVING` is one comparison of a
+grouped column or an aggregate with a parameter or constant (:5708-5745).
+Everything else is 42601 `WHERE must compare a column with a parameter or
+a constant` (:4427-4429), or `ON must …`, `HAVING must …`, `IS NULL of
+other than a column …`, `LIKE of other than a column …`. PG 17 runs all of
+these:
+
+| Statement | Layer today | PG 17 |
+|---|---|---|
+| `WHERE lower(name) = $1` | 42601 | rows |
+| `WHERE a + 1 > $1`, `a * 2 < b + 1`, `abs(a) = 1` | 42601 | rows |
+| `WHERE name \|\| 'x' = 'Alicex'`, `coalesce(a, 0) = $1`, `CASE … END = 1` | 42601 | rows |
+| `WHERE lower(name) LIKE 'a%'`, `a + 1 IS NULL` | 42601 | rows |
+| `WHERE a + 0 IN (1, 5)`, `a = $1 - 1 OR b = 2` | 42601 (`$n + k … inside AND, OR or NOT`) | rows |
+| `JOIN … ON x.a + 1 = y.b`, `ON lower(x.s) = lower(y.s)` | 42601 | rows |
+| `UPDATE … WHERE lower(name) = $1`, `DELETE … WHERE a + 1 > 100` | 42601 | rows |
+| `HAVING sum(v) * 2 > 25`, `HAVING sum(v) IS NULL` | 42601 | groups |
+| `WHERE bigint_col > $1 - 100` | 42601 (`… only compared with an INTEGER column`) | rows, `$1` integer |
+
+The parser already holds any value expression on both sides of a
+comparison (`ast::Compare`, `sql/ast.cppm:175-201`; `parser.cppm:630-639`)
+and the select list already evaluates them (`Binder::value`,
+:2974-3047; `Gen::eval`, `plan/codegen.cppm:1675-1717`). Stage P connects
+the two: an operand that is not one of today's shapes is bound by the
+select list's binder and evaluated per row, by the select list's
+evaluator, as a filter.
+
+#### Positions and forms stage P takes
+
+- **Positions:** a `SELECT`'s `WHERE`, each `ON` (inner, `LEFT`, `RIGHT`,
+  and both arms of a `FULL JOIN`, *FULL JOIN* in `planner_design.md`), the
+  `WHERE` of `UPDATE` and `DELETE`, and (stage P3) `HAVING`. Wherever a
+  conjunct may stand today, under `AND`, `OR` and `NOT` included.
+- **Forms**, each over any value expression the select list takes (its
+  operators, `CASE`, `COALESCE`, `NULLIF`, the string functions, `EXTRACT`,
+  casts, scalar subqueries, the clock, and in stage 3 the jsonb
+  operators):
+  - `e1 op e2`, `op` one of `= <> < <= > >=`, either side or both an
+    expression;
+  - `e IS [NOT] NULL`;
+  - `e [NOT] [I]LIKE p [ESCAPE c]`, `e` and `p` text expressions (`LOWER(x)
+    LIKE LOWER($1)`, Mattermost's `property_field_store_listing.go:127`
+    form), the escape a parameter or a constant as today;
+  - `e [NOT] IN (x, y, …)` and `e [NOT] BETWEEN [SYMMETRIC] lo AND hi`, the
+    parser's rewrites to `OR` of `=` and to `>= AND <=` (:640-704), each
+    item any expression;
+  - a BOOLEAN expression standing alone as a conjunct or an operand of
+    `AND`, `OR` and `NOT`: `WHERE flag`, `WHERE NOT flag`, `WHERE CASE WHEN
+    … THEN … ELSE … END`, `WHERE (a > 0) = b` (open question 2). A bare
+    `$n` standing alone (`WHERE $1`) is typed BOOLEAN, as PG 17 types it
+    (`pg_prepared_statements`: `{boolean}`);
+  - in `HAVING` (stage P3), the same forms over grouped columns, aggregates,
+    parameters and constants, under `AND`, `OR` and `NOT`.
+- **A comparison of no column** (`WHERE $1 = $2`, `WHERE lower($1) = 'x'`)
+  is a filter like any other (stage P1), then a test made once before the
+  plan reads (stage P2, `planner_design.md`).
+
+Today's shapes stay as they are where their types agree: a bare column
+compared with a parameter, constant, other column, subquery or clock of
+its own type binds exactly as it does now and may bound a key. A column
+compared with an operand of another type (`d > $1::int`, `d` a
+DECIMAL(10,2)) is evaluated, never a key (`planner_design.md`, *The search:
+a filter, never a key's bound*). Only what today's gate refuses takes the
+new path, so no statement the layer runs today changes its rows; its plan
+changes only in the order of its filter conjuncts (*Evaluation order*).
+
+#### What stays refused
+
+Each keeps its SQLSTATE; positions are added where they were missing.
+Each refusal of a clause names the clause as PG 17 does.
+
+| Form | SQLSTATE | Why |
+|---|---|---|
+| An aggregate in `WHERE` (`a + count(*) > 1`) | 42803 `aggregate functions are not allowed in WHERE`, with its position | PG 17 (`parse_agg.c:606`) |
+| An aggregate in `ON` | 42803 `aggregate functions are not allowed in JOIN conditions` | PG 17 (`parse_agg.c:592`) |
+| A non-BOOLEAN expression as a conjunct | 42804 `argument of WHERE must be type boolean, not type integer`; `argument of JOIN/ON …`, `argument of HAVING …`; as an operand of `AND`, `OR` or `NOT`, `argument of AND …` (`OR`, `NOT`) at the operand's position | PG 17 (`parse_coerce.c:1180`) |
+| A column of `HAVING` neither grouped nor in an aggregate (P3) | 42803 `column "t.v" must appear in the GROUP BY clause or be used in an aggregate function` | PG 17 (`parse_agg.c:1492`) |
+| `random(lo, hi)` anywhere in a `WHERE`, `ON` or `HAVING` | 42601 `random() in a WHERE, ON or HAVING is not supported yet` | a replay cursor must read the same rows on each run (`cursor_design.md`, *The replay cursor*), as for `ORDER BY random()` (:5328); open question 3 |
+| A comparison or arithmetic of REAL or DOUBLE PRECISION as an expression (`coalesce(dbl, 0) > $1`) | 42601, as in a select list today (`comparison_value`, :3527; `arithmetic_value`, :3496) | no float evaluator in `eval` yet; a bare float column compared as today still runs |
+| `expr [NOT] IN (SELECT …)`, `expr op ANY/ALL (SELECT …)` of an expression | 42601 `IN, ANY or ALL of a subquery of other than a column` (:4240), as today | `any_of` types the set by a column (:2845-2866); a follow-up issue |
+| A `CASE` or `COALESCE` arm that PG 17 drops without folding and whose fold raises (`CASE WHEN false THEN 1/0 …`, `COALESCE(1, 1/0)`) | 42601 `a branch of CASE (COALESCE) that raises an error and is not taken is not supported yet`, as in a select list today | *Constants and CASE arms* below |
+| `GREATEST`, `LEAST` | 42601 `expression not supported`, now with its position | no evaluator yet; Mattermost's `SET … = GREATEST(…)` is open question 6 |
+| `IS [NOT] DISTINCT FROM`, `= ANY($1)` of an array, `IN` of a row | 42601, now with the position | not a stage P form |
+| A jsonb or NUMERIC comparison | as today (`numeric_compared`, :4597-4602) | `jsonb_design.md` stage 2 |
+| A correlated subquery inside an expression | as today | #836 |
+| `UPDATE … SET col = expr` beyond `col ± x` | as today (:4085-4175) | open question 6 |
+| `ORDER BY`, `GROUP BY` of an aggregated query's expression | as today | not a filter |
+
+#### Three-valued logic of an expression filter
+
+A conjunct keeps a row only when it is true. An expression of a NULL is
+NULL, so a comparison of it is unknown and rejects the row; `NOT` of
+unknown is unknown; `AND` is false when one operand is, `OR` true when one
+is; `IS [NOT] NULL` is never unknown. This is today's rule (`CONTRACT.md`,
+the three-valued-logic row), now over any operand. PG 17, table `jz_t(a,
+b)` = (0,1), (1,NULL), (2,3), (NULL,4), (-1,0):
+
+- `WHERE a + NULL = 1`: no row. `WHERE a + b = a + b`: 3 rows, not the two
+  with a NULL.
+- `WHERE (a + b > 2) IS NULL`: (1,NULL), (NULL,4). `WHERE NOT (a + b > 2)`:
+  (0,1), (-1,0).
+- `WHERE NOT (b > 2 AND a = 1)`: (0,1), (2,3), (-1,0); (1,NULL) and
+  (NULL,4) are unknown.
+- `1 / NULL::int` is NULL, not 22012: the arithmetic helpers are called
+  only for a row whose operands are not NULL (`planner_design.md`,
+  *Expressions over columns*).
+
+A row NULL-extended by an outer join reads NULL from the other side's
+columns, so a `WHERE` above the join that is not strict (`WHERE 10 / v.y >
+0 OR v.y IS NULL`, `WHERE v.y * 2 IS NULL`) raises nothing for it and
+keeps or drops it by the same rules, as in PG 17 (5 and 4 rows). A strict
+one is a difference (*Differences*, *One-table conjuncts of a join*).
+
+#### Types of the operands, parameters and literals
+
+The comparison's legality and its type are the select list's
+(`comparison_value`, :3519-3551): what `SELECT e1 < e2` takes, `WHERE e1 <
+e2` takes, with the same rescaling of numerics. What it refuses is refused
+with the same SQLSTATE: `WHERE s + 1 > 0` is 42883 `operator does not
+exist: text + integer`, and `WHERE lower(a) = 'x'` 42883 `function
+lower(integer) does not exist` (PG 17). `LIKE` of a non-text expression is
+42883 `operator does not exist: integer ~~ unknown` (PG 17). A comparison
+or arithmetic of REAL or DOUBLE inside an expression stays 42601, as in a
+select list (*What stays refused*).
+
+An untyped operand takes its type from the other side, whatever that side
+is, as PG 17 types an unknown:
+
+- **A literal** beside an expression is read as the expression's type:
+  `a + 1 = '1.5'` is 22P02 `invalid input syntax for type integer: "1.5"`
+  at bind time, `a + 1 > 1.5` compares an integer with a numeric, as the
+  select list does today (PG 17 agrees on all three).
+- **A parameter** beside an expression is typed by it. Today only a column
+  types a `$n` (`operands`/`peer_of`, :3360-3367); stage P lets any typed
+  operand do it, in the `WHERE` and, with the same change, in the select
+  list (`SELECT lower(name) = $1` is 42601 today). PG 17's types, from
+  `pg_prepared_statements`: `lower($1) = s` text; `a + 1 = $1` integer; `a +
+  $1 = 2` integer; `s || $1 = 'xa'` text; `a + 1 IN ($1, $2)` and `a + 1
+  BETWEEN $1 AND $2` integer, integer; `lower(s) LIKE $1` text. A bad value
+  bound later is 22P02 or 22003 at bind, as for a column's `$n` today
+  (PG 17: `a + 1 = $1` with '1.5' is 22P02, CONTEXT `unnamed portal
+  parameter $1 = '...'`).
+- **`$n - k` beside a BIGINT column** types `$n` INTEGER, as PG 17 does:
+  `c > $1 - 100` with `c` bigint is `{integer}`, and binding
+  1700000000000 is 22003 `value "1700000000000" is out of range for type
+  integer` in PG 17. `$1::bigint - 100` is `{bigint}`. Both run in stage P;
+  the first is the shape Mattermost writes, and it is refused today
+  (:4435-4437).
+- **`$n::T` beside a column of another type** (`d > $1::int`) types `$n` as
+  T and is evaluated as the select list evaluates `d > $1::int`, rescaled;
+  it bounds no key.
+- **Two untyped operands:** `$1 = $2` types both text, as PG 17 does; `$1 +
+  $2 = a` is 42725 `operator is not unique: unknown + unknown`, PG 17's
+  message and HINT. `abs($1) = a` types `$1` double precision in PG 17;
+  the layer has no double `abs` of an unknown and refuses it (42601), a
+  difference listed below.
+- A `$n` an earlier use typed keeps that type, as today.
+
+#### Evaluation order, and errors in rows a filter would reject
+
+An expression can raise an error for a row: 22012 for `1 / a` where `a` is
+0, 22003 for an overflow, 22P02 from a cast, 22011 from `substring`, 22025
+from `LIKE`'s escape. Whether a row raises depends on which conjuncts were
+tried on it first. PostgreSQL says the order is undefined (section
+4.2.14). Stage P1a tries them in written order; stage P1b (open question
+1) tries them as PG 17's planner orders them. Both rules share this:
+
+- **A row stops at the first top-level conjunct that is not true.**
+- **Inside `AND`, `OR`, `NOT`, `CASE` and `COALESCE`** an operand is tried
+  only while the result is unsettled, in written order, as the select
+  list's evaluator does already. PG 17: `a = 0 OR 1/a > 0` runs; `1/a > 0
+  OR a = 0` is 22012; `CASE WHEN a <> 0 THEN 1/a > 0 ELSE false END` runs;
+  `a = 1 OR (a + 1 > 0 AND b = 2)` is planned as written. P1b's
+  normalisation (below) moves `NOT` and `IN`'s items before this rule
+  applies.
+- **A row no plan reads raises nothing.** A row a key excludes, a row past
+  a `LIMIT` that stops the read, a pair of a join whose key does not
+  match: none is evaluated. Which rows a plan reads depends on the key the
+  planner chooses, so where a conjunct would raise on a row a key skips,
+  the statement's error depends on the plan (*Differences*).
+- **An error is the statement's.** A `SELECT` returns it in place of its
+  rows (a cursor at the `FETCH` that reaches the row); an `UPDATE` or
+  `DELETE` raising one has no effect, as for any run-time error (PG 17: a
+  `DELETE` raising 22012 leaves the table unchanged). The SQLSTATE is the
+  operator's, through `BC_E_ARITH` and `BC_E_DATA` (`jsonb_design.md`,
+  stage 0).
+
+**P1b: PG 17's order.** PG 17 normalises a qual, then sorts its top-level
+conjuncts by cost (`order_qual_clauses`, a stable sort). The layer does
+the same, in this order:
+
+1. **`NOT` moves inward** (PG 17's `canonicalize_qual` and negator
+   operators): `NOT (x OR y)` is `NOT x AND NOT y`, `NOT (x AND y)` is
+   `NOT x OR NOT y`, `NOT NOT x` is `x`; `NOT` of a comparison is the
+   negated comparison. PG 17: `NOT (1/a > 0 OR a = 0)` is planned `Filter:
+   ((a <> 0) AND ((1 / a) <= 0))` and returns rows 2 and -1; `NOT (a IS
+   NULL OR 1/a > 0)` is `(a IS NOT NULL) AND ((1 / a) <= 0)`. A marked `IN`
+   list (step 3) is one unit: `NOT` of it is PG's `<> ALL`, one conjunct.
+2. **Every `AND` reached from the top is flattened** into top-level
+   conjuncts, a `BETWEEN`'s included: `1/a BETWEEN 0 AND 5 AND a + 0 <> 0`
+   is 22012 in PG 17, and with `a <> 0` it is planned `(a <> 0) AND ((1/a)
+   >= 0) AND ((1/a) <= 5)`. `NOT BETWEEN` becomes an `OR` (step 1), and
+   `BETWEEN SYMMETRIC` an `OR` of two `AND`s, each one conjunct.
+3. **An `IN` list's items are regrouped** as PG 17's `transformAExprIn`
+   does: when two or more items read no column (constants, parameters,
+   `$1 + 1`), those come first, as one marked unit (PG's `= ANY`), and the
+   items that read a column follow in written order; otherwise the items
+   stay in written order. PG 17: `a IN (1/b, 0, 5)` is planned `((a = ANY
+   ('{0,5}')) OR (a = (1 / b)))` and returns (0,0) and (5,1), where `a =
+   1/b OR a = 0 OR a = 5` is 22012; `a IN (1/b, 0)` stays `(a = (1 / b))
+   OR (a = 0)`; `a NOT IN (1/b, 1)` is `(a <> 1) AND (a <> (1 / b))`. An
+   explicit `OR` is never regrouped.
+4. **Top-level conjuncts are sorted by cost, ties in written order.** The
+   cost counts each operator and function call once (every built-in the
+   layer has is `procost` 1), as PG 17's custom plan sees it:
+   - columns, constants, `IS [NOT] NULL`, `AND`, `OR`, `NOT`, `CASE` and
+     `COALESCE` cost nothing of their own;
+   - **a subtree that reads no column, no clock and no `random()` costs
+     nothing**: PG 17's custom plan, its default for a statement's first
+     five runs and every simple-query statement, folds parameters to
+     constants. `PREPARE q1(int) … WHERE 1/a > 0 AND a = $1 - 1` is planned
+     `Filter: ((a = 1) AND ((1 / a) > 0))` and returns a row; `s =
+     lower($1)` is costed as `s = 'x'`;
+   - the clock costs one call (`now()` and `CURRENT_TIMESTAMP` are calls,
+     `procost` 1, and are not folded): `ts < now() AND a + 1 > 0` ties at 2
+     and keeps its order either way; `ts < now() - interval '1 day'` costs
+     3;
+   - a marked `IN` unit costs its left operand once plus half a call per
+     item: `a + 0 IN (1, 5) AND a + b > 0` keeps its order (2 against 2);
+     `coalesce(a, 0) + 1 IN (1, 2, 3) AND 10/a > 0` puts `10/a > 0` first
+     (2 against 2.5); an explicit `a = 0 OR a = 5 OR a = 7` costs 3;
+   - a jsonb to text or text to jsonb cast costs two (PG's I/O casts); the
+     casts from jsonb to a number or BOOLEAN that stage 3 adds cost one
+     (`pg_cast` method f): `(j->'n')::int > 0` costs 3;
+   - a subquery: an uncorrelated `EXISTS` (`Truth`) costs nothing (PG's
+     one-time filter); `IN (SELECT …)` under `NOT` or `OR` (`InSet`, PG's
+     hashed SubPlan) costs one call; a top-level `IN (SELECT …)` or `op
+     ANY/ALL (SELECT …)` comes after every other conjunct, as PG 17 runs it
+     as a semi-join or a SubPlan after the scan's filter (`a IN (SELECT x
+     FROM v) AND 10/a > 0` is a `Hash Semi Join` over `Filter: ((10 / a) >
+     0)` and is 22012).
+
+PG 17's plans for the examples:
+- `1/a > 0 AND a <> 0` runs, no error: `Filter: ((a <> 0) AND ((1 / a) >
+  0))`. The same with the conjuncts written the other way.
+- `lower(s) = 'x' AND a = 1` is `Filter: ((a = 1) AND (lower(s) = 'x'))`;
+  `a + b + 1 > 0 AND a * 2 > 0` puts `a * 2 > 0` first.
+- `(1/a) IS NOT NULL AND a <> 0` keeps its order (one call each) and is
+  22012.
+- `CASE WHEN a <> 0 THEN 1/a ELSE 0 END > 0 AND b > 0` puts `b > 0` first
+  (3 calls against 1); `COALESCE(a, 0) > 0 AND b > 0` keeps its order (1
+  against 1).
+- `a IN (1,2,3,4) AND a + 1 > 0` keeps its order (2 against 2).
+
+Why PG 17's order and not the written one: a guard written after the
+expression it guards (`1/a > 0 AND a <> 0`) is legal SQL that PG 17 runs,
+and an error where PostgreSQL returns rows is the visible difference an
+application meets. Either order returns the same rows whenever no error is
+raised, so the choice never makes a result wrong; it decides only which
+statements raise.
+
+**`HAVING`** (stage P3). As PG 17's `subquery_planner` does, a `HAVING`
+conjunct that reads no aggregate, no subquery and no `random()` moves to
+the `WHERE` and is tried on every input row before grouping: `GROUP BY k
+HAVING sum(v) > 100 AND 10/k > 0` is planned `HashAggregate Filter: (sum(v)
+> 100) -> Seq Scan Filter: ((10 / k) > 0)` and is 22012 for the k = 0 row.
+The rest are ordered as a `WHERE`'s: `100/sum(v) > 0 AND sum(v) <> 0` is
+planned `(sum(v) <> 0) AND ((100 / sum(v)) > 0)` and runs (with P1b;
+written order before it).
+
+**Constants and CASE arms.** Constants are folded at bind time as today, so
+`a <> 0 AND 1/0 > 0` is 22012 even on an empty table, as in PG 17. The
+fold follows PG 17's `eval_const_expressions`, as the select list's does
+today: a `CASE` arm whose `WHEN` is constant false is dropped, and every
+arm after a constant-true `WHEN` or after a non-NULL constant `COALESCE`
+argument; every other arm is folded, so a constant error in it raises at
+bind, whether or not a row takes it. PG 17: `CASE WHEN a > 0 THEN 1/0 > 0
+ELSE true END` and `COALESCE(a, 1/0) > 0` are 22012 on an empty table; the
+layer's select list raises 22012 for both today. Where PG 17 drops an arm
+whose fold raises (`CASE WHEN false THEN 1/0 > 0 ELSE true END`,
+`COALESCE(1, 1/0)`), PG 17 runs and the layer keeps today's refusal, 42601
+`a branch of CASE that raises an error and is not taken is not supported
+yet` (*Differences*).
+
+#### Binder changes
+
+- **Parser** (`sql/parser.cppm`). A node `predicate()` does not know (a
+  bare column, a `$n`, a `FuncCall`, a `CaseExpr`, any other value
+  expression) becomes a new `ast::Compare::Kind::Value` whose expression is
+  `lhs`, so the AST's walkers (`correlated()`, `correlation()`'s `none()`,
+  the view merge, `has_subquery`) see it without a case of their own, where
+  it is rejected today (:616, :715). The `OR` an `IN` list makes is marked
+  (`ast::Compare::in_list`). `GREATEST`/`LEAST`'s refusal gets its position
+  (:508).
+- **`Binder::compare`** (:4363-4445). Today's shapes are tried first and
+  bind as now. Each refusal below falls through to `value()` for both
+  sides and `comparison_value` for the comparison, with the
+  untyped-operand rule above, giving `logical::compare(op, lhs, rhs)` over
+  any operands:
+  - `WHERE`/`ON must compare a column with a parameter or a constant`
+    (:4427-4429): falls through.
+  - `$n + n and $n - n are supported only compared with an INTEGER column`
+    (:4435-4437) and the literal past INTEGER (:4439-4441): fall through.
+  - `uncast_param`'s `a cast of a parameter to other than its column's
+    type` (:4319-4324, called at :4393): falls through; `value()` types
+    `$n` as T, and the conjunct is evaluated (B1 in `planner_design.md`).
+    A cast to DECIMAL, VARCHAR(n) or CHAR(n) stays refused by `value()`.
+  - The clock compared with other than a column (:4416-4421): the
+    `not_supported` falls through (`now() > $1`, `ts < now() - interval '1
+    day'`); `CURRENT_DATE`'s `not_yet` stays.
+  - A scalar subquery's `comparable` refusal: stays, as in a select list.
+- **Inside `AND`, `OR` and `NOT`** (:4276). The guard goes. A comparison
+  under a connective whose operand is not a bare parameter, constant,
+  column, subquery or clock binds through `value()`, `$n ± k` included (a
+  hidden parameter and a constant, evaluated): the `$n ± k` key shape is
+  made only for a top-level conjunct, the only place `add_computed` and
+  `Checker::predicate_of` look for it.
+- **`IS NULL`, `LIKE` and `Value` conjuncts** bind their operand with
+  `value()` when it is not a column (:4285, :4223); `LIKE`'s pattern may
+  be any text expression, its escape stays a parameter or a constant. A
+  `Value` conjunct must be BOOLEAN (42804 otherwise, the message naming
+  the clause or the connective, *What stays refused*). A quantified
+  subquery of an expression stays refused (:4240).
+- **An `IN` list** (P1b) binds its marked `OR` as step 3 of *Evaluation
+  order* regroups it: an `Or` whose first operand is the marked unit, an
+  `Or` of the no-column items' `=` with `logical::Expr::in_list` set, then
+  the column-reading items' `=`.
+- **`checked_expr`** (:6494-6532), used only for `WITH CHECK OPTION`
+  (:6482), gains a `Value` case (the expression cloned) and nothing else:
+  `LIKE` and subqueries stay refused there, as today. A `CHECK`
+  constraint binds from its own text (:3570-3641), and PG 17 refuses a
+  subquery in one (0A000 `cannot use subquery in check constraint`).
+- **Aggregates** in a `WHERE` or `ON` operand are 42803 with PG 17's
+  message for that clause, found by the resolver `value()` is given.
+- **`HAVING`** (stage P3): `having_conjunct` (:5708-5745) binds through the
+  same path with a resolver that maps a grouped column to the group's key
+  and an aggregate to the group's folded value (the call the select list
+  folds when written alike), and a column neither grouped nor dependent to
+  PG 17's 42803. Its `AND`, `OR`, `NOT`, `IS NULL`, `BETWEEN`, `IN` and
+  constants follow (:5709's refusal goes).
+
+#### Guarantees stage P adds to CONTRACT.md
+
+`CONTRACT.md` states the layer's rule; how far it agrees with PG 17 is
+this section's and *Differences*.
+
+- **Widened** (P1a), the three-valued-logic row (`CONTRACT.md:127`): "A
+  `WHERE`, `ON`, `UPDATE`'s or `DELETE`'s `WHERE` (and in P3 a `HAVING`)
+  of AND, OR and NOT over comparisons, IS [NOT] NULL, LIKE, `<>`, BETWEEN
+  and IN of a list, **whose operands are any value expression a select
+  list takes, or a BOOLEAN expression standing alone**, returns exactly
+  the rows for which it is true in SQL's three-valued logic …". Tests: the
+  binder, search and codegen cases below, the functional file
+  `where_expressions.yaml`, and `proof: test_keyless_machine`, `proof:
+  test_sql_machine`.
+- **Added** (P1a), errors of a filter: "An expression in a WHERE, ON or
+  HAVING is evaluated only for rows the statement reads, and the rows a
+  statement reads depend on its plan. A row a top-level conjunct rejects
+  is not tried against the conjuncts after it; inside AND, OR, NOT, CASE
+  and COALESCE an operand is evaluated only while the result is
+  unsettled, in written order. An error raised is the statement's, with
+  the operator's SQLSTATE (22003, 22012, 22P02, 22011, 22023, 22025), and
+  an UPDATE or DELETE raising one has no effect." P1a adds "Top-level
+  conjuncts are tried in written order"; P1b replaces it with "Top-level
+  conjuncts, after NOT is moved inward, ANDs are flattened and an IN
+  list's constant items are grouped first, are tried in order of their
+  count of operator and function calls, ties in written order." Tests:
+  `proof: test_a_cheaper_conjunct_guards_a_division` (P1b), `embedded API:
+  an expression filter raises only for rows it evaluates`, the keyless
+  machine.
+- **Widened**, the `$n::T` row (`CONTRACT.md:125`): a cast parameter as an
+  operand in WHERE (and in P3 HAVING) is no longer refused; beside a
+  column of another type it is compared as the select list compares it.
+- **Added** (stage P2): "A column compared with an expression of parameters,
+  constants and the clock is compared with its value computed once before
+  any row is read; an error it raises is the statement's even when no row
+  is read." Tests: `search: a row-independent operand bounds a key`,
+  `embedded API: a row-independent operand is computed once`.
+- **Widened** (stage P3), the aggregate row's HAVING clause: a HAVING of
+  expressions over grouped columns and aggregates under AND, OR and NOT,
+  its conjuncts of no aggregate evaluated on each input row.
+
+#### Tests of stage P (front end)
+
+- `tests/binder_test.cpp`: each form above binds to a `Filter` conjunct of
+  the expected tree and types; `$n` typed by an expression (`lower(s) =
+  $1` text, `a + 1 IN ($1, $2)` integers, `c > $1 - 100` integer, `$1 =
+  $2` text, text, `WHERE $1` boolean); `a = $1 - 1 OR b = 2` binds the
+  inner comparison through `value()`; `d > $1::int` an evaluated compare;
+  the refusals of the table above with their SQLSTATEs, messages per
+  clause and positions; P1b: an `IN` list's regrouping and mark. Cases
+  that assert today's refusals change: :198 (`id = $1 + qty` now binds),
+  :1299 (the BIGINT `$n - k` now binds), :1355 (`ON x.a + 1 = y.b` now
+  binds); `tests/api_test.cpp:2963` (`WHERE UPPER(v) = 'ABC'`) becomes a
+  result.
+- `tests/functional/cases/postgresql/where_expressions.yaml`, new, every
+  case run on PG 17 first: the rows of the table in *What a WHERE takes
+  today*; the three-valued-logic list above; `UPDATE` and `DELETE` with an
+  expression `WHERE`, and one that raises 22012 leaving the table as it
+  was; the type errors (42883, 42804 per clause, 42803 per clause, 42725,
+  22P02); the outer-join and `FULL JOIN` cases of `planner_design.md`,
+  *Expression filters*; the constant-fold cases of *Constants and CASE
+  arms* (22012 for a folded arm, 42601 for a dropped one, marked as a
+  difference); P1b: `1/a > 0 AND a <> 0` (rows) against `(1/a) IS NOT NULL
+  AND a <> 0` and `1/a > 0 OR a = 0` (22012), `NOT (1/a > 0 OR a = 0)`
+  (rows), the `BETWEEN` and `IN` cases of *Evaluation order*. Features
+  E061-01, E061-02, E061-03, E061-04, E061-05, E061-06, F041-04, and
+  E051-06 for `HAVING`. The header of `string_functions.yaml` (:1-3),
+  which says column cases are in `strings.yaml` marked unimplemented (none
+  is), is corrected and its column cases added.
+- `tests/functional/not_implemented/sqltest.txt`: no sqltest id is marked
+  for this gap today (every remaining id is a `not PostgreSQL:` line), so
+  no mark changes; the run must stay green.
+
+#### Stages of stage P, and their sizes
+
+| Stage | Builds | Size (code + tests + docs) |
+|---|---|---|
+| P1a | expression operands of comparisons, `IS NULL`, `LIKE`, `IN` lists, `BETWEEN` and BOOLEAN conjuncts in `WHERE`, `ON`, `UPDATE`/`DELETE` `WHERE`; `$n` typed by an expression; `$n - k` beside any integer column; `$n::T` of another type, evaluated; written conjunct order; `eval` gains `LIKE`, `Truth`, `InSet`; the key shape checks (`is_computed`, typed `use_of`), `reads_none` of any conjunct, and every conjunct-test site printing per conjunct | ~1,150 lines: parser 60, binder 280, rewrite 15, search 100, physical 70, codegen 140, tests 380, docs 105 |
+| P1b | PG 17's order: `NOT` moved inward and `AND`s flattened (`plan/rewrite.cppm`), the `IN` list's regrouping and mark, `filter_cost` and the stable sort in every filter | ~450 lines: binder 40, rewrite 60, search 90, tests 200, docs 60 |
+| P2 | an operand of no column computed once before the plan, as `$n ± k` is (`physical::Computed`, generalised), and a key's bound; a conjunct of no column a test made once | ~300 lines |
+| P3 | `HAVING` over expressions of grouped columns and aggregates, under `AND`, `OR`, `NOT`; its aggregate-free conjuncts moved to the `WHERE`; with open question 4, the same expressions in an aggregated select list | ~450 lines |
+
+`jsonb_design.md` budgeted about 1,200 lines; stage P is about 2,350. Each
+row is one PR; P1a alone unblocks jsonb stage 3's `->>` in a `WHERE`.
+
+#### Differences from PG 17 left after stage P
+
+- **Written order before P1b.** Until P1b, `1/a > 0 AND a <> 0` is 22012
+  where PG 17 returns rows.
+- **Conjunct order at the edges** (P1b). The cost is computed on the bound
+  tree, so where the layer writes an expression with another node count
+  than PG 17's (an implicit widening PG calls `int48` for, a relabel PG
+  makes a call), a tie can break the other way. PG 17 also factors common
+  terms out of an `OR` (`canonicalize_qual`), which the layer does not.
+  The subquery costs are PG 17's rank, not its estimate: a hashed
+  SubPlan's cost grows with its estimate in PG 17. Each can only move
+  which of two conjuncts raises first.
+- **The generic plan.** The cost counts a parameter expression as PG 17's
+  custom plan does. Under `plan_cache_mode = force_generic_plan`, or after
+  PG 17 switches a prepared statement to its generic plan, PG 17 counts it
+  (`a = $1 - 1` costs 2): `1/a > 0 AND a = $1 - 1` is then 22012 there and
+  runs in the layer. P1 before P2 is the same split: `a = 1/$1` with `$1` =
+  0 on an empty table raises nothing in P1 (PG 17's generic plan) and
+  22012 in P2 (its custom plan).
+- **A key PG 17 does not use.** A conjunct that would come before a
+  conjunct the layer's key takes is not tried on rows the key skips,
+  where PG 17's sequential scan tries it and raises: `(1/a) IS NOT NULL
+  AND b = 2` with a key on `b`, or, in P2, a conjunct of cost 1 beside a
+  clock key `ts < now()` (cost 2). PG 17 with an index on `b` does the
+  same as the layer. The same holds of a table a join probes: a filter
+  on it runs only on the rows a probe reaches.
+- **One-table conjuncts of a join.** PG 17 evaluates a conjunct that reads
+  one table of a join on every row of that table's scan: an `ON` conjunct
+  of any join (`t LEFT JOIN v ON t.a = v.x AND 10 / v.y > 0` is 22012
+  from a `v` row no `t` row joins, under a hash, merge or nested-loop
+  join, and even when `t` is empty), a `WHERE` conjunct of an inner join
+  (`t JOIN v ON t.a = v.x WHERE 10 / v.y > 0`), and a strict `WHERE`
+  above a left join, which PG 17 reduces to an inner join (`t LEFT JOIN v
+  ON t.a = v.x WHERE 10 / v.y > 0` is a plain `Hash Join` and 22012). The
+  layer evaluates it only on the rows its loop reaches, and keeps a
+  strict `WHERE` above a left join (`push_down`, `plan/rewrite.cppm:347-400`),
+  so it can return rows where PG 17 raises. The rows, when PG 17 returns
+  any, are the same. Open question 8.
+- **CASE and COALESCE arms PG 17 drops.** `CASE WHEN false THEN 1/0 > 0
+  ELSE true END` and `COALESCE(1, 1/0)` run in PG 17 and stay 42601
+  (*Constants and CASE arms*).
+- **An `IN` list's left operand** is evaluated once per item it is
+  compared with, where PG 17's `= ANY` evaluates it once. The rows and
+  the first error are the same; only the work differs.
+- **No expression is a key.** `lower(name) = $1` reads the whole table;
+  PG 17 uses an expression index on `lower(name)` where there is one. The
+  layer has no expression indexes. Results agree.
+- `random()` in a filter, `abs($1)` of an untyped parameter, a float in an
+  expression, `expr IN (SELECT …)`, `GREATEST`, `LEAST`, `IS DISTINCT
+  FROM`, `= ANY(array)`: refused (above).
+
+#### Owner's decisions on stage P
+
+The owner approved every recommendation below on 2026-11-22. Question 8's
+outer-join reduction is tracked as a planner improvement of its own.
+
+1. **The order of conjuncts.** (a) PG 17's order (P1b) in the same PR as
+   P1a; (b) P1a with written order, P1b as the next PR (recommended: P1a
+   is correct on its own, and P1b's rules — the normalisation, the `IN`
+   regrouping, a cost table that tracks PG 17 — are reviewed alone); (c)
+   written order only, simplest to explain, but `1/a > 0 AND a <> 0` stays
+   22012 where PG 17 returns rows; (d) today's order (key's leftovers,
+   then predicates), which matches neither.
+2. **A BOOLEAN expression standing alone as a conjunct** (`WHERE flag`,
+   `WHERE CASE … END`) in P1a. Recommended yes: the parser change is the
+   `Value` kind, the rest is the same path, and `WHERE flag` is common.
+3. **`random()` in a filter.** Recommended refused (42601), as `ORDER BY
+   random()` is: a replay cursor (`cursor_design.md`) recomputes its rows
+   and would read others. The select list's `random()` in a cursor already
+   replays different values; that is a separate issue to open.
+4. **P3 and the aggregated select list.** `SELECT sum(v) * 2 … GROUP BY k`
+   is 42601 today (`an expression in the select list of an aggregated query
+   is not supported yet`); the leaf that evaluates an aggregate's folded
+   value in a `HAVING` is the leaf that select list needs. Recommended: in
+   P3, one more case in the Emit of a group.
+5. **SQLSTATE of the refusals stage P adds** (`random()` in a filter).
+   Recommended 42601 `… is not supported yet`, as the `WHERE` refusals it
+   sits among are; `jsonb_design.md`'s 0A000 is for jsonb's own refusals.
+6. **Expressions in `SET`** (Mattermost's `SET … = GREATEST(…)`, `SET a = a
+   * 2`, `SET name = lower(name)`). Not a filter, and not stage P: `set()`
+   (`codegen.cppm:3036-3075`) and `set_list` (`physical.cppm:731-741`) take
+   `eval` and `value()` in a small addendum of its own with `GREATEST` and
+   `LEAST`. Recommended: a follow-up issue, built after P1a.
+7. **An expression as a join key** (`ON lower(x.s) = lower(y.s)` is a
+   nested loop of every pair). Recommended: a follow-up issue for a hash
+   join on expressions and an inner probe by an outer expression, after P2.
+8. **One-table conjuncts of a join.** Matching PG 17 needs outer-join
+   reduction in `push_down` and a full scan of a joined table with a
+   raising filter, which changes the plans of today's joins. Recommended:
+   not in stage P; the difference stays listed, and the keyless machine
+   draws raising operators only where it does not apply.
+9. **`expr IN (SELECT …)`.** Typing the set by an expression needs
+   `any_of` and `InSet` over an expression's type (a synthetic column, as
+   `like()` builds, and `eval`'s `InSet` by the expression's physical
+   type). Recommended: a follow-up issue after P1a.
+
+#### Risks of stage P
+
+- **Errors where PG 17 has none, or the reverse.** Bounded by P1b's
+  order and checked by the keyless proof machine, whose tables have no
+  key so both sides scan, on single-table `WHERE`s; what is left is
+  listed above.
+- **Shape checks that trust a conjunct's form.** Today's key and `truth`
+  paths read a conjunct by its shape; stage P makes new shapes that pass
+  those checks (`planner_design.md`, B1-B3). Each check becomes one
+  predicate shared by the search, the checker and codegen.
+- **Full scans an application did not expect.** `lower(col) = $1` cannot
+  use a key. Mattermost's expression-index queries will scan; the work
+  budget bounds each one.
+- **Plans of today's statements change order.** P1a's written order and
+  P1b's cost sort can move a predicate ahead of a comparison in a printed
+  plan; codegen tests that compare plan text change with it, and no
+  result does.
+- **Generated code size.** Each expression conjunct prints its locals;
+  compile time grows with the expression, as the select list's does.
+
+#### Edits to other documents once stage P is built
+
+`frontend_design.md`'s *Where expressions may appear* (:461-463) and
+**WHERE** rules (:470-534), its not-yet list (:1189, :1216-1225, the
+string function, expression, `HAVING` items); `planner_design.md`'s *What
+the search refuses* (:1686-1715); `README.md:63` (the "expression in … a
+WHERE" and "string function in a WHERE" gaps); `jsonb_design.md`,
+*Expressions in WHERE and ON*, pointing here.
+
 ## Binding
 
 The binder (`sql/binder.cppm`) resolves names against the catalog version
