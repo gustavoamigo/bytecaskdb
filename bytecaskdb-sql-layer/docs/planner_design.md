@@ -14,7 +14,8 @@ joins of up to 32 tables, every order tried up to 12 (*Joins of several
 tables*).
 The first of the post-MVP designs (#487, *Next*). The parser, the plan API
 and TinyCC are unchanged by it; the binder's output changed. The rest of
-the dialect is #534's (*Slices*).
+the dialect is #534's (*Slices*). *Expressions in casts, group keys,
+DISTINCT, SET and text MIN/MAX (#904)* is approved (2026-11-22), not built yet.
 
 ## Why
 
@@ -1817,6 +1818,374 @@ its text, and every reader of `Rows` (the Python binding, `pg_text`, the
 harness) decides by the kind. Its sum is an
 integer sum, as `SUM`'s, with its 64-bit limit (`frontend_design.md`,
 *Known differences*).
+
+### Expressions in casts, group keys, DISTINCT, SET and text MIN/MAX (#904)
+
+Status: **approved** by the owner on 2026-11-22, with every recommendation
+in *Open questions on #904*; tracking issue #904. Nothing here is built yet. The dialect, PG 17's behaviour, the
+refusals, the stages (M1, C0, C1, S1, G0, G1, G2) and the open questions are
+`frontend_design.md`, *Expressions in casts, GROUP BY, DISTINCT, SET and
+MIN/MAX of text (#904)*. This section is how the plan, the search, the
+check, codegen and the plan API run them. Code citations are to
+`gustavoamigo/sql-jsonb-accessors` at bf22be05.
+
+#### The logical plan of #904
+
+- **`Kind::Cast`** replaces `Kind::JsonbCast` (`plan/logical.cppm:71-72`,
+  :103-105): one argument, the operand; `type` is the target `SqlType`
+  with its precision, scale and length; the source is `args[0].type`.
+  jsonb's casts out are the pairs whose source is jsonb, and
+  `jsonb_cast` (`sql/binder.cppm:3936`) becomes a case of the binder's one
+  cast path. A relabel makes no node: the binder returns the operand
+  retyped, as today. `rewrite.cppm:190`, `physical.cppm:266/307/830/906`,
+  `search.cppm:296/2374` and `codegen.cppm:897/946/1733` follow the rename;
+  a cast is a computed operand, never a condition and never a key's bound.
+- **`Aggregate::group_by`** (`logical.cppm:241-256`) holds columns or
+  expressions; its comment says so.
+- **`Kind::GroupKey`** (C1 has no use for it; G1 adds it): a reference to
+  `Aggregate::group_by[i]`, typed as that key. It is legal only in the
+  Aggregate's outputs, in a `HAVING` `Filter` directly above it and in a
+  `Sort` of its groups. The binder writes a select item, `ORDER BY` key or
+  `HAVING` operand that matches key `i` as `GroupKey(i)`, never as a copy
+  of the key's tree. A copy would be an expression over columns in a place
+  with no row in hand: evaluated there, it reads a column of `bc_empty`,
+  and a NOT NULL column read without a NULL test is undefined (the hazard
+  named under *Codegen of an expression filter*). With `GroupKey`, misuse is a
+  `physical::check` failure, and rewrite's constant fold, which folds
+  outputs and not `group_by`, cannot make the two differ.
+- **`Update::set`** (`logical.cppm:336`) is unchanged: its `Expr` may be any
+  typed value. The binder orders it by column number (frontend open
+  question 10).
+
+The rewrites change only in what they must never do: `push_down` does not
+move a conjunct holding a `GroupKey` below its Aggregate (stage P3 moves an
+aggregate-free `HAVING` conjunct by substituting the key's expression, not
+by moving the reference), and projection pruning already collects
+`columns_of(group_by)` (:454-460), expressions included.
+
+#### Casts in the search, the check and codegen
+
+- **Search.** No change beyond the rename. A cast is `Use::Operand`
+  (`search.cppm:296`), so `id = $1::text::int` is a filter and the plan
+  scans; stage P2's computed operand makes it a bound.
+- **Check** (`Checker::value`, `physical.cppm:906`). The pair list
+  becomes the shared `cast_kind(from, to)` (`frontend_design.md`, *Casts of an
+  expression*): a `Cast` whose pair is a relabel (the binder never makes one)
+  or none is broken, as is one to NUMERIC of no precision other than from
+  jsonb, to `VARCHAR(n)`/`CHAR(n)`, or of a float to text. `cast_kind`
+  lives in `sql/text.cppm` (`bytecask.sql.text`), beside `from_text`,
+  which the binder, the checker and codegen all import already, so none
+  of the three keeps its own list.
+- **Codegen** (`Gen::eval`, `codegen.cppm:1733`). `Cast` dispatches on
+  `(args[0].phys, e.phys)` and the two `SqlType`s, always inside
+  `guarded()` (:2052), so a NULL operand calls nothing. Pure C where no
+  failure or allocation is possible: integer widening is the value,
+  integer to float `bc_i64_to_f64`, real to double precision the value,
+  boolean to integer `v ? 1 : 0`, integer to boolean `v != 0`, timestamp
+  to timestamptz and back the value (a function cast to PG, unchanged in
+  a UTC session), CHAR(n) to text, varchar or name the operand's view
+  shortened past its trailing spaces (PG's `rtrim1`; no copy, so correct
+  whether or not the value was normalised). **Integer narrowing** (int8 to
+  int4 or int2, int4 to int2) is the existing `bc_check_int(cx, v,
+  BC_INTEGER or BC_SMALLINT, 0)`: 22003 `integer out of range` /
+  `smallint out of range`, never a wrapped value. Every other pair calls
+  one plan API helper below. `bc_f64_to_i64` truncates and is **not** a
+  cast; float to integer is the new `bc_f64_to_int`.
+- **Cost.** PG costs a `CoerceViaIO` (every cast to or from text) as 2
+  calls, a function cast 1 (timestamp to timestamptz and CHAR to text
+  included, though they leave the value as it is), a relabel 0. That is
+  stage P1b's `filter_cost`, not built; P1b adds the cost to `cast_kind`'s
+  answer, and C1 carries no field nothing reads.
+
+#### Plan API calls for runtime casts
+
+Each is declared in `algebra/bc_plan.h`, implemented in
+`algebra/plan_api.cpp` over the **same** `sql/text.cppm` functions the
+binder's constant fold calls (`integer_from`, `float_from`,
+`decimal_from`, `bool_from`, the date and time `*_from`, `bytea_from`,
+`to_text`), and registered for TCC in `algebra/runtime.cppm`'s symbol
+table (:480-506), with a `tests/tcc_test.cpp` case for each.
+
+The text inputs are **one helper per physical result**, each a thin
+wrapper over `sql::from_text(text, SqlType, assigned_only)`
+(`text.cppm:1006-1031`), the function the binder's constant fold and the
+server's parameter reader (`server/pg_text.cppm:38`) already call. There is
+then one list of input pairs, and a constant, a parameter and a runtime
+cast cannot read a string differently. The SQL type crosses the C boundary
+as a new `enum bc_sql_type` in `bc_plan.h` (one value per `SqlKind`,
+`BC_TYPE_SMALLINT` … `BC_TYPE_TIMETZ`, the codes `bc_date_source` lacks),
+with a typmod that carries a DECIMAL's precision and scale; an integer
+width is `enum bc_int_type`, as `bc_check_int` takes it.
+
+| Call | Does | Fails |
+|---|---|---|
+| `int64_t bc_text_in_i64(bc_ctx*, bc_view, uint32_t sql_type, uint8_t precision, uint8_t scale)` | `from_text` to an integer (`pg_strtoint`: spaces, sign, `0x`/`0o`/`0b`, `_`), a DECIMAL (`numeric_in`, then the typmod, half away from zero) or a date or time type (`date_in` … `timetz_in`, UTC) | 22P02, 22007, 22008; 22003 as below |
+| `double bc_text_in_f64(bc_ctx*, bc_view, uint32_t sql_type)` | `float8in`, or `float4in` (`strtof`, real's message) for `BC_TYPE_REAL` | 22P02, 22003 |
+| `bool bc_text_in_bool(bc_ctx*, bc_view)` | `boolin` | 22P02 |
+| `bc_view bc_text_in_bytes(bc_ctx*, bc_view, uint32_t sql_type)` | `byteain`, or `namein` (cut to 63 bytes) for `BC_TYPE_NAME`, into the step's arena | 22P02, 54000 |
+| `bc_view bc_value_text(bc_ctx*, int64_t, uint32_t sql_type, uint8_t scale)` | the output function of an integer, DECIMAL, boolean, date or time type, into the step's arena (subsumes `bc_number_text`) | `BC_E_MEMORY`, 54000 |
+| `bc_view bc_bytea_text(bc_ctx*, bc_view)` | `byteaout` (`\x…`), into the step's arena | 54000 |
+| `int64_t bc_f64_to_int(bc_ctx*, double, uint32_t int_type)` | `rint`, then `int_type`'s range | 22003 `integer out of range` (NaN, infinity, past it) |
+| `int64_t bc_decimal_rescale(bc_ctx*, int64_t, uint8_t from_scale, uint32_t to_type, uint8_t precision, uint8_t to_scale)` | half away from zero to `to_scale`; `to_type` `BC_TYPE_DECIMAL` checks the precision, an integer type rounds to scale 0 and checks that type's range | 22003 `numeric field overflow` and DETAIL, or `smallint`/`integer`/`bigint out of range` |
+| `double bc_decimal_to_f64(bc_ctx*, int64_t, uint8_t scale)` | its decimal text read by `strtod` | none |
+| `int64_t bc_f64_to_decimal(bc_ctx*, double, bool real, uint8_t precision, uint8_t scale)` | `%.15g` (`%.6g` for real), then `decimal_from` | 22003 as above; an infinity 22003 with DETAIL `… cannot hold an infinite value.`; NaN 22003 with DETAIL `… cannot hold NaN.` (PG returns NaN: a listed difference) |
+| `float bc_f64_to_f32(bc_ctx*, double)` | nearest real | 22003 `value out of range: overflow` / `underflow` |
+| `int64_t bc_temporal_cast(bc_ctx*, int64_t, uint32_t from_type, uint32_t to_type)` | date to timestamp(tz) (midnight), timestamp(tz) to date or time, time to timetz (`+00`) and timetz to time | 22008 `date out of range for timestamp` |
+
+**The error class of a range error** is stated once in `bc_plan.h`: an
+integer or DECIMAL value outside its target type (`bc_text_in_i64`,
+`bc_f64_to_int`, `bc_decimal_rescale`, `bc_check_int`) is `BC_E_CONSTRAINT`,
+`BC_C_RANGE`, SQLSTATE 22003, on the object id codegen passes (0, or the
+updated table in `SET`), as `bc_check_int`, `bc_jsonb_to_i64` and the row
+builder raise it today; so `b::int`, `'3e9'::text::int` and
+`(j->>'x')::int` out of range surface alike in the embedded API, each with
+its own PG message. Every other cast error (22P02, 22007, 22008, a float's
+22003) is `BC_E_DATA` with its SQLSTATE, as `bc_jsonb_to_f64`'s is.
+
+Text to jsonb is stage 1's `bc_jsonb_in`, and jsonb's casts out are stage
+3's calls, as today.
+
+**Errors.** A helper catches every `TextError` itself and fails with
+`cx->raise(BC_C_RANGE, object_id, e.what())` for an integer or DECIMAL
+range error (above), else
+`cx->fail(BC_E_DATA, e.sqlstate(), e.what(), {detail, hint, context})`,
+as `bc_jsonb_in` does (`plan_api.cpp:4738`). One that escaped would reach
+`BC_GUARD_END`'s `fail_classified` (:1051-1074) as a `std::exception` and
+be reported as `BC_E_CORRUPT`: a malformed `'12x'` is not corruption. The
+SQLSTATE passes through exactly (22P02, 22003, 22007, 22008), so the API
+maps no message. A test asserts each helper's SQLSTATE and message for a
+bad input.
+
+**Undefined behaviour avoided.** A double out of `int64_t`'s range is
+checked before any `static_cast` (as `integer_of` checks it); rounding
+negates through the unsigned magnitude, so `INT64_MIN` is defined; a power
+of ten is indexed by a scale the binder keeps at 18 or below, and the
+helper checks it (`BC_E_HANDLE` past it).
+
+**DECIMAL to float goes through text.** `scaled / 10^s` in double rounds
+twice, once for `10^s` and once for the quotient, and can miss the nearest
+double in its last digit; `strtod` of the decimal's text is correctly
+rounded, as PG 17's `numeric_float8` is (`1.23456789012345678::numeric(20,17)
+::float8` is `1.2345678901234567` there).
+
+#### Memory of a runtime cast
+
+A result whose size depends on its input (text out of a number, date or
+bytea; bytea out of text) is allocated in the step's arena through
+`ArenaOut`, charged **before** it is allocated, and released when the loop
+steps, as `bc_jsonb_text`'s is. `from_text` and `to_text` also build heap
+temporaries as large as their input (`bytea_from`'s `Bytes`,
+`numeric_in`'s and `decimal_from`'s digit strings, `text_bytes`), and
+`kMaxText` (`jsonb.cppm:61`) bounds nothing here, every stored value being
+under it already. So each helper whose input is a view **takes** the
+statement's budget for its input's size before calling `from_text` (twice
+that for `bc_text_in_bytes`, which holds the temporary and its arena copy
+at once) and releases it when the call returns, success or failure: a
+budget too small for the temporary is 54000 before it is built, never an
+uncharged copy of a 1 GiB value on the heap. The output helpers
+(`bc_value_text`, `bc_bytea_text`) write straight into `ArenaOut`, as
+`jsonb::to_text` does (`plan_api.cpp:4751-4753`), and build no temporary;
+a scalar's text is at most a few dozen bytes. Each cast of fixed size
+(integers, floats, dates) allocates nothing.
+
+#### Group keys and DISTINCT values of an expression
+
+- **Search** (`group_select`, `search.cppm:2742-2965`). A key is a column
+  or an expression (`std::vector<GroupKeyRef>`, one or the other).
+  **An expression key never streams**: `candidates()` is given no
+  `Grouping` when any key is an expression, constant or not, `stream` is
+  null, and the structure is the plan. Listing only the column keys would let
+  an index on `a` stream `GROUP BY a, lower(b)` and split its groups:
+  wrong rows. With no streamed plan there is no choice point by count
+  (:2918-2945), so a structure past the budget fails with 54000.
+  `may_cover` takes `columns_of(key)` for an expression key: an index
+  that covers those columns covers the key, which is evaluated from the
+  index entry. `of_group` accepts a
+  `GroupKey` in outputs, `HAVING` and `ORDER BY`; `OrderItem` gains a
+  `GroupKey` alternative, which no candidate's order gives, so the groups
+  are sorted. The three `std::get<ColumnRef>` that assume a column key
+  (`search.cppm:2723` in `group_past`, :2907 in `avoiding_ordered`,
+  `codegen.cppm:2526`) take the variant; an expression key there would
+  throw `bad_variant_access` today. **`avoiding_ordered` is not built when
+  an ordered item is a `GroupKey`** (`search.cppm:2929-2936` sorts the
+  rows by the `ORDER BY` before grouping, and a rows sorter cannot key on
+  an expression of groups without evaluating it per row): the groups are
+  sorted instead, `avoiding_unordered` still offered.
+- **Keys the same for every row.** A constant, a parameter, or an
+  expression of them (`GROUP BY 1+1`, `GROUP BY $1`, a position naming
+  `1`) is a key like any other: the binder never drops it, rewrite's
+  constant fold does not touch `group_by`, and codegen evaluates it and
+  appends it as a key part. Every row then finds the one group, and no
+  row makes none, so over no rows the query returns nothing, as PG 17
+  does. Dropping it would leave an Aggregate with no keys, which
+  `physical.cppm:404-410` defines as one group given even over no rows:
+  `count(*)` would return 0 where PG returns no row. A binder test asserts
+  the key stays in `group_by`, and the embedded tests run each form over
+  an empty table. `GroupCost` counts an expression key
+  as a key. `group_past`'s lower bound on a key's bytes is taken by
+  `PhysType`: an expression key may be NULL (1 byte); a DISTINCT value is
+  never NULL (2 for bytes, 8 for I64 or F64, 1 for Bool).
+- **Physical** (`GroupAggregate`, `physical.cppm:414-428`): `keys` holds
+  columns or expressions. `group_layout` (:441-471) gives an expression
+  key a value to emit: I64 and Bool a slot, set once on the group's first
+  row (`bc_agg_min_i64` on an empty slot); F64 a slot set once
+  (`bc_agg_min_f64` on an empty slot stores the value exactly, `-0.0` and
+  NaN included, which the plan API documents); Bytes no slot and no held
+  row, its value decoded from the group's key, which is exact since text
+  equality is bytewise. `GroupLayout::distinct` holds each DISTINCT
+  argument once, as an `Expr` compared with `==` (the aggregates share one
+  bound copy); that, the DISTINCT value appended as a key part and the
+  one-row Aggregate's fold below are G2's, not G1's. `check` refuses: an expression key that is streamed, holds
+  an aggregate or `random()`, or has no sort-key suffix (jsonb, NUMERIC,
+  CHAR); a `GroupKey` outside a `GroupEmit`'s outputs, a `HAVING` filter
+  over the `GroupAggregate` or a sort of its groups, or past the keys; and
+  it runs `value()` and `params()` over each key, with `held_above` for its
+  columns, as it does for an aggregate's argument (:1741-1751). The
+  DISTINCT-is-a-column refusal (:833) goes.
+- **Codegen.** `fold_into_structure` (:2566-2602) evaluates every
+  expression key with `eval` **before** `bc_sort_key_begin`, since `eval`
+  prints statements and must not run inside an open key builder; then each
+  key's part: a column by `sort_key_part`, an expression by
+  `bc_sort_key_null` or `bc_sort_key_<suffix>(v)`, ascending, NULLs first.
+  On a group's first row it fills the I64, Bool and F64 key slots, skipping
+  a NULL. When any key is Bytes, `in_group` (:2546) decodes the group key's
+  parts once per group, in order up to the last one needed (out of order
+  is `BC_E_HANDLE`), into locals that live until the groups loop steps.
+  `group_value`, `emit_group`, `group_fails` and `group_sort_part` each
+  read a `GroupKey` from its slot or decoded local. A DISTINCT argument is
+  evaluated once per row, its NULL skipped, its value appended as a key
+  part after the group's (`bc_sort_key_f64` folds `-0.0` and NaN as PG's
+  equality does), and the evaluated value folded, not `read_col`; the
+  one-row `Aggregate`'s fold (:2271) keys an expression by its value and a
+  column by `bc_col_key` as today.
+- **Plan API.** Nothing new: the sort-key builders and decoders
+  (`bc_plan.h:499-523`) and the i64/f64 slots cover integer, date, time,
+  DECIMAL, boolean, double and text keys.
+
+#### UPDATE SET of an expression
+
+- **Search**: none; `op.set` is copied into `physical::Update`
+  (`search.cppm:888-892`) and the row is read whole, as today.
+- **Check** (`Checker::set_list`, `physical.cppm:841-851`): each value
+  passes `value()` and `params()` as `returned()` does (:866), reads only
+  the updated table's columns, and `assigns(value.type, declared)` holds
+  for the column's declared `SqlType`, which `physical::Update` gains per
+  item as `InsertFrom::Filled` has it.
+- **Codegen** (`set()`, `codegen.cppm:3170-3220`): a `$n` keeps its fast
+  path (`bc_row_set_param`); any other value is `eval`ed with the row
+  source `{table, "old"}`, so it reads the row before the update, then
+  stored by type through **one** store shared with `INSERT … SELECT`'s
+  sink (:3090-3100): `bc_row_set_null` for NULL, else the type's
+  `bc_row_set_*`, with C1's conversion helpers between the value's type and
+  the column's. Items run in column order. While it generates a `SET`
+  value, `eval` passes the updated table's id as the object id of every
+  range error it raises (`bc_add_bigint`, `bc_check_int`, the cast
+  helpers), so `BC_C_RANGE` names the table as today's SET path does
+  (`codegen.cppm:3190-3193`); elsewhere it stays 0. A folded constant's
+  error the binder recorded on an item is raised at bind, by the first
+  such item in column order. `eval`'s views (into `old` and
+  the step arena) are consumed by `bc_row_set_*` before `bc_update`, and
+  the row builder copies them; none is kept past it. The row builder's
+  range, length and UTF-8 checks (`catalog.cppm:1681-1750`) give 22003 and
+  22001 as today. `ON CONFLICT DO UPDATE` calls the same `set()` with
+  `{table, "old"}` (:3041-3050).
+
+#### MIN and MAX of text
+
+- **Plan API.** `void bc_agg_min_bytes(bc_ctx*, bc_agg, bc_group, uint32_t
+  slot, bc_view)`, `bc_agg_max_bytes(…)` and `bc_view bc_agg_bytes(bc_ctx*,
+  bc_agg, bc_group, uint32_t slot)`, with slot kinds `MinBytes` and
+  `MaxBytes`. The bytes live beside the slot, in a vector of the `Agg`
+  indexed by the slot's `i`, so `Slot` stays a POD and `kAggSlotBytes` does
+  not grow for every aggregate. Values compare with `bytes_cmp`, the
+  comparison `bc_bytes_cmp` and the sort keys use, so `MIN`/`MAX` agree with
+  `ORDER BY`. `bc_agg_bytes` returns a **copy** in the step's arena: a view
+  into the held bytes would dangle when a later row replaces them.
+- **Charging.** A replacement takes the new value's size before it copies,
+  then releases the old one's; a take that fails is 54000 (or
+  `BC_E_MEMORY`) and leaves the old value held and charged. `bc_agg_clear`
+  and the context's reset release every held value, tracked per group so
+  exactly what was taken is released. "Indexed by the slot's `i`": a
+  bytes slot's `Slot::i` (`plan_api.cpp:844`), which holds a sum or a
+  minimum for the other kinds, holds the index of its value in the `Agg`'s
+  vector of held bytes.
+- **Streams.** A streamed group, and every group of no key, keeps its
+  accumulators in C locals and has no slot. It opens a one-group `bc_agg`
+  as its holder, as a stream already opens one for DISTINCT values
+  (`codegen.cppm:~2764`), finds the group by the empty key on each row
+  (charging nothing once it exists), folds there, reads with
+  `bc_agg_bytes` when the group is given, then clears. The holder is never
+  iterated with `bc_agg_next`, after which a clear is refused.
+- **Binder and check.** `aggregate_support` takes `MIN`/`MAX` of Text,
+  Varchar, Char and Name; the call is typed `text` for Varchar and Name,
+  CHAR with no length for a CHAR(n) column (Describe's typmod -1), the
+  output carrying the column's `n` as its display width so the result
+  writer pads to it; a CHAR-typed expression argument is 0A000. `check`
+  allows `MIN`/`MAX` of Bytes in a `GroupAggregate` and in a stream; the
+  holder is codegen's, not a field of the physical plan, so it is proved
+  by codegen's goldens and the fault sweep, not by `check`. A `HAVING`
+  comparison of one compares bytes as a column's does. `KeyAggregates`
+  stays I64-only; reading a text `MIN` from an index's first key is a
+  later optimisation (`bc_key_part_bytes`).
+
+#### Memory of #904
+
+No new structure escapes the statement's budget. Per-row values (a cast's
+text, an evaluated key or DISTINCT value, its sort key, a `SET` value)
+live in the step's arena and are released each row. A group's key is
+charged by `bc_agg_group`, its decoded bytes per group step, a DISTINCT
+value per (group, value), a text `MIN`/`MAX` by its held bytes as above.
+A `GROUP BY` or `DISTINCT` of an expression has no streamed alternative,
+so past the budget it is 54000, as `CONTRACT.md:311` lists.
+
+#### Tests of #904 (planner, plan API and proof)
+
+- `tests/physical_test.cpp`: `check` refuses a `Cast` of no cast, a
+  streamed expression key, a `GroupKey` outside its places or past the
+  keys, a jsonb, NUMERIC or CHAR expression key, a `SET` value of a pair
+  `assigns` refuses or reading another table, an expression key over a derived
+  relation's columns.
+- `tests/search_test.cpp`: an expression key never streams over an index on
+  a column key beside it; no choice point; `GroupKey` ordering sorts the
+  groups and builds no `avoiding_ordered`; a constant key keeps the query
+  grouped; an index covering an expression key's columns covers it.
+- `tests/codegen_test.cpp` and golden plans (`tests/golden/*.sql|.c`): a cast
+  in a select list, a `WHERE` and an `ORDER BY`, an integer narrowing
+  through `bc_check_int`, a CHAR(n) to text trimming its view;
+  `group_by_expression`, `group_by_constant`,
+  `distinct_expression`, `count_distinct_expression` (evaluate-before-builder,
+  the decode prologue, the slot fills); an `UPDATE` with expression `SET`
+  items in column order, a range error on the table's id; a text `MAX` in
+  a structure and a keyless stream with its holder.
+- `tests/plan_api_types_test.cpp`, `tests/plan_api_test.cpp`: each cast
+  helper's results and each SQLSTATE, message and DETAIL, NULL never
+  reaching one, `INT64_MIN`, NaN, infinity, a scale of 18; each range
+  error's class (`BC_C_RANGE` for an integer or DECIMAL target, on the
+  object id given, `BC_E_DATA` otherwise); `bc_decimal_rescale` to each
+  integer type; `bc_temporal_cast`'s 22008; an input helper over a budget
+  smaller than its input failing 54000 before it parses; the text slot's
+  order, NULL, replace, clear releasing its charge, a stale handle.
+- `tests/plan_sort_key_test.cpp`: decoding mixed i64, bytes and f64 parts in
+  order, and `BC_E_HANDLE` out of order.
+- `tests/plan_alloc_faults_test.cpp`, per the fault-sweep rule in
+  `tests/CLAUDE.md`: each arena-allocating cast helper and each input
+  helper's charge for its temporaries (taken, released on success and on
+  a failed parse), a structure with
+  expression keys and DISTINCT expression values, and the text slot's
+  every transition (first value, a longer replacement, a shorter one, a
+  clear, a stream holder's group end), the sweep counting that each
+  happened in a call an injected failure or a budget at each byte boundary
+  then ended, and asserting the old value stays held and charged.
+- Proof, `tests/proof/test_sql_machine.py` (gated on
+  `BYTECASK_SQL_ORACLE`), text columns `COLLATE "C"`: draws casts of
+  columns and accessors (integer, float, boolean, date and DECIMAL to and
+  from text, with valid and invalid strings, compared on SQLSTATE where
+  either raises); `GROUP BY` and `DISTINCT` of drawn expressions and of
+  positions; `COUNT`/`SUM`/`AVG(DISTINCT expr)`; `UPDATE … SET` of drawn
+  expressions with two failing items; `MIN`/`MAX` of text, varchar, char
+  and `->>`, per group and over no rows. `tests/proof/oracle.py` gains the
+  cast pairs. The keyless machine draws casts in filters, where both
+  sides scan.
 
 ## Memory
 
