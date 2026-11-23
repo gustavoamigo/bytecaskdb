@@ -263,7 +263,7 @@ struct Filter {
     case Expr::Kind::Substr:
     case Expr::Kind::TextFn:
     case Expr::Kind::Extract:
-    case Expr::Kind::JsonbCast:
+    case Expr::Kind::Cast:
     case Expr::Kind::Jsonb:
     case Expr::Kind::Mod:
     case Expr::Kind::Neg:
@@ -304,7 +304,7 @@ struct Filter {
     case Expr::Kind::Substr:
     case Expr::Kind::TextFn:
     case Expr::Kind::Extract:
-    case Expr::Kind::JsonbCast:
+    case Expr::Kind::Cast:
     case Expr::Kind::Jsonb:
     case Expr::Kind::Mod:
     case Expr::Kind::Neg:
@@ -923,16 +923,17 @@ private:
       case Expr::Kind::Not:
       case Expr::Kind::Neg:
       case Expr::Kind::Abs: operands(1, 1); break;
-      case Expr::Kind::JsonbCast: {
+      case Expr::Kind::Cast: {
+        // A cast the shared table has and the layer takes: a relabel makes
+        // a node only over a cast, whose type is what it computes; no other
+        // cast is generated.
         operands(1, 1);
-        auto from = e.args[0].phys();
-        auto out_of = from == PhysType::Jsonb && (e.phys() == PhysType::Bytes || e.phys() == PhysType::Bool ||
-                                                  e.phys() == PhysType::I64 || e.phys() == PhysType::F64 ||
-                                                  e.phys() == PhysType::Num);
-        if (!((e.phys() == PhysType::Jsonb && from == PhysType::Bytes) || out_of) ||
-            (e.phys() == PhysType::I64 && e.type.kind != SqlKind::SmallInt && e.type.kind != SqlKind::Integer &&
-             e.type.kind != SqlKind::BigInt)) {
-          broken("a jsonb cast of other than jsonb to text, a boolean or a number, or text to jsonb");
+        auto kind = cast_kind(e.args[0].type, e.type);
+        auto relabel_ok = kind == CastKind::Relabel && e.args[0].kind == Expr::Kind::Cast && e.args[0].type != e.type;
+        if (kind == CastKind::None || (kind == CastKind::Relabel && !relabel_ok) ||
+            cast_refusal(e.args[0].type, e.type) != CastRefusal::None) {
+          broken("a cast of no cast, a relabel, or one not taken (" + sql_type_name(e.args[0].type) + " to " +
+                 sql_type_name(e.type) + ")");
         }
         break;
       }
@@ -1146,7 +1147,7 @@ private:
       case Expr::Kind::Substr:
       case Expr::Kind::TextFn:
       case Expr::Kind::Extract:
-      case Expr::Kind::JsonbCast:
+      case Expr::Kind::Cast:
       case Expr::Kind::Jsonb:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:

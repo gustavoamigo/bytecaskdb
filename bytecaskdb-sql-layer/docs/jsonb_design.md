@@ -1373,7 +1373,8 @@ estimates of changed lines, code and tests.
     (`sql/text.cppm`), whose `TextError` now carries a DETAIL and a
     CONTEXT, and a statement error (`ast::SqlError`) a CONTEXT, sent as
     W.
-  - The binder's `JsonbCast` expression is the run-time cast: a string to
+  - The binder's `JsonbCast` expression (since #904 stage C1, the one
+    `Cast` kind of every cast computed per row) is the run-time cast: a string to
     jsonb (`bc_jsonb_in`) and a jsonb to `text` or `varchar` of no length
     (`bc_jsonb_text`). Its other casts are refused as *Casts to and from
     jsonb and json* sorts them: to `boolean` and the numbers is stage 3
@@ -1383,7 +1384,8 @@ estimates of changed lines, code and tests.
     a string column (an assignment cast; `INSERT … SELECT v::text` works,
     and a jsonb constant is assigned as its text), `||` of a jsonb column
     with text (of a constant it is text concatenation). `UPDATE … SET` of
-    a cast is the layer's 42601 for a cast of a column in `SET`, any type.
+    a cast is the layer's 42601 for a cast in `SET`, any type (#904 stage
+    S1).
   - Constants are refused as columns are: a comparison, `||` or `-` of
     jsonb constants is 0A000 after an unknown literal beside the jsonb is
     read by `jsonb_in` (its 22P02 first), and a pair PostgreSQL has no
@@ -1457,7 +1459,7 @@ estimates of changed lines, code and tests.
   - The binder's logical form is one expression kind, `Jsonb`, with its
     function (`Field`, `Element`, `Path`, their `Text` forms, `Typeof`,
     `ArrayLength`, `PathIn`, `PathArray`); the casts out widen
-    `JsonbCast`. Both are strict but `PathArray`, whose NULL element is the
+    `JsonbCast` (now `Cast`, #904 stage C1). Both are strict but `PathArray`, whose NULL element is the
     path's.
   - `'a' - 'b'`, two string literals under an arithmetic operator, is
     PostgreSQL's 42725 (`operator is not unique: unknown - unknown`), so

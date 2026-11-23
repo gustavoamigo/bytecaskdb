@@ -1407,7 +1407,7 @@ flattened into conjuncts.
     `clock_reading`, `binder.cppm:2563`);
   - otherwise a call for each `Add`, `Sub`, `Mul`, `Div`, `Mod`, `Neg`,
     `Abs`, `Compare`, `Concat`, `Substr`, `TextFn`, `Extract`, `Like`,
-    `Random` and clock parameter; two for a `JsonbCast` to or from text,
+    `Random` and clock parameter; two for a `Cast` to or from text,
     one for stage 3's casts from jsonb to a number or BOOLEAN;
   - an `in_list` `Or`: its left operand's cost once plus half a call per
     item;
@@ -1552,12 +1552,13 @@ Stage 3 adds `->`, `->>`, `#>`, `#>>`, `jsonb_typeof`,
 `jsonb_array_length` and the casts from jsonb as kinds of `eval` for the
 select list. After P1a, each is also a filter with no further work:
 `WHERE props->>'k' = $1` (`$1` typed text by its peer), `WHERE
-Timezone->>'useAutomaticTimezone' = 'true'`, `WHERE (props->>'n')::int >
-5`, `WHERE props->'a' IS NULL`, `WHERE LOWER(Attrs->>$1) LIKE LOWER($2)`,
+Timezone->>'useAutomaticTimezone' = 'true'`, `WHERE props->'a' IS NULL`, `WHERE LOWER(Attrs->>$1) LIKE LOWER($2)`,
 `IN` lists and `BETWEEN` of them, in `ON`, `UPDATE` and `DELETE`; after
 P3, in `HAVING`. Its `filter_cost` (P1b) is a call per operator, as PG 17
 counts `jsonb_object_field_text`, and a call for a cast from jsonb to a
-number or BOOLEAN. Comparing two jsonb values (`Data->'k' = $1::jsonb`)
+number or BOOLEAN. A cast of an accessor's text, `WHERE (props->>'n')::int
+> 5`, is #904's stage C1 (a cast of any expression), built after stage 3:
+it is a filter once C1 is. Comparing two jsonb values (`Data->'k' = $1::jsonb`)
 still waits for stage 2. Stage 3's tests add a `WHERE` step to each
 operator's functional case.
 
@@ -1828,7 +1829,8 @@ fixes `from_text` shares (`integer_from`, `float_from`'s `real`,
 `decimal_from`'s NaN and infinities), is built, with its as-built notes in
 `frontend_design.md`: the runtime cast helpers below inherit them, so
 `bc_text_in_*` and `bc_f64_to_decimal` need no input code of their own.
-The other stages are not yet. The dialect, PG 17's behaviour, the
+Stage C1, casts of any expression, is built, with its as-built notes under
+*Plan API calls for runtime casts*. The other stages are not yet. The dialect, PG 17's behaviour, the
 refusals, the stages (M1, C0, C1, S1, G0, G1, G2) and the open questions are
 `frontend_design.md`, *Expressions in casts, GROUP BY, DISTINCT, SET and
 MIN/MAX of text (#904)*. This section is how the plan, the search, the
@@ -1961,6 +1963,46 @@ be reported as `BC_E_CORRUPT`: a malformed `'12x'` is not corruption. The
 SQLSTATE passes through exactly (22P02, 22003, 22007, 22008), so the API
 maps no message. A test asserts each helper's SQLSTATE and message for a
 bad input.
+
+**As built (C1).** Plan API revision 24. The calls are as the table says,
+but for these, each found while building them:
+
+- Each call that can raise `BC_C_RANGE` (`bc_text_in_i64`, `bc_f64_to_int`,
+  `bc_decimal_rescale`, `bc_f64_to_decimal`) takes the `object_id` as its
+  last argument; codegen passes 0 (S1 passes the table).
+- Widths are `uint32_t`, as the rest of the API's codes; a REAL travels as
+  a double (`bc_f64_to_f32` returns the nearest REAL as a double, as a
+  REAL is held everywhere else), and `bc_decimal_to_f64` takes a `real`
+  flag, so a DECIMAL to `real` is `float4in` of its text, rounded once.
+- `bc_i64_to_f32` (no context, it cannot fail): an integer's nearest REAL,
+  rounded once; through `bc_i64_to_f64` an `int8` past 2^53 would round
+  twice.
+- `bc_value_text` writes a BOOLEAN as `booltext` (`true`) at scale 0 and
+  `boolout` (`t`) at scale 1, the I/O cast to `name`. It replaced
+  `bc_number_text`, which `||` of a number now calls in its place.
+- A DECIMAL range error raises `BC_C_RANGE` with numeric's DETAIL in
+  `bc_error_note`; `bc_ctx::raise` takes the note. An integer input's own
+  range message (`value "…" is out of range for type integer`) is mapped
+  to 22003 by `range_sqlstate`.
+- A relabel over a cast (`bo::name::text`) is a `Cast` node whose pair
+  `cast_kind` calls a relabel; codegen gives its operand's value. The
+  checker takes such a node over a `Cast` only.
+- The cast helpers' values come from `sql/text.cppm`'s cast functions
+  (`cast_from_text`, `cast_to_text`, `rescale_decimal`, …), which the
+  binder's constant fold calls too.
+- Tests: `tests/plan_api_casts_test.cpp` (each helper's values and errors,
+  the charge taken before a parse and released after, an allocation sweep
+  over the allocating helpers), `tests/binder_test.cpp` (*a cast of an
+  expression binds by the cast table*), `tests/api_test.cpp` (*casts of
+  expressions give PostgreSQL 17's values and errors*), the functional
+  cases in `casts.yaml`, `where_expressions.yaml` and `jsonb.yaml`, and
+  the proof's range-message test, which now reaches the cast's message.
+  The proof's `SqlMachine` draws casts of a column of each type, and of
+  expressions over it, for one row (`cast_a_column`: integers, floats,
+  booleans, DECIMALs and bytes to and from text, between integers and
+  DECIMALs, valid and invalid strings), compared on SQLSTATE where either
+  side raises; not text to a float or a DECIMAL, whose hexadecimal forms
+  are a listed difference. The keyless machine draws no casts yet.
 
 **Undefined behaviour avoided.** A double out of `int64_t`'s range is
 checked before any `static_cast` (as `integer_of` checks it); rounding

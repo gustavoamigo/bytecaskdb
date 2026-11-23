@@ -1483,7 +1483,11 @@ TEST_CASE("embedded API: a NUMERIC column stores its value as numeric_out writes
   CHECK(state("SELECT v FROM n GROUP BY v") == "0A000");
   CHECK(state("SELECT v + 1 FROM n") == "0A000");
   CHECK(state("SELECT sum(v) FROM n") == "0A000");
-  CHECK(state("SELECT v::text FROM n") == "0A000");
+  // To text it is its numeric_out text; to any other type, not yet.
+  CHECK(text_of(db->execute("SELECT v::text FROM n WHERE k = $1", {std::int64_t{1}}).rows.at(0).at(0)) ==
+        "123456789012345678901234567890.10");
+  CHECK(state("SELECT v::integer FROM n") == "0A000");
+  CHECK(state("SELECT x::text::numeric FROM n") == "0A000");
   CHECK(state("SELECT v FROM n UNION SELECT x FROM n") == "0A000");
   CHECK(state("SELECT CAST('1.5' AS NUMERIC)") == "0A000");
   CHECK(state("SELECT $1::numeric", {sql_test::bytes("1.5")}) == "0A000");

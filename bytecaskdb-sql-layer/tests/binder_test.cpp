@@ -2057,7 +2057,7 @@ TEST_CASE("binder: $n::T in a value types $n as T; a SELECT without FROM binds a
   CHECK(state("UPDATE t SET qty = $1::integer WHERE id = 1") ==
         "42601 a cast of a parameter to other than its column's type is not supported yet");
   CHECK(state("UPDATE t SET qty = qty::bigint WHERE id = 1") ==
-        "42601 a cast of other than a constant or a parameter is not supported yet");
+        "42601 a cast of a value expression in SET (#904 stage S1) is not supported yet");
   // An operator is ?column?, % among them, as PostgreSQL names it.
   CHECK(get<logical::Project>(bind_sql(cat, "SELECT qty % 2 FROM t")).exprs[0].name == "?column?");
   CHECK(get<logical::Project>(bind_sql(cat, "SELECT (SELECT 1) % 2")).exprs[0].name == "?column?");
@@ -2429,5 +2429,120 @@ TEST_CASE("binder: ARRAY[ARRAY[...]] as a jsonb path is refused as a multidimens
       CHECK(std::string{e.sqlstate()} == "42601");
       CHECK(std::string{e.what()} == "a multidimensional ARRAY is not supported yet");
     }
+  }
+}
+
+TEST_CASE("binder: a cast of an expression binds by the cast table", "[sql][binder][cast]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE c (k INT PRIMARY KEY, s TEXT, v VARCHAR(5), n NAME, ch CHAR(3), "
+                                        "b BYTEA, j JSONB, d NUMERIC(5,2), r REAL, x DOUBLE PRECISION, dt DATE, "
+                                        "ts TIMESTAMP, tm TIME, bo BOOLEAN, sm SMALLINT, nu NUMERIC)").stmt));
+  const auto& cat = f.cat();
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what() + " @" + std::to_string(e.pos());
+    }
+    return "bound";
+  };
+  auto first = [&](std::string_view sql) -> logical::Output {
+    auto b = bind_sql(cat, sql);
+    return get<logical::Project>(b).exprs.at(0);
+  };
+
+  SECTION("the classes of cast_kind, as pg_cast and CoerceViaIO") {
+    using K = SqlKind;
+    auto kind = [](K from, K to) { return cast_kind(SqlType{from}, SqlType{to}); };
+    CHECK(kind(K::Text, K::Text) == CastKind::Relabel);
+    CHECK(kind(K::Name, K::Text) == CastKind::Relabel);
+    CHECK(kind(K::Varchar, K::Text) == CastKind::Relabel);
+    CHECK(kind(K::Text, K::Name) == CastKind::Function);  // cut to 63 bytes
+    CHECK(kind(K::Char, K::Text) == CastKind::Function);  // rtrim1
+    CHECK(kind(K::Boolean, K::Text) == CastKind::Function);  // booltext
+    CHECK(kind(K::Boolean, K::Name) == CastKind::InOut);     // boolout
+    CHECK(kind(K::BigInt, K::Integer) == CastKind::Function);
+    CHECK(kind(K::Integer, K::Boolean) == CastKind::Function);
+    CHECK(kind(K::SmallInt, K::Boolean) == CastKind::None);
+    CHECK(kind(K::Boolean, K::BigInt) == CastKind::None);
+    CHECK(kind(K::Decimal, K::Boolean) == CastKind::None);
+    CHECK(kind(K::Date, K::Timestamp) == CastKind::Function);
+    CHECK(kind(K::Time, K::Timestamp) == CastKind::None);
+    CHECK(kind(K::Timestamp, K::TimeTz) == CastKind::None);
+    CHECK(kind(K::TimestampTz, K::TimeTz) == CastKind::Function);
+    CHECK(kind(K::Date, K::Integer) == CastKind::None);
+    CHECK(kind(K::Integer, K::Text) == CastKind::InOut);
+    CHECK(kind(K::Text, K::Date) == CastKind::InOut);
+    CHECK(kind(K::Text, K::Jsonb) == CastKind::InOut);
+    CHECK(kind(K::Jsonb, K::Integer) == CastKind::Function);
+    CHECK(kind(K::Jsonb, K::Bytea) == CastKind::None);
+    CHECK(kind(K::Integer, K::Jsonb) == CastKind::None);
+    CHECK(cast_kind(SqlType{K::Decimal, 0, 5, 2}, SqlType{K::Decimal, 0, 4, 1}) == CastKind::Function);
+    CHECK(cast_refusal(SqlType{K::Double}, SqlType{K::Text}) == CastRefusal::FloatText);
+    CHECK(cast_refusal(SqlType{K::Numeric}, SqlType{K::Integer}) == CastRefusal::Numeric);
+    CHECK(cast_refusal(SqlType{K::Numeric}, SqlType{K::Text}) == CastRefusal::None);
+    CHECK(cast_refusal(SqlType{K::Jsonb}, SqlType{K::Numeric}) == CastRefusal::None);
+    CHECK(cast_refusal(SqlType{K::Char, 3}, SqlType{K::Integer}) == CastRefusal::CharInput);
+  }
+
+  SECTION("a cast of a column is a Cast node of the target type; a relabel is the operand retyped") {
+    auto o = first("SELECT s::int FROM c");
+    CHECK(o.expr.kind == logical::Expr::Kind::Cast);
+    CHECK(o.expr.type == SqlType{SqlKind::Integer});
+    REQUIRE(o.expr.args.size() == 1);
+    CHECK(o.expr.args[0].type == SqlType{SqlKind::Text});
+    auto relabel = first("SELECT n::text FROM c");
+    CHECK(relabel.expr.kind == logical::Expr::Kind::Column);
+    CHECK(relabel.expr.type == SqlType{SqlKind::Text});
+    auto d = first("SELECT k::numeric(4,1) FROM c");
+    CHECK(d.expr.type == SqlType{SqlKind::Decimal, 0, 4, 1});
+    // jsonb's casts out are the same node.
+    CHECK(first("SELECT (j->'a')::int FROM c").expr.kind == logical::Expr::Kind::Cast);
+    CHECK(first("SELECT (j->'a')::numeric FROM c").expr.type == SqlType{SqlKind::Numeric});
+  }
+
+  SECTION("$1::text::int types $1 as text and casts it per row") {
+    auto b = bind_sql(cat, "SELECT $1::text::int");
+    const auto& o = get<logical::Project>(b).exprs.at(0);
+    CHECK(o.name == "int4");
+    CHECK(o.expr.kind == logical::Expr::Kind::Cast);
+    REQUIRE(b.params.size() == 1);
+    CHECK(b.params[0].type == SqlType{SqlKind::Text});
+    // In a WHERE it is an operand of a filter, not a key's bound.
+    CHECK(state("SELECT k FROM c WHERE k = $1::text::int") == "bound");
+  }
+
+  SECTION("a NULL constant operand folds to a NULL of the target type") {
+    auto o = first("SELECT (s || NULL)::int FROM c");
+    CHECK(o.expr.kind == logical::Expr::Kind::Param);
+    CHECK(o.expr.type == SqlType{SqlKind::Integer});
+  }
+
+  SECTION("no cast is 42846 at the cast; what the layer does not take yet is refused") {
+    CHECK(state("SELECT dt::int FROM c") == "42846 cannot cast type date to integer @9");
+    CHECK(state("SELECT sm::bool FROM c") == "42846 cannot cast type smallint to boolean @9");
+    CHECK(state("SELECT tm::timestamp FROM c") ==
+          "42846 cannot cast type time without time zone to timestamp without time zone @9");
+    CHECK(state("SELECT k::jsonb FROM c") == "42846 cannot cast type integer to jsonb @8");
+    CHECK(state("SELECT x::text FROM c") == "42601 a cast of a floating-point value to text is not supported yet @8");
+    CHECK(state("SELECT r::name FROM c") == "42601 a cast of a floating-point value to text is not supported yet @8");
+    CHECK(state("SELECT s::varchar(2) FROM c") == "42601 a cast to VARCHAR(n) is not supported yet @8");
+    CHECK(state("SELECT s::char(2) FROM c") == "42601 a cast to CHAR(n) is not supported yet @8");
+    CHECK(state("SELECT ch::int FROM c").starts_with("0A000 a cast of a CHAR(n) value to integer"));
+    CHECK(state("SELECT nu::int FROM c").starts_with("0A000 a cast of a NUMERIC to integer"));
+    CHECK(state("SELECT s::numeric FROM c").starts_with("0A000 a cast to NUMERIC"));
+    CHECK(state("SELECT (j->'a')::numeric(5,2) FROM c").starts_with("0A000 a cast of jsonb to numeric(5,2)"));
+    CHECK(state("SELECT nu::text FROM c") == "bound");
+  }
+
+  SECTION("a cast is named as PostgreSQL 17's FigureColname") {
+    auto bound = bind_sql(cat, "SELECT s::int, upper(s)::text, coalesce(k, 0)::text, (k + 1)::text, (k * 2)::bigint, "
+                      "(j->>'k')::int, (CASE WHEN k > 0 THEN 1 ELSE 2 END)::int, (CASE WHEN k > 0 THEN 1 ELSE k END)::text, "
+                      "(s || 'x')::text, (SELECT 1 AS y)::text, (SELECT 1)::text, nullif(k, 1)::text, s::text::int, "
+                      "(j->0)::int::text, coalesce(1, 2)::text, '1'::int FROM c");
+    std::vector<std::string> got;
+    for (const auto& o : get<logical::Project>(bound).exprs) got.push_back(o.name);
+    CHECK(got == std::vector<std::string>{"s", "upper", "coalesce", "text", "int8", "int4", "int4", "k", "text", "y",
+                                          "?column?", "nullif", "s", "text", "coalesce", "int4"});
   }
 }

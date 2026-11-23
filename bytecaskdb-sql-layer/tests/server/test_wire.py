@@ -508,6 +508,35 @@ def test_the_jsonb_accessors_describe_as_postgresql_17(server):
     assert states(run(c, "SELECT (v -> 'a')::int FROM jw")) == ["22023"]
 
 
+def test_a_cast_of_an_expression_is_described_and_named_as_postgresql_17(server):
+    """A cast of any expression (#904 stage C1): described as its target
+    type, numeric(5,2) with its typmod; $1::text::int describes $1 as text
+    (25) and the result as int4 (23); each named by FigureColname, as
+    PostgreSQL 17 does; a per-row error with no position."""
+    c = connect(server)
+    c.send(query("CREATE TABLE cw (k INTEGER PRIMARY KEY, s TEXT, j jsonb)"))
+    c.until_ready()
+    sql = ("SELECT s::int, (s || 'x')::text, (j->>'n')::bigint, upper(s)::text, (k + 1)::numeric(5,2), $1::text::int "
+           "FROM cw WHERE s::int > $2")
+    c.send(parse(sql, "q"), describe("S", "q"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"1tTZ"
+    assert struct.unpack("!hii", out[1][1]) == (2, 25, 23)
+    assert row_description(out[2][1]) == [("s", 23), ("text", 25), ("int8", 20), ("upper", 25), ("numeric", 1700),
+                                          ("int4", 23)]
+    body = out[2][1][2:]
+    mods = []
+    for _ in range(6):
+        _, body = body.split(b"\0", 1)
+        mods.append(struct.unpack("!ihihih", body[:18])[4])
+        body = body[18:]
+    assert mods[4] == (5 << 16 | 2) + 4  # numeric(5,2)'s typmod
+    assert states(run(c, "INSERT INTO cw VALUES (1, '7', '{\"n\": \"12\"}'), (2, 'x', NULL)")) == []
+    assert data(run(c, sql + " AND k = 1", ["0x1F", "1"])) == [["7", "7x", "12", "7", "2.00", "31"]]
+    assert states(run(c, sql, ["1", "0"])) == ["22P02"]
+    assert states(run(c, "SELECT $1::text::int", ["zz"])) == ["22P02"]
+
+
 def test_text_min_and_max_describe_as_postgresql_17(server):
     """MIN and MAX of text (#904, stage M1): of a VARCHAR text (25), of a
     CHAR(n) column bpchar of no length (1042, typmod -1), its value padded
