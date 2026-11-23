@@ -111,3 +111,73 @@
       error: "22007"
   teardown:
     - DROP TABLE pc
+
+- name: text to an integer reads prefixes, underscores and spaces as int4in does
+  features: [pg:cast-operator]
+  steps:
+    - sql: SELECT '0x1F'::integer, '0o17'::integer, '0b101'::integer, '1_000'::integer, ' -0X1f '::integer
+      expected: [[31, 15, 5, 1000, -31]]
+    - sql: SELECT '0x_1F'::bigint, '1_000_000'::bigint, '-0x8000000000000000'::bigint, '0b111111111111111'::smallint
+      expected: [[31, 1000000, "-9223372036854775808", 32767]]
+    - sql: SELECT '0x1F'::integer + 1
+      expected: [[32]]
+    - sql: SELECT '1__0'::integer
+      error: "22P02"
+    - sql: SELECT '_1'::integer
+      error: "22P02"
+    - sql: SELECT '1_'::integer
+      error: "22P02"
+    - sql: SELECT '0x'::integer
+      error: "22P02"
+    - sql: SELECT '0o8'::integer
+      error: "22P02"
+    - sql: SELECT '1e3'::integer
+      error: "22P02"
+
+- name: text to an integer out of its range names the value
+  features: [pg:cast-operator, E011-01]
+  steps:
+    - sql: SELECT '3000000000'::integer
+      error: "22003"
+    - sql: SELECT '0x80000000'::integer
+      error: "22003"
+    - sql: SELECT '70000'::smallint
+      error: "22003"
+    - sql: SELECT '0x8000000000000000'::bigint
+      error: "22003"
+    - sql: SELECT '3000000000x'::integer
+      error: "22003"
+
+- name: text to real is read as float4in reads it
+  features: [pg:cast-operator, E011-02]
+  steps:
+    - sql: SELECT '1.5'::real, ' 2.25 '::real, '1e-45'::real
+      expected: [["1.5", "2.25", "1e-45"]]
+    - sql: SELECT '1e39'::real
+      error: "22003"
+    - sql: SELECT '1e-50'::real
+      error: "22003"
+    - sql: SELECT 'x'::real
+      error: "22P02"
+    - sql: SELECT '1e3x'::real
+      error: "22P02"
+
+- name: text out of a float's range is 22003 before any text after the number
+  features: [pg:cast-operator, E011-02]
+  steps:
+    - sql: SELECT ' 1e39 '::real
+      error: "22003"
+    - sql: SELECT '1e39x'::real
+      error: "22003"
+    - sql: SELECT '1e999x'::float8
+      error: "22003"
+
+- name: an infinity is no value of a DECIMAL
+  features: [pg:cast-operator, E011-03]
+  steps:
+    - sql: SELECT 'Infinity'::numeric(3,0)
+      error: "22003"
+    - sql: SELECT '-inf'::numeric(5,2)
+      error: "22003"
+    - sql: SELECT 'Infinityx'::numeric(3,0)
+      error: "22P02"

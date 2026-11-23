@@ -7,7 +7,8 @@ differences from PostgreSQL in what SQL means. The planner is
 `planner_design.md`. The TPROC-C statements the layer runs are in
 `testing_design.md`, *The TPROC-C statements*. *Expressions in casts,
 GROUP BY, DISTINCT, SET and MIN/MAX of text (#904)* is approved (2026-11-22);
-its stage M1, `MIN` and `MAX` of text, is built, the other stages not yet.
+its stages M1, `MIN` and `MAX` of text, and C0, the text input fixes, are
+built, the other stages not yet.
 
 ## Standing rules
 
@@ -1348,8 +1349,14 @@ recompile after a DDL folds them again, to the types they meet then.
 - A cast of a string literal or `NULL`: `DATE '…'`, `'…'::date` and
   `CAST('…' AS date)` alike read the string with the type's input function,
   a `DECIMAL(p, s)` rounded to its scale and range-checked (22003), and are
-  of that type. A cast to `VARCHAR(n)` or `CHAR(n)`, which PostgreSQL's cast
-  truncates or pads, is not taken yet.
+  of that type. An integer is read as PG 17's `int4in` reads it (`'0x1F'`,
+  `'0o17'`, `'0b101'`, `'1_000'`, spaces around; past its type 22003 `value
+  "3000000000" is out of range for type integer`), a `real` as `float4in`
+  (rounded once; `"1e39" is out of range for type real`), and `NaN` or an
+  infinity into a `DECIMAL(p, s)` is 22003 with PG's DETAIL (#904 stage C0,
+  *Casts of an expression*, **Integer input, constants included**). A cast
+  to `VARCHAR(n)` or `CHAR(n)`, which PostgreSQL's cast truncates or pads,
+  is not taken yet.
 - A cast of any other typed constant follows PostgreSQL's cast table
   (`pg_cast`), and its I/O casts to and from a string:
   - a number to any number type: an integer to a narrower integer range
@@ -2262,8 +2269,9 @@ WHERE" and "string function in a WHERE" gaps); `jsonb_design.md`,
 
 Status: **approved** by the owner on 2026-11-22, with every recommendation
 in *Open questions on #904*; tracking issue #904. Stage M1, `MIN` and `MAX`
-of text, is built (*MIN and MAX of text*, its as-built notes); the other
-stages are not yet. It covers the six gaps #904 lists,
+of text, is built (*MIN and MAX of text*, its as-built notes), and so is
+stage C0, the text input fixes (*Casts of an expression*, **Integer input,
+constants included**, its as-built notes); the other stages are not yet. It covers the six gaps #904 lists,
 found while building jsonb stage 3: a cast of an expression, `GROUP BY`
 of an expression, `SELECT DISTINCT` and `COUNT(DISTINCT …)` of an
 expression, an expression in `UPDATE … SET` (#896), `MIN`/`MAX` of text,
@@ -2396,6 +2404,32 @@ where today it says `value out of range: overflow`), and `decimal_from`
 reads `NaN` and the infinities, so a DECIMAL(p, s) of `'Infinity'` is
 PG's 22003 with its DETAIL rather than 22P02 (NaN: the difference above).
 Hexadecimal floats stay 22P02 (*Differences*).
+
+*As built (C0).* `integer_from(text, type, bits)` follows
+`pg_strtoint16/32/64_safe`: the range check runs before each digit is
+taken (more than 2^(bits-1)/base already read is 22003), so a value too
+long is 22003 even with junk after it (`'3000000000x'`), as in PG 17, and
+the type's range is checked there, so a string's 22003 names the value for
+every reader of `from_text` (a typed string, an unknown literal assigned
+or compared, a text-format parameter); the binder's own range check no
+longer sees such a value. `float_from(text, real)` reads a `real` with
+`from_chars<float>`, which rounds as `strtof` and keeps subnormals
+(`'1e-45'`), out of range where the rounding is infinite or a nonzero
+text gives zero. As `float4in` and `float8in`, a value out of range is
+22003 before the text after the number is looked at, and the message
+quotes only the number read, its sign kept and white space dropped
+(`' 1e39 '` and `'1e39x'` are both `"1e39" is out of range for type
+real`); `double precision` shares the path, so `' 1e999 '::float8`,
+which quoted the spaces, and `'1e999x'::float8`, which was 22P02, are
+PG's now too. `decimal_from` takes the `SqlType` for the DETAIL's
+precision; `NaN` (no sign, any case) and `Infinity`/`inf` (signed) are
+22003 before the digits are read, so `'-NaN'` and `'Infinityx'` stay
+22P02, as PG's. Two differences found while building it, both an error
+where PG returns a value (#911): PG 17's `numeric_in` also reads `0x`,
+`0o`, `0b` and `_` (`'0x1F'::numeric(5,0)` is 31), which `decimal_from`
+does not (22P02); and a DECIMAL constant or parameter that is NaN or an
+infinity, compared (`WHERE d = 'Infinity'`, `WHERE d = $1`), is 22003
+where PG compares and matches no row (*Differences*).
 
 **What stays refused.**
 
@@ -2762,7 +2796,7 @@ decision Q2, `jsonb_design.md`, *Path arguments*). A general array type is
 - `('{"a":1}'::jsonb)::text[]` and `5::text[]` are 42846; `j #>
   '{a}'::int[]` is 22P02 for the literal, `j #> '{1}'::int[]` 42883.
 
-**Design: keep both refused**, with a message that says what is refused:
+**Design: keep both refused** (the message built in C0), with a message that says what is refused:
 `ARRAY[ARRAY[…]]` in a path becomes 42601 `a multidimensional ARRAY is not
 supported yet` (today's `an ARRAY other than as the path of #> or #>>` is
 wrong, the outer `ARRAY` being that path). The SQLSTATE stays 42601, so
@@ -2948,7 +2982,7 @@ tests.
 | Stage | Builds | Unblocks (Mattermost-style) | Size (code + tests + docs) |
 |---|---|---|---|
 | M1 | `MIN`/`MAX` of text: the plan API's bytes slot, a stream's holder; depends on no other stage | `SELECT max(Id) …`, `min(Props->>'k')` | ~700 lines: binder 40, physical 40, codegen 120, plan API 180, tests 270, docs 50 |
-| C0 | input fixes shared by constants, parameters and (later) casts: `integer_from` (`0x`, `0o`, `0b`, `_`, the value in its 22003), `float_from`'s `real` (`strtof`, its message), `decimal_from`'s `'Infinity'`; the `ARRAY[ARRAY]` message | `'0x1F'::int`, a hex integer parameter | ~300 lines: text 90, binder 10, tests 170, docs 30 |
+| C0 (built) | input fixes shared by constants, parameters and (later) casts: `integer_from` (`0x`, `0o`, `0b`, `_`, the value in its 22003), `float_from`'s `real` (`strtof`, its message), `decimal_from`'s `'Infinity'`; the `ARRAY[ARRAY]` message | `'0x1F'::int`, a hex integer parameter | ~300 lines: text 90, binder 10, tests 170, docs 30 |
 | C1 | casts of expressions: `cast_kind`, the `Cast` kind replacing `JsonbCast`, the plan API's cast helpers, cast naming; casts in procedure expressions | `WHERE (Props->>'x')::bigint > $1`, `ORDER BY (Props->>'n')::int`, `sum((Props->>'n')::int)`, `$1::text::int` | ~1,150 lines: binder 190, physical 50, codegen 150, plan API 330, tests 370, docs 60 |
 | S1 | expressions in `SET` with the assignment table, the store shared with `INSERT … SELECT` (closes #824), column-order evaluation, `$n::T` of another type; needs C1's output and rounding helpers | `UPDATE … SET Message = lower(Message)`, `SET n = (Props->>'n')::int`, `SET s = Props->>'k'`, `SET flag = CASE … END`; with jsonb stage 4, `SET Props = jsonb_set(Props, $2, $3)` | ~950 lines: binder 240, physical 60, codegen 130, tests 440, docs 80 |
 | G0 | `GROUP BY` positions and output names over **column** items (the input-column-first rule, 42P10, 42702, 42601 for a non-integer constant); binder only, keys stay columns; a position naming an expression item stays 42601 until G1 | `SELECT UserId, count(*) … GROUP BY 1` | ~350 lines: parser 60, binder 110, tests 160, docs 20 |
@@ -2974,7 +3008,14 @@ open question 12 and stage P.
 - **NaN into DECIMAL(p, s).** PG 17 stores NaN (`'NaN'::float8::numeric(3,0)`
   and `'NaN'::numeric(3,0)` are `NaN`); the layer's DECIMAL has no NaN, so
   it is 22003 `numeric field overflow`, DETAIL `A field with precision 3,
-  scale 0 cannot hold NaN.`: an error where PG returns a value.
+  scale 0 cannot hold NaN.`: an error where PG returns a value. A compared
+  DECIMAL constant or parameter that is NaN or an infinity
+  (`WHERE d = 'Infinity'`, `WHERE d = $1`) is the same 22003, where PG
+  compares it and matches no row (C0, #911).
+- **DECIMAL input forms.** PG 17's `numeric_in` reads `0x`, `0o`, `0b` and
+  `_` between digits as its integer input does (`'0x1F'::numeric(5,0)`,
+  `'1_000'::numeric(6,1)`); `decimal_from` reads decimal only, so they are
+  22P02 (found in C0, #911).
 - **VARCHAR(n) assignments whose excess is spaces** stay 22001 in `SET`,
   as in `INSERT` (the existing entry under *Known differences from
   PostgreSQL*).

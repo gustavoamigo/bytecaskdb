@@ -1823,8 +1823,12 @@ integer sum, as `SUM`'s, with its 64-bit limit (`frontend_design.md`,
 
 Status: **approved** by the owner on 2026-11-22, with every recommendation
 in *Open questions on #904*; tracking issue #904. Stage M1 (*MIN and MAX
-of text*) is built, with the as-built notes there; the other stages are
-not yet. The dialect, PG 17's behaviour, the
+of text*) is built, with the as-built notes there; stage C0, the text input
+fixes `from_text` shares (`integer_from`, `float_from`'s `real`,
+`decimal_from`'s NaN and infinities), is built, with its as-built notes in
+`frontend_design.md`: the runtime cast helpers below inherit them, so
+`bc_text_in_*` and `bc_f64_to_decimal` need no input code of their own.
+The other stages are not yet. The dialect, PG 17's behaviour, the
 refusals, the stages (M1, C0, C1, S1, G0, G1, G2) and the open questions are
 `frontend_design.md`, *Expressions in casts, GROUP BY, DISTINCT, SET and
 MIN/MAX of text (#904)*. This section is how the plan, the search, the

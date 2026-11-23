@@ -451,3 +451,11 @@
       error: "22023"
   teardown:
     - "DROP TABLE jb"
+
+- name: "a multidimensional ARRAY path is read flat"
+  features: [pg:jsonb]
+  # a multidimensional ARRAY is not supported yet (42601; docs/frontend_design.md, *ARRAY[ARRAY[…]] and casts to text[]*)
+  unimplemented: true
+  steps:
+    - sql: "SELECT '{\"a\":{\"b\":1}}'::jsonb #> ARRAY[ARRAY['a'],ARRAY['b']], '{\"a\":{\"b\":1}}'::jsonb #>> ARRAY[['a'],['b']]"
+      expected: [[1, 1]]

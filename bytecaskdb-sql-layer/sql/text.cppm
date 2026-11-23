@@ -67,9 +67,11 @@ private:
 // Text as a value of type t, as t's input function reads it. A DECIMAL
 // finer than its scale is rounded half away from zero when the value is
 // only assigned, as PostgreSQL rounds on assignment, and refused otherwise.
-// A value outside the type's range (a SMALLINT past 32767, a VARCHAR too
-// long) is left to the layer's range check, which reports it as PostgreSQL
-// does. Throws TextError.
+// An integer outside its type is the input function's 22003, naming the
+// text, as PostgreSQL 17's int2in, int4in and int8in raise it; a REAL
+// outside real's range is float4in's. Any other value outside the type's
+// range (a DECIMAL past its precision, a VARCHAR too long) is left to the
+// layer's range check, which reports it as PostgreSQL does. Throws TextError.
 [[nodiscard]] auto from_text(std::string_view text, SqlType t, bool assigned_only) -> Datum;
 
 // PostgreSQL's AVG of an exact number, as numeric's text: its numeric_div
@@ -516,25 +518,81 @@ auto timetz_from(std::string_view text) -> std::int64_t {
 
 // ---------------------------------------------------------------- numbers
 
-auto integer_from(std::string_view text, std::string_view type) -> std::int64_t {
-  auto s = trim(text);
-  if (!s.empty() && s.front() == '+') s.remove_prefix(1);
-  std::int64_t v = 0;
-  auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
-  if (s.empty() || end != s.data() + s.size() || (ec != std::errc{} && ec != std::errc::result_out_of_range)) {
-    bad_text(type, text);
+// An integer's text as PostgreSQL 17's pg_strtoint16/32/64 read it, for a
+// type of `bits`: spaces around it, a sign, then decimal digits or a 0x, 0o
+// or 0b prefix and its digits, a single _ between digits (and after the
+// prefix). A value past the type's range is 22003 naming the text, found as
+// the digits are read, so it wins over trailing junk as PostgreSQL's does.
+auto integer_from(std::string_view text, std::string_view type, int bits) -> std::int64_t {
+  auto s = text;
+  while (!s.empty() && is_space(s.front())) s.remove_prefix(1);
+  auto negative = false;
+  if (!s.empty() && (s.front() == '-' || s.front() == '+')) {
+    negative = s.front() == '-';
+    s.remove_prefix(1);
   }
-  if (ec == std::errc::result_out_of_range) {
+  auto out_of_range = [&] [[noreturn]] {
     throw TextError("value \"" + std::string{text} + "\" is out of range for type " + std::string{type}, "22003");
+  };
+  std::uint64_t base = 10;
+  auto prefixed = false;
+  if (s.size() >= 2 && s[0] == '0') {
+    auto p = static_cast<char>(std::tolower(static_cast<unsigned char>(s[1])));
+    if (p == 'x' || p == 'o' || p == 'b') {
+      base = p == 'x' ? 16 : p == 'o' ? 8 : 2;
+      prefixed = true;
+      s.remove_prefix(2);
+    }
   }
-  return v;
+  auto digit_of = [&](char ch) -> std::optional<std::uint64_t> {
+    auto lower = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    std::uint64_t d = 0;
+    if (lower >= '0' && lower <= '9') {
+      d = static_cast<std::uint64_t>(lower - '0');
+    } else if (lower >= 'a' && lower <= 'f') {
+      d = static_cast<std::uint64_t>(lower - 'a') + 10;
+    } else {
+      return std::nullopt;
+    }
+    if (d >= base) return std::nullopt;
+    return d;
+  };
+  // The magnitude of the type's most negative value, 2^(bits - 1); checked
+  // before each digit as PostgreSQL checks it.
+  const auto most = std::uint64_t{1} << (bits - 1);
+  std::uint64_t magnitude = 0;
+  std::size_t i = 0;
+  auto any = false;
+  while (i < s.size()) {
+    if (auto d = digit_of(s[i])) {
+      if (magnitude > most / base) out_of_range();
+      magnitude = magnitude * base + *d;
+      any = true;
+      ++i;
+    } else if (s[i] == '_') {
+      // Never first (but after a prefix), and a digit must follow.
+      if (i == 0 && !prefixed) bad_text(type, text);
+      if (i + 1 >= s.size() || !digit_of(s[i + 1])) bad_text(type, text);
+      ++i;
+    } else {
+      break;
+    }
+  }
+  if (!any) bad_text(type, text);
+  for (; i < s.size(); ++i) {
+    if (!is_space(s[i])) bad_text(type, text);
+  }
+  if (magnitude > most - (negative ? 0u : 1u)) out_of_range();
+  return negative ? static_cast<std::int64_t>(0 - magnitude) : static_cast<std::int64_t>(magnitude);
 }
 
-// A float's text, as PostgreSQL's float8in reads it: what strtod reads,
-// NaN and Infinity in any case. A REAL is read as a double too: the layer
-// rounds it and checks its range, in column order, as it does every REAL it
-// is given, so a REAL behaves as over the embedded API.
-auto float_from(std::string_view text) -> double {
+// A float's text, as PostgreSQL's float8in reads it, or float4in when
+// `real`: what strtod (strtof) reads, NaN and Infinity in any case. A REAL
+// is rounded once, from its text, never through a double; a value whose
+// rounding is infinite, or zero from a nonzero text, is out of range.
+// Hexadecimal floats, which strtod reads, are 22P02 (from_chars does not).
+auto float_from(std::string_view text, bool real) -> double {
+  const std::string_view type = real ? "real" : "double precision";
   auto s = trim(text);
   auto negative = false;
   auto body = s;
@@ -546,13 +604,29 @@ auto float_from(std::string_view text) -> double {
   if (iequals(body, "infinity") || iequals(body, "inf")) {
     return negative ? -std::numeric_limits<double>::infinity() : std::numeric_limits<double>::infinity();
   }
+  // The number as written, sign included, for the out-of-range message.
+  const auto number = s;
   if (!s.empty() && s.front() == '+') s.remove_prefix(1);
-  double d = 0;
-  auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), d);
-  if (s.empty() || end != s.data() + s.size()) bad_text("double precision", text);
-  if (ec == std::errc::result_out_of_range) {
-    throw TextError("\"" + std::string{text} + "\" is out of range for type double precision", "22003");
+  // As float4in and float8in: a value out of range is 22003 naming only the
+  // number read, before any text after it is looked at; then anything left
+  // is 22P02 naming the whole input.
+  auto read = [&]<typename F>(F& v) {
+    auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (ec == std::errc::result_out_of_range) {
+      const auto read_size = static_cast<std::size_t>(end - number.data());
+      throw TextError("\"" + std::string{number.substr(0, read_size)} + "\" is out of range for type " +
+                          std::string{type},
+                      "22003");
+    }
+    if (s.empty() || ec != std::errc{} || end != s.data() + s.size()) bad_text(type, text);
+  };
+  if (real) {
+    float f = 0;
+    read(f);
+    return static_cast<double>(f);
   }
+  double d = 0;
+  read(d);
   return d;
 }
 
@@ -560,13 +634,26 @@ auto float_from(std::string_view text) -> double {
 // is rounded half away from zero when the parameter is only assigned, as
 // PostgreSQL rounds on assignment, and refused otherwise: a compared or
 // added value is used unrounded there (docs/server_design.md).
-auto decimal_from(std::string_view text, std::uint8_t scale, bool assigned_only) -> std::int64_t {
+//
+// NaN and the infinities, which numeric_in reads, a DECIMAL cannot hold: 22003
+// with apply_typmod_special's DETAIL for the infinities, and for NaN (which
+// PostgreSQL stores) a DETAIL in its form.
+auto decimal_from(std::string_view text, SqlType t, bool assigned_only) -> std::int64_t {
+  const auto scale = t.scale;
   auto s = trim(text);
+  auto special = [&] [[noreturn]] (std::string_view what) {
+    throw TextError("numeric field overflow", "22003",
+                    "A field with precision " + std::to_string(t.precision) + ", scale " + std::to_string(scale) +
+                        " cannot hold " + std::string{what} + ".",
+                    "");
+  };
+  if (iequals(s, "nan")) special("NaN");
   auto negative = false;
   if (!s.empty() && (s.front() == '+' || s.front() == '-')) {
     negative = s.front() == '-';
     s.remove_prefix(1);
   }
+  if (iequals(s, "infinity") || iequals(s, "inf")) special("an infinite value");
   std::string digits;
   std::int64_t point = 0;  // digits before the decimal point
   auto seen_digit = false;
@@ -1005,11 +1092,11 @@ auto to_text(const Datum& v, SqlType t) -> std::string {
 
 auto from_text(std::string_view text, SqlType t, bool assigned_only) -> Datum {
   switch (t.kind) {
-    case SqlKind::SmallInt: return integer_from(text, "smallint");
-    case SqlKind::Integer: return integer_from(text, "integer");
-    case SqlKind::BigInt: return integer_from(text, "bigint");
-    case SqlKind::Real:
-    case SqlKind::Double: return float_from(text);
+    case SqlKind::SmallInt: return integer_from(text, "smallint", 16);
+    case SqlKind::Integer: return integer_from(text, "integer", 32);
+    case SqlKind::BigInt: return integer_from(text, "bigint", 64);
+    case SqlKind::Real: return float_from(text, true);
+    case SqlKind::Double: return float_from(text, false);
     case SqlKind::Boolean: return bool_from(text);
     case SqlKind::Bytea: return bytea_from(text);
     case SqlKind::Text:
@@ -1021,7 +1108,7 @@ auto from_text(std::string_view text, SqlType t, bool assigned_only) -> Datum {
       b.resize(name_prefix(b).size());
       return b;
     }
-    case SqlKind::Decimal: return decimal_from(text, t.scale, assigned_only);
+    case SqlKind::Decimal: return decimal_from(text, t, assigned_only);
     case SqlKind::Timestamp: return timestamp_from(text);
     case SqlKind::TimestampTz: return timestamptz_from(text);
     case SqlKind::Date: return date_from(text);
