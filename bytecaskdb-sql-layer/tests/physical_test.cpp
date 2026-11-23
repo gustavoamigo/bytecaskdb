@@ -522,7 +522,8 @@ TEST_CASE("physical: a plan holds one hash join, and a predicate over two tables
     return with(std::move(f));
   };
   CHECK(refusal(scaled(2, 2)).empty());
-  refused(scaled(2, 1), "types it does not relate");
+  // At two scales, eval's (physical::evaluated), which brings both to one.
+  CHECK(refusal(scaled(2, 1)).empty());
   // The inner side of a nested loop reads the outer side's rows too: as a left outer join's match does.
   auto inner = [&](logical::ColumnRef a, logical::ColumnRef b) {
     auto filtered = node(physical::Filter{scan_of(2), {both_columns(a, b)}});
@@ -718,4 +719,41 @@ TEST_CASE("physical: a derived relation is its query's groups, read by a grouped
   const logical::ColumnRef flag{d, 2, PhysType::Bool, true};
   CHECK(physical::group_layout({flag}, {}).key_slot[0].has_value());
   CHECK_FALSE(physical::group_layout({{1, 4, PhysType::Bool, true}}, {}).key_slot[0].has_value());
+}
+
+TEST_CASE("physical: an evaluated filter is a BOOLEAN of rows in hand, of no random(); evaluated agrees with the search",
+          "[sql][physical]") {
+  using Kind = logical::Expr::Kind;
+  using Op = ast::Compare::Op;
+  const auto big = SqlType{SqlKind::BigInt};
+  const auto integer = SqlType{SqlKind::Integer};
+  auto id = logical::column(kId, big);
+  auto v = logical::column(kV, big);
+  auto filtered = [&](logical::Expr c) {
+    return plan(emit(node(physical::Filter{get({p(0)}), {std::move(c)}})));
+  };
+  // v * $2 > $1 is printed by eval, a BOOLEAN over the row in hand.
+  auto times = logical::compare(Op::Gt, logical::binary(Kind::Mul, v, p(1), big), p(0));
+  CHECK(physical::evaluated(times));
+  CHECK(refusal(filtered(times)).empty());
+  // Not a BOOLEAN; a column of a table not in hand; random().
+  refused(filtered(logical::binary(Kind::Add, v, p(1), big)), "not a BOOLEAN");
+  auto stray = logical::compare(Op::Gt, logical::binary(Kind::Add, logical::column({9, 0, PhysType::I64, true}, big), p(1), big), p(0));
+  refused(filtered(stray), "not in hand");
+  auto dice = logical::compare(Op::Eq, logical::binary(Kind::Random, p(0), p(1), big), v);
+  refused(filtered(dice), "random()");
+  // A column against a parameter of its type, or $n ± k of an INTEGER,
+  // is truth's; of another type (d > $1::int) or $n ± k under OR, eval's.
+  CHECK_FALSE(physical::evaluated(logical::compare(Op::Eq, v, p(0))));
+  auto d = logical::column({1, 4, PhysType::I64, true}, SqlType{SqlKind::Decimal, 0, 10, 2});
+  auto cast = logical::compare(Op::Gt, d, logical::param(0, integer));
+  CHECK(physical::evaluated(cast));
+  CHECK_FALSE(physical::column_compare(cast));
+  auto n = logical::column({1, 5, PhysType::I64, true}, integer);
+  auto sum = logical::binary(Kind::Add, logical::param(0, integer), logical::constant(1, integer), integer);
+  CHECK(physical::is_computed(sum));
+  CHECK_FALSE(physical::evaluated(logical::compare(Op::Eq, n, sum)));
+  CHECK(physical::evaluated(logical::predicate_of(Kind::Or, {logical::compare(Op::Eq, n, sum), logical::compare(Op::Eq, v, p(1))})));
+  // b = a + 1 is no $n ± k, whatever its kind.
+  CHECK_FALSE(physical::is_computed(logical::binary(Kind::Add, n, logical::constant(1, integer), integer)));
 }

@@ -2473,9 +2473,10 @@ TEST_CASE("embedded API: expressions over columns in the select list", "[sql][ap
   CHECK(state("SELECT abs(f) < 1 FROM ce") == "42601");  // a comparison of floats as a value
   CHECK(state("SELECT SUM(i) + 1 FROM ce") == "42601");
   CHECK(state("SELECT i + 1, COUNT(*) FROM ce GROUP BY i") == "42601");
-  CHECK(state("SELECT $1 + 1 FROM ce") == "42601");
+  CHECK(state("SELECT $1 + $2 FROM ce") == "42725");
   CHECK(state("UPDATE ce SET i = i * 2") == "42601");
-  CHECK(state("SELECT id FROM ce WHERE i * 2 = 4") == "42601");
+  CHECK(state("SELECT id FROM ce WHERE f * 2 = 4") == "42601");  // a float in an expression filter
+  CHECK(state("SELECT id FROM ce WHERE random(1, 2) = 1") == "42601");
 }
 
 
@@ -2958,9 +2959,9 @@ TEST_CASE("embedded API: || and the string functions of constants fold as Postgr
   (void)db->execute("INSERT INTO sf VALUES (1, 'ab' || 'c')");
   (void)db->execute("INSERT INTO sf VALUES (2, UPPER('x'))");
   CHECK(db->execute("SELECT v FROM sf WHERE v = LOWER('ABC')").rows == Grid{{text("abc")}});
-  // Of a column they are select-list values (below); in a WHERE, not yet.
+  // Of a column they are values, in a select list and in a WHERE.
   CHECK(db->execute("SELECT v || 'x', UPPER(v) FROM sf WHERE id = 1").rows == Grid{{text("abcx"), text("ABC")}});
-  CHECK(state("SELECT id FROM sf WHERE UPPER(v) = 'ABC'") == "42601");
+  CHECK(db->execute("SELECT id FROM sf WHERE UPPER(v) = 'ABC'").rows == Grid{{i(1)}});
 }
 
 TEST_CASE("embedded API: a view is read as a table, expanded at each use, and kept in the catalog", "[sql][api][view]") {
@@ -4273,6 +4274,12 @@ TEST_CASE("embedded API: a CHAR(n) column ignores trailing spaces and is returne
     CHECK(text(*db, "SELECT id FROM t WHERE a = 'ab        ' ORDER BY id") == V{"1", "3", "9"});
     CHECK(text(*db, "SELECT id FROM t WHERE a = 'é'") == V{"4"});
     CHECK(text(*db, "SELECT id FROM t WHERE a > 'ab' ORDER BY id") == V{"2", "4"});
+    // A TEXT constant (of || or lower()) is not: the CHAR is compared as
+    // text, as PostgreSQL casts it; a VARCHAR one is cut as a literal is.
+    CHECK(text(*db, "SELECT id FROM t WHERE a = 'ab ' || ''").empty());
+    CHECK(text(*db, "SELECT id FROM t WHERE a = lower('AB ')").empty());
+    CHECK(text(*db, "SELECT id FROM t WHERE a = 'ab' || '' ORDER BY id") == V{"1", "3", "9"});
+    CHECK(text(*db, "SELECT id FROM t WHERE a = 'ab '::varchar ORDER BY id") == V{"1", "3", "9"});
     // Two CHARs compare without their spaces; a CHAR with a VARCHAR as text,
     // the CHAR's spaces cut and the VARCHAR's kept.
     CHECK(text(*db, "SELECT a = b FROM t WHERE id = 4") == V{"f"});
@@ -5525,9 +5532,10 @@ TEST_CASE("embedded API: CURRENT_USER and its kin, CURRENT_CATALOG and CURRENT_S
   // CURRENT_SCHEMA spelled as calls, named by the call.
   CHECK(text(*db, "SELECT current_database(), pg_catalog.current_schema()") == V{"shop", "public"});
   CHECK(state(*db, "CREATE TABLE w (id INTEGER, c NAME DEFAULT current_database())") == "ok");
-  // Refused as gaps of PostgreSQL's dialect (0A000): compared in WHERE with
-  // no column, in a CHECK, an aggregated select list, ADD COLUMN's DEFAULT.
-  CHECK(state(*db, "SELECT id FROM t WHERE CURRENT_USER = 'bytecask'") == "0A000");
+  // Compared in a WHERE with no column: a filter of every row alike.
+  CHECK(state(*db, "SELECT id FROM t WHERE CURRENT_USER = 'bytecask'") == "ok");
+  // Refused as gaps of PostgreSQL's dialect (0A000): in a CHECK, an
+  // aggregated select list, ADD COLUMN's DEFAULT.
   CHECK(state(*db, "CREATE TABLE z (a NAME CHECK (a = CURRENT_USER))") == "0A000");
   CHECK(state(*db, "SELECT COUNT(*), CURRENT_USER FROM t") == "0A000");
   CHECK(state(*db, "ALTER TABLE t ADD COLUMN w NAME DEFAULT CURRENT_USER") == "0A000");
@@ -5538,4 +5546,81 @@ TEST_CASE("embedded API: CURRENT_USER and its kin, CURRENT_CATALOG and CURRENT_S
   const auto long_name = std::string(70, 'u');
   longer.user = long_name;
   CHECK(text(*db, "SELECT CURRENT_USER", longer) == V{std::string(63, 'u')});
+}
+
+TEST_CASE("embedded API: an expression filter raises only for rows it evaluates", "[sql][api]") {
+  sql_test::TempDir dir{"api_expression_filter"};
+  auto db = Database::open(dir.path());
+  (void)db->execute("CREATE TABLE ef (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, s TEXT)");
+  (void)db->execute("INSERT INTO ef VALUES (1, 0, 1, 'Alice'), (2, 1, NULL, 'bob'), (3, 2, 3, NULL), (4, NULL, 4, 'x'), (5, -1, 0, 'Y')");
+  (void)db->execute("CREATE TABLE eg (x INTEGER PRIMARY KEY, y INTEGER)");
+  (void)db->execute("INSERT INTO eg VALUES (1, 10), (2, 0), (3, 5), (5, 1)");
+  auto state = [&](std::string_view sql, std::vector<Value> params = {}) -> std::string {
+    try {
+      (void)db->execute(db->prepare(sql), params);
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    }
+    return std::string{"ran"};
+  };
+  auto rows = [&](std::string_view sql, std::vector<Value> params = {}) { return ids(db->execute(db->prepare(sql), params)); };
+  using V = std::vector<std::int64_t>;
+  auto text = [](std::string_view v) { return Value{sql_test::bytes(v)}; };
+
+  // SQL's three-valued logic over any operand (PostgreSQL 17's rows).
+  CHECK(rows("SELECT id FROM ef WHERE a + NULL = 1").empty());
+  CHECK(rows("SELECT id FROM ef WHERE a + b = a + b ORDER BY id") == V{1, 3, 5});
+  CHECK(rows("SELECT id FROM ef WHERE (a + b > 2) IS NULL ORDER BY id") == V{2, 4});
+  CHECK(rows("SELECT id FROM ef WHERE NOT (a + b > 2) ORDER BY id") == V{1, 5});
+  CHECK(rows("SELECT id FROM ef WHERE NOT (b > 2 AND a = 1) ORDER BY id") == V{1, 3, 5});
+  CHECK(rows("SELECT id FROM ef WHERE lower(s) = $1", {text("alice")}) == V{1});
+  CHECK(rows("SELECT id FROM ef WHERE lower(s) LIKE lower($1) ORDER BY id", {text("%L%")}) == V{1});
+  CHECK(rows("SELECT id FROM ef WHERE a + 0 IN (1, 5) ORDER BY id") == V{2});
+  CHECK(rows("SELECT id FROM ef WHERE a = $1 - 1 OR b = 4 ORDER BY id", {i(1)}) == V{1, 4});
+  CHECK(rows("SELECT id FROM ef WHERE $1 = $2 ORDER BY id", {text("a"), text("b")}).empty());
+  // A key and an expression on one column: the point lookup, then the filter.
+  CHECK(rows("SELECT id FROM ef WHERE id = $1 AND id * 2 = 6", {i(3)}) == V{3});
+  CHECK(rows("SELECT id FROM ef WHERE id + 0 = 3") == V{3});
+
+  // Inside AND, OR and CASE an operand is tried only while the result is
+  // unsettled, in written order; a top-level conjunct after one that
+  // rejects the row is not tried.
+  CHECK(rows("SELECT id FROM ef WHERE a = 0 OR 1/a > 0 ORDER BY id") == V{1, 2});
+  CHECK(state("SELECT id FROM ef WHERE 1/a > 0 OR a = 0") == "22012");
+  CHECK(rows("SELECT id FROM ef WHERE CASE WHEN a <> 0 THEN 1/a > 0 ELSE false END ORDER BY id") == V{2});
+  CHECK(rows("SELECT id FROM ef WHERE a <> 0 AND 1/a > 0 ORDER BY id") == V{2});
+  CHECK(state("SELECT id FROM ef WHERE 1/a > 0 AND a <> 0") == "22012");  // written order (P1a)
+  CHECK(state("SELECT id FROM ef WHERE a * 2147483647 > 0") == "22003");
+  // A conjunct testing a correlated subquery keeps its written place.
+  CHECK(rows("SELECT id FROM ef WHERE EXISTS (SELECT 1 FROM eg WHERE eg.x = ef.id AND eg.y = 5) AND 10/a > 0") == V{3});
+  CHECK(state("SELECT id FROM ef WHERE 10/a > 0 AND EXISTS (SELECT 1 FROM eg WHERE eg.x = ef.id AND eg.y = 5)") == "22012");
+  // A strict operator with a NULL constant operand is NULL, its other
+  // operand never evaluated, as PostgreSQL 17 folds it; a NULL parameter
+  // is not folded (frontend_design.md, *Differences from PG 17*).
+  CHECK(rows("SELECT id FROM ef WHERE 10/a > NULL").empty());
+  CHECK(rows("SELECT id FROM ef WHERE 10/a > NULL OR a = 0") == V{1});
+  CHECK(rows("SELECT id FROM ef WHERE (10/a + NULL) IS NULL ORDER BY id") == V{1, 2, 3, 4, 5});
+  CHECK(db->execute("SELECT 10/a > NULL, abs(10/a) + NULL FROM ef WHERE id = 1").rows == Grid{{Value{}, Value{}}});
+  CHECK(state("SELECT id FROM ef WHERE 10/a > $1", {Value{}}) == "22012");
+  // A row no plan reads raises nothing: a key that names no row, a pair no
+  // key matches, a left row with no match.
+  CHECK(db->execute("SELECT count(a) FROM ef WHERE id = 99 AND 10/a > 0").rows == Grid{{i(0)}});
+  CHECK(state("SELECT count(a) FROM ef WHERE id = 1 AND 10/a > 0") == "22012");
+  CHECK(db->execute("SELECT count(*) FROM ef WHERE id = 2 AND 10/a > 0").rows == Grid{{i(1)}});
+  CHECK(rows("SELECT ef.id FROM ef LEFT JOIN eg ON eg.x = ef.b AND 10/eg.y > 0 ORDER BY ef.id") == V{1, 2, 3, 4, 5});
+  CHECK(rows("SELECT ef.id FROM ef LEFT JOIN eg ON eg.x = ef.a + 1 ORDER BY ef.id") == V{1, 2, 3, 4, 5});
+  CHECK(rows("SELECT ef.id FROM ef JOIN eg ON ef.a + 1 = eg.x ORDER BY ef.id") == V{1, 2, 3});
+  // Above a left join, a NULL-extended row reads NULL and raises nothing.
+  CHECK(rows("SELECT ef.id FROM ef LEFT JOIN eg ON ef.a = eg.x WHERE eg.y * 2 IS NULL ORDER BY ef.id") == V{1, 4, 5});
+
+  // An UPDATE or DELETE raising one has no effect.
+  CHECK(state("DELETE FROM ef WHERE 10 / a > 0") == "22012");
+  CHECK(db->execute("SELECT count(*) FROM ef").rows == Grid{{i(5)}});
+  CHECK(state("UPDATE ef SET b = 0 WHERE 10 / (a + 1) > 0") == "22012");
+  CHECK(rows("SELECT id FROM ef WHERE b = 0") == V{5});
+  CHECK(db->execute("UPDATE ef SET b = 7 WHERE lower(s) = 'bob'").affected == 1);
+  CHECK(db->execute("DELETE FROM ef WHERE a + 1 > 2").affected == 1);
+  CHECK(rows("SELECT id FROM ef WHERE b = 7") == V{2});
 }

@@ -131,7 +131,9 @@ TEST_CASE("parser: subqueries as values, EXISTS, IN and ANY, SOME or ALL", "[sql
   CHECK((sel.where[3].kind == Compare::Kind::Not && sel.where[3].args[0].kind == Compare::Kind::Quantified));
   CHECK((sel.where[4].quantified == ValueCompare::Lt && sel.where[4].all));
   CHECK((sel.where[5].quantified == ValueCompare::Ne && !sel.where[5].all));
-  for (auto sql : {"SELECT id FROM t WHERE (SELECT 1)", "SELECT id FROM t WHERE (id, qty) IN (SELECT a, b FROM u)",
+  // A scalar subquery standing alone is a value (Value), the binder's to type.
+  CHECK(std::get<Select>(parse("SELECT id FROM t WHERE (SELECT 1)")).where[0].kind == Compare::Kind::Value);
+  for (auto sql : {"SELECT id FROM t WHERE (id, qty) IN (SELECT a, b FROM u)",
                    "SELECT id FROM t WHERE id = ARRAY(SELECT a FROM u)", "SELECT id FROM t WHERE id IN (VALUES (1))"}) {
     INFO(sql);
     CHECK_THROWS_AS(parse(sql), SqlError);

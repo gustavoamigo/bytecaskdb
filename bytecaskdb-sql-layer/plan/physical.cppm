@@ -17,6 +17,7 @@ module;
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -202,13 +203,120 @@ struct Choice {
   NodePtr at_or_above;
 };
 
-// The rows every conjunct holds for, run as soon as the row is read. NULL
-// on either side of a comparison rejects the row. A DOUBLE or REAL compares
-// in PostgreSQL's float8 order, the row's value, never a key's.
+// The rows every conjunct holds for, run as soon as the row is read, in
+// the order of `conjuncts`: a row stops at the first that is not true, and
+// is tried against none after it. NULL on either side of a comparison
+// rejects the row. A DOUBLE or REAL compares in PostgreSQL's float8 order,
+// the row's value, never a key's.
 struct Filter {
   NodePtr input;
   std::vector<Expr> conjuncts;
 };
+
+// $n ± k as the plan computes it once, before anything is read (Computed):
+// an INTEGER Add or Sub of a parameter and a constant. The one test of the
+// shape, shared by the search, the checker and codegen.
+[[nodiscard]] inline auto is_computed(const Expr& e) -> bool {
+  return (e.kind == Expr::Kind::Add || e.kind == Expr::Kind::Sub) && e.type.kind == SqlKind::Integer && e.args.size() == 2 &&
+         e.args[0].kind == Expr::Kind::Param && e.args[1].kind == Expr::Kind::Const;
+}
+
+// Whether comparison c is a column against what a key may take and truth
+// prints: a parameter of the column's type (or, a subquery's value or an
+// outer row's column, a wider integer, which bounds no key), $n ± k of
+// it, or another column of a type the comparison relates without
+// rescaling. Any other comparison is evaluated (evaluated), never a key's
+// bound: `d > $1::int` reads the parameter as an INTEGER and compares it
+// with the DECIMAL at the DECIMAL's scale.
+[[nodiscard]] inline auto column_compare(const Expr& c) -> bool {
+  if (c.kind != Expr::Kind::Compare || c.args.size() != 2 || c.args[0].kind != Expr::Kind::Column) return false;
+  const auto& col = c.args[0];
+  const auto& o = c.args[1];
+  auto integer = [](SqlType t) { return t.kind == SqlKind::SmallInt || t.kind == SqlKind::Integer || t.kind == SqlKind::BigInt; };
+  switch (o.kind) {
+    case Expr::Kind::Param:
+      return o.type == col.type || (integer(o.type) && integer(col.type) &&
+                                    key_part_of(o.type, false, false).width > key_part_of(col.type, false, false).width);
+    case Expr::Kind::Add:
+    case Expr::Kind::Sub: return is_computed(o) && o.type == col.type;
+    case Expr::Kind::Column: {
+      auto number = [](PhysType t) { return t == PhysType::I64 || t == PhysType::F64; };
+      auto x = col.col.type;
+      auto y = o.col.type;
+      return (x == y || (number(x) && number(y))) && decimal_scale(col.type) == decimal_scale(o.type);
+    }
+    case Expr::Kind::Const:
+    case Expr::Kind::Mul:
+    case Expr::Kind::Div:
+    case Expr::Kind::Compare:
+    case Expr::Kind::Aggregate:
+    case Expr::Kind::And:
+    case Expr::Kind::Or:
+    case Expr::Kind::Not:
+    case Expr::Kind::IsNull:
+    case Expr::Kind::Like:
+    case Expr::Kind::Truth:
+    case Expr::Kind::InSet:
+    case Expr::Kind::Case:
+    case Expr::Kind::Coalesce:
+    case Expr::Kind::Concat:
+    case Expr::Kind::Substr:
+    case Expr::Kind::TextFn:
+    case Expr::Kind::Extract:
+    case Expr::Kind::JsonbCast:
+    case Expr::Kind::Mod:
+    case Expr::Kind::Neg:
+    case Expr::Kind::Abs:
+    case Expr::Kind::Random: break;
+  }
+  return false;
+}
+
+// Whether truth prints e as one C condition: a comparison column_compare
+// takes ($n ± k only as a conjunct of its own, `top`), IS NULL of a column,
+// a text column LIKE parameters, a subquery's Truth or InSet of a column, a
+// folded constant, and AND, OR and NOT of these.
+[[nodiscard]] inline auto truth_prints(const Expr& e, bool top) -> bool {
+  auto column = [](const Expr& x) { return x.kind == Expr::Kind::Column; };
+  switch (e.kind) {
+    case Expr::Kind::And:
+    case Expr::Kind::Or:
+    case Expr::Kind::Not: return std::ranges::all_of(e.args, [](const Expr& a) { return truth_prints(a, false); });
+    case Expr::Kind::IsNull: return e.args.size() == 1 && column(e.args[0]);
+    case Expr::Kind::Like:
+      return e.args.size() >= 2 && column(e.args[0]) && e.args[0].col.type == PhysType::Bytes &&
+             std::ranges::all_of(e.args.begin() + 1, e.args.end(), [](const Expr& a) { return a.kind == Expr::Kind::Param; });
+    case Expr::Kind::InSet: return e.args.size() == 1 && column(e.args[0]);
+    case Expr::Kind::Truth:
+    case Expr::Kind::Const: return true;
+    case Expr::Kind::Compare: return column_compare(e) && (top || !is_computed(e.args[1]));
+    case Expr::Kind::Column:
+    case Expr::Kind::Param:
+    case Expr::Kind::Add:
+    case Expr::Kind::Sub:
+    case Expr::Kind::Mul:
+    case Expr::Kind::Div:
+    case Expr::Kind::Aggregate:
+    case Expr::Kind::Case:
+    case Expr::Kind::Coalesce:
+    case Expr::Kind::Concat:
+    case Expr::Kind::Substr:
+    case Expr::Kind::TextFn:
+    case Expr::Kind::Extract:
+    case Expr::Kind::JsonbCast:
+    case Expr::Kind::Mod:
+    case Expr::Kind::Neg:
+    case Expr::Kind::Abs:
+    case Expr::Kind::Random: break;
+  }
+  return false;
+}
+
+// Whether codegen prints conjunct c by eval, the select list's evaluator,
+// as statements before its test, rather than as truth's condition: every
+// conjunct truth_prints does not take. The search, the checker and codegen
+// all ask this, so they never disagree on how a conjunct is printed.
+[[nodiscard]] inline auto evaluated(const Expr& c) -> bool { return !truth_prints(c, true); }
 
 // A result column that is an expression over the row's columns, parameters
 // and constants, evaluated for each row (docs/planner_design.md,
@@ -780,8 +888,15 @@ private:
       case Expr::Kind::Sub:
       case Expr::Kind::Mul:
       case Expr::Kind::Div:
-      case Expr::Kind::Compare:
       case Expr::Kind::Mod: operands(2, 2); break;
+      case Expr::Kind::Compare:
+        // eval compares two values held alike; a DECIMAL's scale it brings up.
+        operands(2, 2);
+        {
+          auto held = [](const Expr& x) { return x.kind == Expr::Kind::Column ? x.col.type : x.phys(); };
+          if (held(e.args[0]) != held(e.args[1])) broken("a comparison of values of types it does not relate");
+        }
+        break;
       case Expr::Kind::IsNull:
       case Expr::Kind::Not:
       case Expr::Kind::Neg:
@@ -837,10 +952,19 @@ private:
         }
         break;
       }
-      case Expr::Kind::Aggregate:
       case Expr::Kind::Like:
+        operands(2, 3);
+        for (const auto& a : e.args) {
+          if (a.phys() != PhysType::Bytes) broken("LIKE of other than text");
+        }
+        break;
       case Expr::Kind::Truth:
-      case Expr::Kind::InSet: broken("a result column of an expression codegen does not print");
+        if (e.args.size() != 1 || e.args[0].kind != Expr::Kind::Param || e.args[0].phys() != PhysType::Bool) {
+          broken("a truth of other than a BOOLEAN parameter");
+        }
+        break;
+      case Expr::Kind::InSet: in_set(e); break;
+      case Expr::Kind::Aggregate: broken("a result column of an expression codegen does not print");
     }
     // A branch is of the expression's type; a numeric may be of a finer scale
     // below it, which eval brings up, never a coarser one, which would lose digits.
@@ -855,11 +979,34 @@ private:
     for (const auto& a : e.args) value(a);
   }
 
-  // A predicate filter: AND, OR and NOT of comparisons of a column with a
-  // parameter, a constant or a column (compared_columns), and
-  // IS NULL of a column. It reads rows in hand: the tables `here` gives rows
-  // to, and those of the loops outside it (outer_).
-  void predicate(const Expr& e, const std::vector<std::uint32_t>& here) const {
+  // IN of a subquery: of a column of its subquery's set's type.
+  void in_set(const Expr& e) const {
+    auto i = static_cast<std::size_t>(e.constant);
+    if (e.args.size() != 1 || e.args[0].kind != Expr::Kind::Column || e.constant < 0 || i >= subs_.size() ||
+        subs_[i].kind != logical::Subquery::Kind::Set || phys_type(subs_[i].type) != e.args[0].col.type) {
+      broken("IN of a subquery of other than a column of its set's type");
+    }
+  }
+
+  // A conjunct eval prints (evaluated): a BOOLEAN value as a result
+  // column's is checked, of the tables in hand, with no aggregate and no
+  // random(), whose rows a replay cursor could not read again.
+  void evaluated_conjunct(const Expr& c, const std::vector<std::uint32_t>& here) const {
+    if (c.phys() != PhysType::Bool) broken("a filter that is not a BOOLEAN");
+    std::function<void(const Expr&)> pure = [&](const Expr& e) {
+      if (e.kind == Expr::Kind::Random) broken("a filter of random()");
+      for (const auto& a : e.args) pure(a);
+    };
+    pure(c);
+    in_hand(c, here);
+    value(c);
+    params(c);
+    reads(c);
+  }
+
+  // Every column e reads is of the tables `here` gives rows to or of the
+  // loops outside it (outer_).
+  void in_hand(const Expr& e, const std::vector<std::uint32_t>& here) const {
     std::vector<ColumnRef> cols;
     logical::columns_of(e, cols);
     for (const auto& c : cols) {
@@ -867,6 +1014,14 @@ private:
         broken("a predicate that reads a column of a table not in hand");
       }
     }
+  }
+
+  // A predicate filter: AND, OR and NOT of comparisons of a column with a
+  // parameter, a constant or a column (compared_columns), and
+  // IS NULL of a column. It reads rows in hand: the tables `here` gives rows
+  // to, and those of the loops outside it (outer_).
+  void predicate(const Expr& e, const std::vector<std::uint32_t>& here) const {
+    in_hand(e, here);
     predicate_of(e);
   }
 
@@ -910,16 +1065,10 @@ private:
         }
         params(e);
         return;
-      case Expr::Kind::InSet: {
-        // Of a column of its subquery's set's type.
-        auto i = static_cast<std::size_t>(e.constant);
-        if (e.args.size() != 1 || e.args[0].kind != Expr::Kind::Column || e.constant < 0 || i >= subs_.size() ||
-            subs_[i].kind != logical::Subquery::Kind::Set || phys_type(subs_[i].type) != e.args[0].col.type) {
-          broken("IN of a subquery of other than a column of its set's type");
-        }
+      case Expr::Kind::InSet:
+        in_set(e);
         reads(e);
         return;
-      }
       case Expr::Kind::Column:
       case Expr::Kind::Param:
       case Expr::Kind::Add:
@@ -1174,7 +1323,8 @@ private:
     auto of_outer = [&](const Expr& e) { return e.kind == Expr::Kind::Column && std::ranges::contains(outer, e.col.table); };
     for (const auto* in = &inner; const auto* f = std::get_if<Filter>(&in->op); in = f->input.get()) {
       for (const auto& c : f->conjuncts) {
-        if (c.kind != Expr::Kind::Compare) continue;
+        // An evaluated conjunct reads what it reads, the Filter's check.
+        if (c.kind != Expr::Kind::Compare || evaluated(c)) continue;
         if (left_outer && of_outer(c.args[0]) && (c.args[1].kind != Expr::Kind::Column || of_outer(c.args[1]))) continue;
         if (c.args[0].kind != Expr::Kind::Column || c.args[0].col.table != sc->table) {
           broken("a nested loop whose inner filter compares a column outside its inner side");
@@ -1276,6 +1426,10 @@ private:
               std::vector<ColumnRef> cols;
               logical::columns_of(c, cols);
               for (const auto& col : cols) held_above(*op.outer, col);
+              if (evaluated(c)) {
+                evaluated_conjunct(c, here);
+                continue;
+              }
               if (logical::is_predicate(c)) {
                 predicate(c, here);
                 continue;
@@ -1411,6 +1565,10 @@ private:
             }
             const auto here = tables_of(*op.input);
             for (const auto& c : op.conjuncts) {
+              if (evaluated(c)) {
+                evaluated_conjunct(c, here);
+                continue;
+              }
               if (logical::is_predicate(c)) {
                 predicate(c, here);
                 continue;

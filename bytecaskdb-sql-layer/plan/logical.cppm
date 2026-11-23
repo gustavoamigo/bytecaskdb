@@ -57,12 +57,12 @@ struct ColumnRef {
 // BOOLEAN parameter it set, true, false or NULL as it holds; and whether a
 // column's value is among a BC_SUB_SET subquery's values, `constant` its
 // index in the statement's subqueries (NULL for a NULL column).
-// And, Or, Not, IsNull and Like are a predicate's, a WHERE conjunct that is
-// no comparison of its own: three-valued, as SQL's logic is, over
-// comparisons, IS NULL of a column and a text column LIKE a pattern; a
-// filter, never a key's bound. In a select list the same kinds are values:
-// a BOOLEAN, NULL where SQL's logic says unknown, over operands of any
-// value expression. Case and Coalesce are values of a select list only:
+// And, Or, Not, IsNull and Like are values over operands of any value
+// expression, in a filter as in a select list: a BOOLEAN, NULL where SQL's
+// logic says unknown (a WHERE keeps a row only where it is true). A WHERE
+// or ON conjunct is any BOOLEAN expression; one that is not a column
+// compared with what a key takes (physical::column_compare) is a filter,
+// never a key's bound. Case and Coalesce are values of a select list only:
 // every branch is of the expression's type, or a numeric of a finer scale
 // below it, which the evaluator brings up. Concat, Substr, TextFn and Extract, built
 // at run time, are values of a select list (and of a procedure's
@@ -86,9 +86,8 @@ struct Expr {
   bool distinct{false};         // Aggregate: COUNT(DISTINCT arg)
   bool fold{false};             // Like: ILIKE, ASCII letters matched in either case
   std::vector<Expr> args;       // Add, Sub, Mul, Div, Compare: two; Aggregate: none (COUNT(*)) or its argument;
-                                // And, Or: two or more; Not: one; IsNull: its column, or in a select list its
-                                // operand; Like: the column and the
-                                // pattern, a parameter, and an ESCAPE parameter, which `constant` then is not; Truth: its parameter; InSet: its column;
+                                // And, Or: two or more; Not: one; IsNull: its operand; Like: the text and the
+                                // pattern, any text values, and an ESCAPE parameter, which `constant` then is not; Truth: its parameter; InSet: its column;
                                 // Case: WHEN, THEN, WHEN, THEN … and an ELSE last if there is one (an odd count);
                                 // Coalesce: two or more; Concat: two, text or an integer or DECIMAL (its
                                 // text); Substr: the text, the start, and the count if given (INTEGERs);

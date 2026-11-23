@@ -1267,11 +1267,31 @@ private:
       if (!nulls.empty()) w_.close();
       rows_.push_back({j.inner, row});
       auto matched = found;
-      for (const auto& c : j.match) matched += " && !(" + fails(c) + ")";
+      if (std::ranges::any_of(j.match, [](const Expr& c) { return physical::evaluated(c); })) {
+        // A block per conjunct: no conjunct's code runs for a row the key
+        // did not find or an earlier conjunct rejected.
+        matched = "jm" + d;
+        w_.line("bool " + matched + " = " + found + ";");
+        for (const auto& c : j.match) match_block(matched, c);
+      } else {
+        for (const auto& c : j.match) matched += " && !(" + fails(c) + ")";
+      }
       w_.line("if (!(" + matched + ")) " + row + " = " + nr + ";");
       k();
       rows_.pop_back();
     });
+  }
+
+  // `flag &&= conjunct c holds`, c's code run only while `flag` is set.
+  void match_block(const std::string& flag, const Expr& c) {
+    if (!physical::evaluated(c)) {
+      w_.line("if (" + flag + ") " + flag + " = !(" + fails(c) + ");");
+      return;
+    }
+    w_.open("if (" + flag + ")");
+    auto v = eval(c);
+    w_.line(flag + " = !(" + rejects(v) + ");");
+    w_.close();
   }
 
   void produce(const physical::IndexJoin& j, const Consume& k) {
@@ -1533,34 +1553,41 @@ private:
       });
       return;
     }
-    // A conjunct that tests a correlated subquery comes after the others,
-    // so a row they reject runs none, its runs printed before it. Over a
-    // one-row aggregate's row (`hit_`) a run is for a row that is there
-    // and has passed the conjuncts before.
-    std::vector<const Expr*> plain;
-    std::vector<std::pair<const Expr*, std::vector<std::size_t>>> correlated;
-    for (const auto& c : f.conjuncts) {
-      auto runs = correlated_in(c);
-      if (runs.empty()) {
-        plain.push_back(&c);
-      } else {
-        correlated.emplace_back(&c, std::move(runs));
-      }
-    }
+    // In written order, as the search returns them: a conjunct that tests
+    // a correlated subquery runs it for the row in hand just before its
+    // test, so a row an earlier conjunct rejects runs none. Over a one-row
+    // aggregate's row (`hit_`) a run is for a row that is there and has
+    // passed the conjuncts before.
     produce(*f.input, [&] {
       auto test = [&](const Expr& c) {
-        if (hit_) {
-          *hit_ += " && !(" + fails(c) + ")";
-        } else {
-          miss(fails(c));
+        if (!physical::evaluated(c)) {
+          if (hit_) {
+            *hit_ += " && !(" + fails(c) + ")";
+          } else {
+            miss(fails(c));
+          }
+          return;
         }
+        // An evaluated conjunct prints statements: after the tests before
+        // it, so its code never runs for a row they reject or that is not
+        // there (`hit_`: a block of its own over a one-row aggregate's row).
+        if (hit_) {
+          auto flag = "h" + std::to_string(exprs_++);
+          w_.line("bool " + flag + " = " + (hit_->empty() ? std::string{"1"} : *hit_) + ";");
+          match_block(flag, c);
+          *hit_ = flag;
+          return;
+        }
+        miss(rejects(eval(c)));
       };
-      for (const auto* c : plain) test(*c);
-      for (const auto& [c, runs] : correlated) {
-        if (hit_) w_.open("if (" + *hit_ + ")");
-        for (auto i : runs) run_correlated(i);
-        if (hit_) w_.close();
-        test(*c);
+      for (const auto& c : f.conjuncts) {
+        auto runs = correlated_in(c);
+        if (!runs.empty()) {
+          if (hit_) w_.open("if (" + (hit_->empty() ? std::string{"1"} : *hit_) + ")");
+          for (auto i : runs) run_correlated(i);
+          if (hit_) w_.close();
+        }
+        test(c);
       }
       k();
     });
@@ -1713,12 +1740,41 @@ private:
         return guarded("int64_t", "0", either(lo.null, hi.null), "bc_random(cx, " + lo.value + ", " + hi.value + ")",
                        PhysType::I64);
       }
-      case Expr::Kind::Aggregate:
-      case Expr::Kind::Like:
-      case Expr::Kind::Truth:
-      case Expr::Kind::InSet: break;
+      case Expr::Kind::Like: {
+        // As truth prints a column's: ESCAPE $n checked, and its code point
+        // taken, at each row.
+        auto x = eval(e.args[0]);
+        auto p = eval(e.args[1]);
+        auto null = either(x.null, p.null);
+        auto escape = std::to_string(e.constant);
+        if (e.args.size() == 3) {
+          auto c = eval(e.args[2]);
+          null = either(null, c.null);
+          escape = "bc_like_escape(cx, " + c.value + ")";
+        }
+        return guarded("bool", "0", null,
+                       std::string{e.fold ? "bc_ilike" : "bc_like"} + "(cx, " + x.value + ", " + p.value + ", " + escape + ")",
+                       PhysType::Bool);
+      }
+      case Expr::Kind::Truth: {  // a subquery's BOOLEAN parameter
+        auto p = e.args[0].param;
+        return {param_null(p), param(PhysType::Bool, p), PhysType::Bool};
+      }
+      case Expr::Kind::InSet: {  // the column's value among a subquery's
+        const auto& col = e.args[0].col;
+        auto x = eval(e.args[0]);
+        return guarded("bool", "0", x.null,
+                       "bc_sub_has_" + key_suffix(col.type) + "(cx, " + std::to_string(e.constant) + ", " + x.value + ")",
+                       PhysType::Bool);
+      }
+      case Expr::Kind::Aggregate: break;
     }
     throw std::logic_error{"physical plan: an expression over columns codegen does not print"};
+  }
+
+  // Whether a BOOLEAN value rejects the row, as a conjunct: NULL or false.
+  [[nodiscard]] static auto rejects(const Val& v) -> std::string {
+    return v.null.empty() ? "!(" + v.value + ")" : v.null + " || !(" + v.value + ")";
   }
 
   // The negation of a NULL test, as C: parenthesized where it is a

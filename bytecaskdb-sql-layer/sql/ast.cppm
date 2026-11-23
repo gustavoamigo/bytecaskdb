@@ -171,10 +171,11 @@ struct Expr {
 // or `lhs` compared by `quantified` with ANY or ALL (`all`) of the
 // subquery's rows: IN is = ANY, NOT IN its NOT. The
 // parser writes <>, BETWEEN and IN with them: NOT (a = b); a >= lo AND a <=
-// hi; a = x OR a = y.
+// hi; a = x OR a = y. Value: any other expression, `lhs`, standing alone
+// (WHERE flag, WHERE CASE … END), which must be a BOOLEAN.
 struct Compare {
   enum class Op { Eq, Lt, Le, Gt, Ge };
-  enum class Kind { Compare, And, Or, Not, IsNull, Like, Exists, Quantified, Const };
+  enum class Kind { Compare, And, Or, Not, IsNull, Like, Exists, Quantified, Const, Value };
   Op op;
   Expr lhs, rhs;
   std::int32_t pos{-1};
@@ -192,6 +193,9 @@ struct Compare {
   bool all{false};
   bool ne{false};  // Compare, Eq: written <> (or !=), under its NOT; an error names <>
   std::optional<bool> truth;  // Const: TRUE or FALSE; none for NULL
+  // Value: what PostgreSQL's 42804 for a non-BOOLEAN names it an argument
+  // of: WHERE, JOIN/ON, HAVING, or the AND, OR or NOT around it.
+  std::string arg_of;
 };
 
 // A copy of e, which owns its operands: what BETWEEN and IN repeat.
@@ -516,6 +520,7 @@ struct SetOperation {
   out.all = c.all;
   out.ne = c.ne;
   out.truth = c.truth;
+  out.arg_of = c.arg_of;
   return out;
 }
 

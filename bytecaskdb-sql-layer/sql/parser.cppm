@@ -504,6 +504,7 @@ auto expr(const PgQuery__Node* n) -> Expr {
     e.rhs = std::make_unique<Expr>(operand(c->arg));
     return e;
   }
+  if (n->node_case == PG_QUERY__NODE__NODE_MIN_MAX_EXPR) reject("expression not supported", n->min_max_expr->location);  // GREATEST, LEAST
   reject("expression not supported", -1);
 }
 
@@ -542,12 +543,21 @@ auto negated(Compare c) -> Compare {
 // A WHERE clause's conjunct, as a comparison or a predicate over them:
 // AND, OR, NOT, IS [NOT] NULL, <> (NOT =), BETWEEN [SYMMETRIC] (>= and <=;
 // SYMMETRIC either way round) and [NOT] IN of a list (= of each, OR'd); or
-// TRUE, FALSE or NULL. A numeric constant is PostgreSQL's 42804, naming
-// what it is an argument of: `arg_of`, the AND, OR or NOT around it, else
-// the clause.
+// TRUE, FALSE or NULL; or any other expression standing alone (Value),
+// which the binder requires to be a BOOLEAN. A numeric constant is
+// PostgreSQL's 42804, naming what it is an argument of: `arg_of`, the AND,
+// OR or NOT around it, else the clause.
 auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t pos, std::uint32_t on,
                std::string_view arg_of) -> Compare {
   if (n == nullptr) reject(clause + " must compare a column", pos);
+  auto of = arg_of.empty() ? (clause == "ON" ? std::string{"JOIN/ON"} : clause) : std::string{arg_of};
+  auto standing = [&](Expr e) {
+    Compare c{Compare::Op::Eq, std::move(e), {}, pos, on};
+    if (c.lhs.pos >= 0) c.pos = c.lhs.pos;
+    c.kind = Compare::Kind::Value;
+    c.arg_of = of;
+    return c;
+  };
   if (n->node_case == PG_QUERY__NODE__NODE_A_CONST && n->a_const->val_case != PG_QUERY__A__CONST__VAL_SVAL) {
     auto l = literal(n);
     Compare c{Compare::Op::Eq, {}, {}, l.pos, on};
@@ -567,12 +577,11 @@ auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t p
             type = std::in_range<std::int32_t>(v) ? "integer" : "bigint";
           }
         }
-        auto of = arg_of.empty() ? (clause == "ON" ? std::string{"JOIN/ON"} : clause) : std::string{arg_of};
         reject("argument of " + of + " must be type boolean, not type " + type, l.pos, kDatatypeMismatch);
       }
       case Literal::Kind::String: break;
     }
-    reject(clause + " must compare a column", l.pos);
+    return standing(literal_expr(std::move(l)));  // an unknown, read as a BOOLEAN
   }
   if (n->node_case == PG_QUERY__NODE__NODE_BOOL_EXPR) {
     const auto* b = n->bool_expr;
@@ -612,14 +621,14 @@ auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t p
                                          : value_compare(str(l->oper_name[l->n_oper_name - 1]), l->location);
       c.all = l->sub_link_type == PG_QUERY__SUB_LINK_TYPE__ALL_SUBLINK;
     } else if (l->sub_link_type == PG_QUERY__SUB_LINK_TYPE__EXPR_SUBLINK) {
-      reject("a subquery of one value is not a predicate; compare it", l->location);
+      return standing(expr(n));
     } else {
       reject("this subquery form is not supported", l->location);
     }
     c.subquery = subquery(l);
     return c;
   }
-  if (n->node_case != PG_QUERY__NODE__NODE_A_EXPR) reject(clause + " must compare a column", pos);
+  if (n->node_case != PG_QUERY__NODE__NODE_A_EXPR) return standing(expr(n));
   const auto* a = n->a_expr;
   auto list = [&](const PgQuery__Node* l) {
     if (l == nullptr || l->node_case != PG_QUERY__NODE__NODE_LIST) reject(clause + " must compare a column", a->location);
@@ -627,8 +636,12 @@ auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t p
   };
   switch (a->kind) {
     case PG_QUERY__A__EXPR__KIND__AEXPR_OP: {
-      if (a->n_name != 1 || a->lexpr == nullptr) break;
+      if (a->n_name != 1) break;
       auto op = str(a->name[0]);
+      // Any other operator gives a value: a BOOLEAN standing alone, or not.
+      if (a->lexpr == nullptr || (op != "=" && op != "<>" && op != "<" && op != "<=" && op != ">" && op != ">=")) {
+        return standing(expr(n));
+      }
       if (op == "<>") {
         auto eq = compare_of(Compare::Op::Eq, expr(a->lexpr), expr(a->rexpr), a->location, on);
         eq.ne = true;
@@ -703,12 +716,12 @@ auto predicate(const PgQuery__Node* n, const std::string& clause, std::int32_t p
       if (a->n_name == 1 && str(a->name[0]) == "<>") return negated(std::move(c));  // NOT IN
       return c;
     }
+    case PG_QUERY__A__EXPR__KIND__AEXPR_NULLIF: return standing(expr(n));
     case PG_QUERY__A__EXPR__KIND__A_EXPR_KIND_UNDEFINED:
     case PG_QUERY__A__EXPR__KIND__AEXPR_OP_ANY:
     case PG_QUERY__A__EXPR__KIND__AEXPR_OP_ALL:
     case PG_QUERY__A__EXPR__KIND__AEXPR_DISTINCT:
     case PG_QUERY__A__EXPR__KIND__AEXPR_NOT_DISTINCT:
-    case PG_QUERY__A__EXPR__KIND__AEXPR_NULLIF:
     case PG_QUERY__A__EXPR__KIND__AEXPR_SIMILAR:
     case _PG_QUERY__A__EXPR__KIND_IS_INT_SIZE: break;
   }

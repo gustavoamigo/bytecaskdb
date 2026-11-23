@@ -1,6 +1,5 @@
-# || and the string functions of constants. Of columns they are not supported
-# yet (#667), so each case here selects constants only; the cases of columns
-# are in strings.yaml, marked unimplemented.
+# || and the string functions, of constants and, in the last case, of
+# columns in a select list and in a WHERE.
 
 - name: "|| concatenates strings, and any other type through its text"
   features: [E021-07]
@@ -121,3 +120,25 @@
       expected: [["ab", "x"]]
     - sql: SELECT 'ab' || 'c' = 'abc', UPPER('a') = 'A'
       expected: [[true, true]]
+
+- name: the string functions of columns, in a select list and in a WHERE
+  features: [E021-07, E021-08, E021-09, E021-11]
+  setup:
+    - CREATE TABLE sfc (id INTEGER PRIMARY KEY, s TEXT)
+    - INSERT INTO sfc VALUES (1, 'Alice'), (2, '  bob '), (3, NULL)
+  steps:
+    - sql: SELECT id, upper(s), lower(s) || '!', btrim(s), position('b' IN s) FROM sfc ORDER BY id
+      expected:
+        - [1, ALICE, alice!, Alice, 0]
+        - [2, "  BOB ", "  bob !", bob, 3]
+        - [3, null, null, null, null]
+    - sql: SELECT id FROM sfc WHERE upper(s) = 'ALICE'
+      expected: [[1]]
+    - sql: SELECT id FROM sfc WHERE btrim(s) || 'x' = 'bobx'
+      expected: [[2]]
+    - sql: SELECT id FROM sfc WHERE char_length(s) > 5 ORDER BY id
+      expected: [[2]]
+    - sql: SELECT id FROM sfc WHERE position('li' IN s) = 2
+      expected: [[1]]
+  teardown:
+    - DROP TABLE sfc

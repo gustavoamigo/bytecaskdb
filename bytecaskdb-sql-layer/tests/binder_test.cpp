@@ -195,7 +195,14 @@ TEST_CASE("binder: anything outside the scope is rejected with a message and pos
   CHECK(rejected(cat, "SELECT CAST('a' AS CHAR(5))").first.find("CHAR(n)") != std::string::npos);
   // No primary key: the catalog gives the table a row id.
   CHECK(std::get<CreateTableDdl>(std::get<Ddl>(bind_sql(cat, "CREATE TABLE u (k BIGINT)").stmt)).pk.empty());
-  CHECK(rejected(cat, "SELECT id FROM t WHERE id = $1 + qty").first == "WHERE must compare a column with a parameter or a constant");
+  {
+    // An expression operand is the select list's: $1 typed by qty, evaluated, never a key.
+    auto b = bind_sql(cat, "SELECT id FROM t WHERE id = $1 + qty");
+    const auto& w = get<logical::Filter>(b).conjuncts;
+    REQUIRE(w.size() == 1);
+    CHECK(w[0].args[1].kind == logical::Expr::Kind::Add);
+    CHECK(b.params.at(0).type == SqlType{SqlKind::BigInt});
+  }
   // Two columns of one table PostgreSQL has no operator for: its message, the operator as written.
   CHECK(rejected(cat, "SELECT id FROM t WHERE name <> qty").first == "operator does not exist: bytea <> bigint");
 }
@@ -875,9 +882,10 @@ TEST_CASE("binder: OR, NOT, IS NULL, <>, BETWEEN and IN are predicates over comp
   CHECK(conjuncts("id = $1 AND NOT (qty = 1 OR name IS NULL)") == V{"CMP", "NOT(OR(CMP,ISNULL))"});
   // Each comparison in a tree is a WHERE's: typed, folded, refused alike.
   CHECK(conjuncts("qty = 1 OR qty = id") == V{"OR(CMP,CMP)"});
-  CHECK(rejected(cat, "SELECT id FROM t WHERE qty = $1 + 1 OR id = 2").first ==
-        "$n + k and $n - k inside AND, OR or NOT is not supported yet");
-  CHECK(rejected(cat, "SELECT id FROM t WHERE 1 IS NULL").first == "IS NULL of other than a column is not supported yet");
+  // $n ± k inside AND, OR or NOT is an expression, evaluated: the key's
+  // shape is a conjunct's own.
+  CHECK(conjuncts("qty = $1 + 1 OR id = 2") == V{"OR(CMP,CMP)"});
+  CHECK(conjuncts("1 IS NULL") == V{"ISNULL"});
   CHECK(rejected(cat, "SELECT qty FROM t GROUP BY qty HAVING qty <> 1").first ==
         "HAVING with AND, OR, NOT, IS NULL, <>, BETWEEN, IN or a constant is not supported yet");
   // NULL is FALSE as a filter, but not under NOT, where it stays unknown.
@@ -1295,10 +1303,13 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
     CHECK(sum.args[0].param == 1u);
     CHECK(sum.args[1].constant == 20);
     CHECK(w[1].args[1].kind == logical::Expr::Kind::Param);
-    CHECK(rejected(g.cat(), "SELECT o FROM ol WHERE w = $1 AND s < $2 + 1").first ==
-          "$n + n and $n - n are supported only compared with an INTEGER column yet");
-    CHECK(rejected(g.cat(), "SELECT o FROM ol WHERE w = $1 AND o < $2 + 2147483648").first ==
-          "an integer literal past INTEGER is not supported here yet");
+    // Beside another integer column, or past INTEGER, $n ± k is an
+    // expression, $n typed by the literal as PostgreSQL types it.
+    auto small = bind_sql(g.cat(), "SELECT o FROM ol WHERE w = $1 AND s < $2 + 1");
+    CHECK(get<logical::Filter>(small).conjuncts[1].args[1].args[1].kind == logical::Expr::Kind::Param);
+    CHECK(small.params.at(1).type == SqlType{SqlKind::Integer});
+    auto big = bind_sql(g.cat(), "SELECT o FROM ol WHERE w = $1 AND o < $2 + 2147483648");
+    CHECK(big.params.at(1).type == SqlType{SqlKind::BigInt});
   }
   {
     // A literal is in its column's representation: a DECIMAL's scaled.
@@ -1351,8 +1362,7 @@ TEST_CASE("binder: a join of two tables, qualified columns and integer literals"
   CHECK(rejected(cat, "SELECT id FROM t, u WHERE k > name").first == "operator does not exist: bigint > bytea");
   CHECK(rejected(cat, "SELECT u.qty, count(*) FROM t, u WHERE id = k").first ==
         "column \"u.qty\" must appear in the GROUP BY clause or be used in an aggregate function");
-  CHECK(rejected(cat, "SELECT id FROM t JOIN u ON id = $1 + k WHERE k = $2").first ==
-        "ON must compare a column with a parameter or a constant");
+  CHECK(bind_sql(cat, "SELECT id FROM t JOIN u ON id = $1 + k WHERE k = $2").params.at(0).type == SqlType{SqlKind::BigInt});
   {
     // A range refusal names the table of the column the parameter is compared with.
     auto b = bind_sql(cat, "SELECT name FROM t, u WHERE id = $1 AND k = $2");
@@ -1976,7 +1986,10 @@ TEST_CASE("binder: $n::T in a value types $n as T; a SELECT without FROM binds a
   CHECK(state("SELECT x + 1") == "42703 column \"x\" does not exist");
   CHECK(state("SELECT 1, abs(x)") == "42703 column \"x\" does not exist");
   CHECK(state("SELECT u.x") == "42P01 missing FROM-clause entry for table \"u\"");
-  CHECK(state("SELECT 1 + $1") == "42601 a parameter or a constant with no column beside it to give it a type is not supported yet");
+  // A typed constant types a $n beside it; two untyped operands of an
+  // operator are PostgreSQL's 42725.
+  CHECK(state("SELECT 1 + $1") == "bound");
+  CHECK(state("SELECT $1 + $2") == "42725 operator is not unique: unknown + unknown");
   // Assigned, $n::T of the column's type binds as $n, as in a WHERE.
   {
     auto b = bind_sql(cat, "INSERT INTO t VALUES ($1::bigint, NULL, $2::bigint)");
@@ -2103,4 +2116,107 @@ TEST_CASE("binder: a grouped view joined with a table is a derived relation, its
   CHECK(state("SELECT * FROM hh JOIN u ON u.qty = hh.n") ==
         "42601 a join of a view that aggregates over a grouped view is not supported yet");
   CHECK(state("SELECT * FROM h JOIN u USING (nope)") == "42703 column \"nope\" specified in USING clause does not exist in left table");
+}
+
+TEST_CASE("binder: an expression in a WHERE or ON is the select list's, a BOOLEAN, of no aggregate and no random()", "[sql][binder]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE ex (k INTEGER PRIMARY KEY, a INTEGER, s TEXT, d DECIMAL(10,2), c BIGINT, "
+                                        "flag BOOLEAN)").stmt));
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE ey (x INTEGER PRIMARY KEY, y INTEGER)").stmt));
+  const auto& cat = f.cat();
+  using K = logical::Expr::Kind;
+  auto where = [&](std::string_view w) {
+    auto b = bind_sql(cat, "SELECT k FROM ex WHERE " + std::string{w});
+    return get<logical::Filter>(b).conjuncts;
+  };
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what();
+    }
+    return "bound";
+  };
+  auto types = [&](std::string_view sql) {
+    std::vector<SqlType> out;
+    for (const auto& p : bind_sql(cat, sql).params) out.push_back(p.type);
+    return out;
+  };
+  const SqlType text{SqlKind::Text};
+  const SqlType integer{SqlKind::Integer};
+  const SqlType boolean{SqlKind::Boolean};
+
+  // Each form binds to one conjunct of its tree.
+  CHECK(where("lower(s) = $1").at(0).args[0].kind == K::TextFn);
+  CHECK(where("a + 1 > $1").at(0).args[0].kind == K::Add);
+  CHECK(where("lower(s) LIKE 'a%'").at(0).args[0].kind == K::TextFn);
+  CHECK(where("s LIKE s").at(0).args[1].kind == K::Column);
+  CHECK(where("a + 1 IS NULL").at(0).args[0].kind == K::Add);
+  CHECK(where("a + 0 IN (1, 5)").at(0).kind == K::Or);
+  CHECK(where("a + 1 BETWEEN 1 AND 2").size() == 2);  // two conjuncts, as a column's
+  CHECK(where("flag").at(0).kind == K::Column);
+  CHECK(where("NOT flag").at(0).kind == K::Not);
+  CHECK(where("CASE WHEN a > 0 THEN flag ELSE false END").at(0).kind == K::Case);
+  CHECK(where("(a > 0) = flag").at(0).args[0].kind == K::Compare);
+  // $n typed by an expression beside it, as PostgreSQL types it.
+  CHECK(types("SELECT k FROM ex WHERE lower(s) = $1") == std::vector{text});
+  CHECK(types("SELECT k FROM ex WHERE a + 1 IN ($1, $2)") == std::vector{integer, integer});
+  CHECK(types("SELECT k FROM ex WHERE c > $1 - 100") == std::vector{integer});
+  CHECK(types("SELECT k FROM ex WHERE $1 = $2") == std::vector{text, text});
+  CHECK(types("SELECT k FROM ex WHERE $1") == std::vector{boolean});
+  CHECK(types("SELECT k FROM ex WHERE lower(s) LIKE $1") == std::vector{text});
+  CHECK(types("SELECT lower(s) = $1 FROM ex") == std::vector{text});
+  // $n ± k under OR is an expression of a hidden parameter, never the key's $n ± k.
+  {
+    const auto w = where("a = $1 - 1 OR k = 2");
+    const auto& sub = w.at(0).args[0].args[1];
+    CHECK(sub.kind == K::Sub);
+    CHECK(sub.args[1].kind == K::Param);
+  }
+  // $n::T beside a column of another type: the parameter T, compared as
+  // the select list compares it, at the DECIMAL's scale.
+  {
+    auto b = bind_sql(cat, "SELECT k FROM ex WHERE d > $1::int");
+    CHECK(b.params.at(0).type == integer);
+    const auto& c = get<logical::Filter>(b).conjuncts.at(0);
+    CHECK(c.args[1].type == integer);
+  }
+  // An ON of expressions binds as the WHERE's.
+  CHECK(state("SELECT k FROM ex JOIN ey ON ex.a + 1 = ey.x") == "bound");
+  CHECK(state("SELECT k FROM ex LEFT JOIN ey ON lower(ex.s) = 'x' AND ey.y * 2 > ex.a") == "bound");
+  // A column compared as today keeps its shape: a key may take it.
+  CHECK(where("a = $1").at(0).args[1].kind == K::Param);
+  CHECK(where("a = $1 + 1").at(0).args[1].args[1].kind == K::Const);
+
+  // The refusals, PostgreSQL's SQLSTATEs and messages, each naming its clause.
+  CHECK(state("SELECT k FROM ex WHERE a + 1") == "42804 argument of WHERE must be type boolean, not type integer");
+  CHECK(state("SELECT k FROM ex WHERE a + 1 AND flag") == "42804 argument of AND must be type boolean, not type integer");
+  CHECK(state("SELECT k FROM ex WHERE flag OR s") == "42804 argument of OR must be type boolean, not type text");
+  CHECK(state("SELECT k FROM ex WHERE NOT a") == "42804 argument of NOT must be type boolean, not type integer");
+  CHECK(state("SELECT k FROM ex JOIN ey ON ex.a") == "42804 argument of JOIN/ON must be type boolean, not type integer");
+  CHECK(state("SELECT k FROM ex WHERE (SELECT 1)") == "42804 argument of WHERE must be type boolean, not type integer");
+  // At the expression's leftmost token, as PostgreSQL's exprLocation.
+  auto at = [&](std::string_view sql) { return rejected(cat, sql).second; };
+  CHECK(at("SELECT k FROM ex WHERE a + 1") == 23);
+  CHECK(at("SELECT k FROM ex WHERE (a + 1)") == 24);
+  CHECK(at("SELECT k FROM ex WHERE NOT (a + 1)") == 28);
+  CHECK(at("SELECT k FROM ex WHERE flag AND a * 2") == 32);
+  CHECK(at("SELECT k FROM ex WHERE s || 'x'") == 23);
+  CHECK(state("SELECT k FROM ex WHERE a + count(*) > 1") == "42803 aggregate functions are not allowed in WHERE");
+  CHECK(state("SELECT k FROM ex JOIN ey ON ex.a + count(*) > 1") == "42803 aggregate functions are not allowed in JOIN conditions");
+  CHECK(state("UPDATE ex SET a = 1 WHERE count(*) > 1") == "42803 aggregate functions are not allowed in WHERE");
+  CHECK(state("SELECT k FROM ex WHERE random(1, 2) = 1") == "42601 random() in a WHERE, ON or HAVING is not supported yet");
+  CHECK(state("DELETE FROM ex WHERE a = random(1, 2)") == "42601 random() in a WHERE, ON or HAVING is not supported yet");
+  CHECK(state("SELECT k FROM ex WHERE s + 1 > 0") == "42883 operator does not exist: text + integer");
+  CHECK(state("SELECT k FROM ex WHERE lower(a) = 'x'") == "42883 function lower(integer) does not exist");
+  CHECK(state("SELECT k FROM ex WHERE a + 1 LIKE 'x'") == "42883 operator does not exist: integer ~~ unknown");
+  CHECK(state("SELECT k FROM ex WHERE s LIKE a") == "42883 operator does not exist: text ~~ integer");
+  CHECK(state("SELECT k FROM ex WHERE a + 1 = '1.5'") == "22P02 invalid input syntax for type integer: \"1.5\"");
+  CHECK(state("SELECT k FROM ex WHERE $1 + $2 = a") == "42725 operator is not unique: unknown + unknown");
+  CHECK(state("SELECT k FROM ex WHERE $1 IS NULL") == "42P18 could not determine data type of parameter $1");
+  CHECK(state("SELECT k FROM ex WHERE a + 1 IN (SELECT x FROM ey)") ==
+        "42601 IN, ANY or ALL of a subquery of other than a column is not supported yet");
+  CHECK(state("SELECT k FROM ex WHERE d > $1::numeric(5,1)") ==
+        "42601 a cast of a parameter to DECIMAL, VARCHAR(n) or CHAR(n) is not supported yet");
+  CHECK(rejected(cat, "SELECT k FROM ex WHERE greatest(a, 1) > 1") == std::pair<std::string, std::int32_t>{"expression not supported", 23});
 }

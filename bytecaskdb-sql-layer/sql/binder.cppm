@@ -787,6 +787,20 @@ auto literal_constant(const ast::Literal& l) -> Constant {
   std::unreachable();
 }
 
+// Where e starts: the leftmost position among it and its operands, as
+// PostgreSQL's exprLocation reports an expression (`a + 1` at `a`, not
+// `+`).
+auto leftmost(const ast::Expr& e) -> std::int32_t {
+  auto out = e.pos;
+  auto take = [&](std::int32_t p) {
+    if (p >= 0 && (out < 0 || p < out)) out = p;
+  };
+  if (e.lhs) take(leftmost(*e.lhs));
+  if (e.rhs) take(leftmost(*e.rhs));
+  for (const auto& a : e.args) take(leftmost(a));
+  return out;
+}
+
 auto is_constant(const ast::Expr& e) -> bool {
   using K = ast::Expr::Kind;
   switch (e.kind) {
@@ -2218,7 +2232,7 @@ void params_in(const ast::Expr& e, std::uint32_t& n) {
 }
 
 void params_in(const ast::Compare& c, std::uint32_t& n) {
-  if (c.kind == ast::Compare::Kind::Compare || c.kind == ast::Compare::Kind::IsNull) {
+  if (c.kind == ast::Compare::Kind::Compare || c.kind == ast::Compare::Kind::IsNull || c.kind == ast::Compare::Kind::Value) {
     params_in(c.lhs, n);
     if (c.kind == ast::Compare::Kind::Compare) params_in(c.rhs, n);
   }
@@ -2719,6 +2733,7 @@ public:
         case K::Exists:
         case K::Quantified:
         case K::Const:
+        case K::Value:
           none(c.lhs, kElsewhere);
           none(c.rhs, kElsewhere);
           return;
@@ -2972,11 +2987,70 @@ public:
   };
 
   auto value(const ast::Expr& e, const Resolve& resolve, const std::optional<Peer>& peer = std::nullopt) -> logical::Expr {
+    return strict_null(bound_value(e, resolve, peer));
+  }
+
+  // A NULL constant's slot (null_consts_), never a subquery's, which is
+  // NULL until it runs.
+  [[nodiscard]] auto null_const(const logical::Expr& x) const -> bool {
+    return x.kind == logical::Expr::Kind::Param && std::ranges::contains(null_consts_, x.param);
+  }
+
+  // A strict operator or function with a NULL constant operand is a NULL
+  // of its type, its other operands never evaluated, as PostgreSQL 17's
+  // eval_const_expressions folds it: `10/a > NULL` divides nothing. Its
+  // operands are bound first, so their types are checked. A NULL
+  // parameter is not folded (frontend_design.md, *Differences from PG
+  // 17*).
+  auto strict_null(logical::Expr x) -> logical::Expr {
+    using K = logical::Expr::Kind;
+    auto strict = [&] {
+      switch (x.kind) {
+        case K::Add:
+        case K::Sub:
+        case K::Mul:
+        case K::Div:
+        case K::Mod:
+        case K::Neg:
+        case K::Abs:
+        case K::Compare:
+        case K::Not:
+        case K::Like:
+        case K::Concat:
+        case K::Substr:
+        case K::TextFn:
+        case K::Extract:
+        case K::JsonbCast: return true;
+        case K::Column:
+        case K::Param:
+        case K::Const:
+        case K::Aggregate:
+        case K::And:
+        case K::Or:
+        case K::IsNull:
+        case K::Truth:
+        case K::InSet:
+        case K::Case:
+        case K::Coalesce:
+        case K::Random: return false;
+      }
+      return false;
+    }();
+    if (!strict || std::ranges::none_of(x.args, [&](const logical::Expr& a) { return null_const(a); })) return x;
+    auto out = fixed(std::monostate{}, x.type);
+    null_consts_.push_back(out.param);
+    return out;
+  }
+
+  auto bound_value(const ast::Expr& e, const Resolve& resolve, const std::optional<Peer>& peer) -> logical::Expr {
     using K = ast::Expr::Kind;
     if (is_constant(e)) {
       auto c = fold(e);
       if (c.unknown && peer) c = resolved(c, peer->type);
-      return fixed(std::move(c.value), c.type);
+      auto null = std::holds_alternative<std::monostate>(c.value);
+      auto out = fixed(std::move(c.value), c.type);
+      if (null) null_consts_.push_back(out.param);
+      return out;
     }
     switch (e.kind) {
       case K::Column: {
@@ -2984,7 +3058,9 @@ public:
         return logical::column_of(t->id, *c);
       }
       case K::Param:
-        if (!peer || peer->column == nullptr) not_yet("a parameter beside other than a column", e.pos);
+        if (!peer) not_yet("a parameter beside other than a column", e.pos);
+        // Typed by an expression beside it, as PostgreSQL types an unknown.
+        if (peer->column == nullptr) return typed_param(e, peer->type, peer->use);
         use_param(e.param, phys_type(peer->column->sql), e.pos, *peer->column, peer->table->id, peer->use);
         return logical::param(e.param, peer->column->sql);
       case K::Subquery: return subquery_output(e).expr;
@@ -3029,11 +3105,7 @@ public:
         }
         if (e.cast_type == "numeric" && e.cast_typmods.empty()) refuse_numeric("a cast of a parameter to NUMERIC", e.pos);
         if (modified_cast(e)) not_yet("a cast of a parameter to DECIMAL, VARCHAR(n) or CHAR(n)", e.pos);
-        auto as = cast_type(e);
-        const auto& col =
-            typed_params_.emplace_back(Column{0, "$" + std::to_string(e.rhs->param + 1), as, phys_type(as), true, std::monostate{}});
-        use_param(e.rhs->param, phys_type(as), e.rhs->pos, col, 0, Use::Operand);
-        return logical::param(e.rhs->param, as);
+        return typed_param(*e.rhs, cast_type(e), Use::Operand);
       }
       case K::Case:
       case K::Coalesce:
@@ -3043,6 +3115,14 @@ public:
       case K::Literal: break;  // constants, above
     }
     throw SqlError{"expression not supported", e.pos};
+  }
+
+  // $n of type `as`, the type its place gives it (a cast, a function's
+  // argument, the operand beside it).
+  auto typed_param(const ast::Expr& p, SqlType as, Use use) -> logical::Expr {
+    const auto& col = typed_params_.emplace_back(Column{0, "$" + std::to_string(p.param + 1), as, phys_type(as), true, std::monostate{}});
+    use_param(p.param, phys_type(as), p.pos, col, 0, use);
+    return logical::param(p.param, as);
   }
 
   // The type CASE, COALESCE or NULLIF gives branches of these types, as
@@ -3123,9 +3203,7 @@ public:
     // text beside ||, integer for SUBSTRING's start and count.
     auto arg = [&](const ast::Expr& a, SqlType as) {
       if (a.kind != ast::Expr::Kind::Param) return value(a, resolve);
-      const auto& col = typed_params_.emplace_back(Column{0, "$" + std::to_string(a.param + 1), as, phys_type(as), true, std::monostate{}});
-      use_param(a.param, phys_type(as), a.pos, col, 0, Use::Operand);
-      return logical::param(a.param, as);
+      return typed_param(a, as, Use::Operand);
     };
     if (e.func == "%") {
       auto [a, b] = operands(e.args[0], e.args[1], resolve, Use::Operand);
@@ -3359,18 +3437,29 @@ public:
   // reading would be wrong for.
   auto operands(const ast::Expr& lhs, const ast::Expr& rhs, const Resolve& resolve, Use use,
                 const std::function<void(SqlType, bool)>& settled_type = {}) -> std::pair<logical::Expr, logical::Expr> {
-    auto settled = [](const ast::Expr& x) { return x.kind != ast::Expr::Kind::Param && !is_constant(x); };
+    auto untyped = [&](const ast::Expr& x) { return x.kind == ast::Expr::Kind::Param || (is_constant(x) && fold(x).unknown); };
+    // A typed constant beside a $n or an unknown literal gives it its type.
+    auto settled = [&](const ast::Expr& x, const ast::Expr& other) {
+      return x.kind != ast::Expr::Kind::Param && (!is_constant(x) || (!untyped(x) && untyped(other)));
+    };
     auto peer_of = [&](const logical::Expr& bound, const ast::Expr& written) {
       Peer p{bound.type, nullptr, nullptr, use};
       if (written.kind == ast::Expr::Kind::Column) std::tie(p.table, p.column) = resolve(written);
       return p;
     };
-    if (!settled(lhs) && !settled(rhs)) not_yet("a parameter or a constant with no column beside it to give it a type", lhs.pos);
-    if (settled(lhs) && settled(rhs)) {
+    // Two untyped operands of a comparison are text, as PostgreSQL resolves
+    // unknown = unknown.
+    if (use == Use::Compared && untyped(lhs) && untyped(rhs)) {
+      Peer text{SqlType{SqlKind::Text}, nullptr, nullptr, use};
+      auto l = value(lhs, resolve, text);
+      return {std::move(l), value(rhs, resolve, text)};
+    }
+    if (!settled(lhs, rhs) && !settled(rhs, lhs)) not_yet("a parameter or a constant with no column beside it to give it a type", lhs.pos);
+    if (settled(lhs, rhs) && settled(rhs, lhs)) {
       auto l = value(lhs, resolve);
       return {std::move(l), value(rhs, resolve)};
     }
-    if (settled(lhs)) {
+    if (settled(lhs, rhs)) {
       auto l = value(lhs, resolve);
       if (settled_type) settled_type(l.type, false);
       auto r = value(rhs, resolve, peer_of(l, lhs));
@@ -3485,6 +3574,10 @@ public:
                      kUndefinedFunction}
           .with_notes("", "No operator matches the given name and argument types. You might need to add explicit type casts.");
     }
+    if (untyped(*e.lhs) && untyped(*e.rhs)) {
+      throw SqlError{"operator is not unique: unknown " + std::string{arith_text(op)} + " unknown", e.pos, kAmbiguousFunction}.with_notes(
+          "", "Could not choose a best candidate operator. You might need to add explicit type casts.");
+    }
     auto [l, r] = operands(*e.lhs, *e.rhs, resolve, Use::Operand, untyped_beside_temporal);
     if (is_temporal(l.type) || is_temporal(r.type)) {
       temporal_operator(op, l.type, r.type, e.pos);  // returns for DATE - DATE only
@@ -3517,22 +3610,6 @@ public:
   // A comparison as a value: of operands of one class (42883 otherwise), as
   // a WHERE's, with <> as NOT of =. Numbers meet at the finer scale.
   auto comparison_value(const ast::Expr& e, const Resolve& resolve) -> logical::Expr {
-    auto [l, r] = operands(*e.lhs, *e.rhs, resolve, Use::Compared);
-    if (type_class(l.type.kind) != type_class(r.type.kind)) {
-      throw SqlError{"operator does not exist: " + pg_type_name(l.type) + " " + std::string{value_op_text(e.cmp)} + " " +
-                         pg_type_name(r.type),
-                     e.pos, kUndefinedFunction};
-    }
-    numeric_compared(l.type, r.type, e.pos);
-    if (is_float(l.type) || is_float(r.type)) not_yet("a comparison of REAL and DOUBLE PRECISION as a value", e.pos);
-    if (type_class(l.type.kind) == TypeClass::Temporal && l.type.kind != r.type.kind) {
-      // LOCALTIME beside a time with time zone is read as one, as PostgreSQL
-      // casts it: the same reading at the session's zone.
-      if (!(clock_as_timetz(l, r) || clock_as_timetz(r, l))) {
-        not_yet("a comparison of different date and time types as a value", e.pos);
-      }
-    }
-    if (is_number(l.type)) rescalable(l, r, std::max(decimal_scale(l.type), decimal_scale(r.type)), e.pos);
     using Op = ast::Compare::Op;
     auto op = [&] {
       switch (e.cmp) {
@@ -3545,9 +3622,31 @@ public:
       }
       return Op::Eq;
     }();
-    auto compared = logical::compare(op, std::move(l), std::move(r));
+    auto compared = compare_values(*e.lhs, *e.rhs, op, value_op_text(e.cmp), e.pos, resolve);
     if (e.cmp != ast::ValueCompare::Ne) return compared;
     return logical::predicate_of(logical::Expr::Kind::Not, {std::move(compared)});
+  }
+
+  // lhs <op> rhs over any operands, `written` the operator as an error
+  // names it: of one class (42883 otherwise), numbers met at the finer scale.
+  auto compare_values(const ast::Expr& lhs, const ast::Expr& rhs, ast::Compare::Op op, std::string_view written, std::int32_t pos,
+                      const Resolve& resolve) -> logical::Expr {
+    auto [l, r] = operands(lhs, rhs, resolve, Use::Compared);
+    if (type_class(l.type.kind) != type_class(r.type.kind)) {
+      throw SqlError{"operator does not exist: " + pg_type_name(l.type) + " " + std::string{written} + " " + pg_type_name(r.type), pos,
+                     kUndefinedFunction};
+    }
+    numeric_compared(l.type, r.type, pos);
+    if (is_float(l.type) || is_float(r.type)) not_yet("a comparison of REAL and DOUBLE PRECISION as a value", pos);
+    if (type_class(l.type.kind) == TypeClass::Temporal && l.type.kind != r.type.kind) {
+      // LOCALTIME beside a time with time zone is read as one, as PostgreSQL
+      // casts it: the same reading at the session's zone.
+      if (!(clock_as_timetz(l, r) || clock_as_timetz(r, l))) {
+        not_yet("a comparison of different date and time types as a value", pos);
+      }
+    }
+    if (is_number(l.type)) rescalable(l, r, std::max(decimal_scale(l.type), decimal_scale(r.type)), pos);
+    return strict_null(logical::compare(op, std::move(l), std::move(r)));
   }
 
   // AND, OR and NOT of BOOLEAN operands (42804 otherwise).
@@ -3558,7 +3657,7 @@ public:
     for (const auto& a : e.args) {
       auto v = value(a, resolve, Peer{SqlType{SqlKind::Boolean}, nullptr, nullptr, Use::Compared});
       if (v.type.kind != SqlKind::Boolean) {
-        throw SqlError{std::string{"argument of "} + word + " must be type boolean, not type " + pg_type_name(v.type), a.pos,
+        throw SqlError{std::string{"argument of "} + word + " must be type boolean, not type " + pg_type_name(v.type), leftmost(a),
                        kDatatypeMismatch};
       }
       args.push_back(std::move(v));
@@ -4099,7 +4198,11 @@ public:
       return fixed(std::move(v), target.sql);
     }
     // $n::T assigned to a column of type T binds as $n, as in a WHERE.
-    if (param_cast(e)) return value(t, *uncast_param(&e, target), target);
+    if (param_cast(e)) {
+      const auto* uncast = uncast_param(&e, target);
+      if (uncast == nullptr) not_yet("a cast of a parameter to other than its column's type", e.pos);
+      return value(t, *uncast, target);
+    }
     switch (e.kind) {
       case ast::Expr::Kind::Param:
         use_param(e.param, want, e.pos, target, t.id, Use::Assigned);
@@ -4177,9 +4280,8 @@ public:
   auto where(const Table& t, const std::vector<ast::Compare>& in) -> std::vector<logical::Expr> {
     std::vector<logical::Expr> out;
     auto was = std::exchange(in_where_, true);
-    for (const auto* w : top_level(in)) {
-      out.push_back(predicate(*w, [&](const ast::Expr& e) { return std::pair{t.id, column(t, e)}; }));
-    }
+    Resolve resolve = [&](const ast::Expr& e) -> std::pair<const Table*, const Column*> { return {&t, column(t, e)}; };
+    for (const auto* w : top_level(in)) out.push_back(predicate(*w, resolve));
     in_where_ = was;
     return out;
   }
@@ -4195,7 +4297,8 @@ public:
       ast::Compare w{ast::Compare::Op::Eq, ast::Expr{ast::Expr::Kind::Column, col->name, 0, nullptr, nullptr, pos},
                      ast::Expr{ast::Expr::Kind::Param, {}, first + bytecask::sql::narrow<std::uint32_t>(out.size()), nullptr, nullptr, pos},
                      pos};
-      out.push_back(predicate(w, [&](const ast::Expr&) { return std::pair{t.id, col}; }));
+      Resolve resolve = [&](const ast::Expr&) -> std::pair<const Table*, const Column*> { return {&t, col}; };
+      out.push_back(predicate(w, resolve));
     }
     return out;
   }
@@ -4215,28 +4318,50 @@ public:
     return out;
   }
 
-  // col LIKE pattern: a TEXT or VARCHAR column, as PostgreSQL's ~~ takes
-  // them, and a pattern a parameter or a constant, of TEXT, as PostgreSQL
-  // types it; the escape a backslash, ESCAPE's one character, or none for
-  // ESCAPE ''.
-  auto like(const ast::Compare& w, const auto& resolve) -> logical::Expr {
-    if (w.lhs.kind != ast::Expr::Kind::Column) not_yet("LIKE of other than a column", w.pos);
-    auto [table, c] = resolve(w.lhs);
-    if (!is_string(c->sql)) {
-      if (c->sql.kind == SqlKind::Bytea) not_yet("LIKE of a BYTEA column", w.pos);
-      throw SqlError{"operator does not exist: " + pg_type_name(c->sql) + (w.fold ? " ~~* unknown" : " ~~ unknown"), w.pos,
-                     kUndefinedFunction};
+  // x LIKE pattern: x a TEXT, VARCHAR or NAME column or text expression, as
+  // PostgreSQL's ~~ takes them, and a pattern of TEXT: a parameter or a
+  // constant, as PostgreSQL types it, or a text expression; the escape a
+  // backslash, ESCAPE's one character, or none for ESCAPE ''. A column
+  // against a parameter or a constant is a predicate's leaf; anything else
+  // is evaluated (docs/frontend_design.md, *Expressions in WHERE, ON and
+  // HAVING*).
+  auto like(const ast::Compare& w, const Resolve& resolve) -> logical::Expr {
+    const auto* op = w.fold ? "~~*" : "~~";
+    auto untyped = [&](const ast::Expr& x) { return x.kind == ast::Expr::Kind::Param || (is_constant(x) && fold(x).unknown); };
+    // PostgreSQL's 42883 names an untyped operand unknown.
+    auto no_like = [&] [[noreturn]] (SqlType text, const std::string& pattern) {
+      if (text.kind == SqlKind::Bytea) not_yet(w.lhs.kind == ast::Expr::Kind::Column ? "LIKE of a BYTEA column" : "LIKE of a BYTEA value", w.pos);
+      throw SqlError{"operator does not exist: " + (untyped(w.lhs) ? std::string{"unknown"} : pg_type_name(text)) + " " + op + " " + pattern,
+                     w.pos, kUndefinedFunction};
+    };
+    logical::Expr text_value;
+    std::uint32_t table = 0;
+    std::string name = "?column?";
+    if (w.lhs.kind == ast::Expr::Kind::Column) {
+      auto [t, c] = resolve(w.lhs);
+      table = t->id;
+      name = c->name;
+      text_value = logical::column_of(t->id, *c);
+    } else {
+      text_value = value(w.lhs, resolve, Peer{SqlType{SqlKind::Text}, nullptr, nullptr, Use::Compared});
     }
-    synthetic_.push_back(Column{0, c->name, SqlType{SqlKind::Text}, PhysType::Bytes, true, {}});
+    if (!is_string(text_value.type)) {
+      no_like(text_value.type, untyped(w.rhs) ? std::string{"unknown"} : pg_type_name(value(w.rhs, resolve).type));
+    }
+    synthetic_.push_back(Column{0, name, SqlType{SqlKind::Text}, PhysType::Bytes, true, {}});
     const auto& text = synthetic_.back();
     logical::Expr pattern;
     if (w.rhs.kind == ast::Expr::Kind::Param) {
       use_param(w.rhs.param, PhysType::Bytes, w.rhs.pos, text, table, Use::Compared);
       pattern = logical::param(w.rhs.param, text.sql);
     } else if (is_constant(w.rhs)) {
-      pattern = fixed(coerce(fold(w.rhs), text, false, w.fold ? "~~*" : "~~"), text.sql);
+      pattern = fixed(coerce(fold(w.rhs), text, false, op), text.sql);
     } else {
-      not_yet("LIKE of other than a parameter or a constant pattern", w.pos);
+      pattern = value(w.rhs, resolve);
+      if (!is_string(pattern.type)) {
+        throw SqlError{"operator does not exist: " + pg_type_name(text_value.type) + " " + op + " " + pg_type_name(pattern.type), w.pos,
+                       kUndefinedFunction};
+      }
     }
     std::int64_t escape = '\\';
     if (w.escape) {
@@ -4252,7 +4377,7 @@ public:
       }
     }
     auto e = logical::expr(logical::Expr::Kind::Like, SqlType{SqlKind::Boolean});
-    e.args.push_back(logical::column_of(table, *c));
+    e.args.push_back(std::move(text_value));
     e.args.push_back(std::move(pattern));
     e.constant = escape;
     e.fold = w.fold;
@@ -4264,29 +4389,56 @@ public:
     return e;
   }
 
+  // What no WHERE or ON holds (docs/frontend_design.md, *Expressions in
+  // WHERE, ON and HAVING*): an aggregate, PostgreSQL's 42803 naming the
+  // clause, and random(), whose rows a replay cursor could not read again.
+  // A subquery is a query of its own, checked when it is bound.
+  static void filter_refusals(const ast::Compare& w) {
+    std::function<void(const ast::Expr&)> walk = [&](const ast::Expr& e) {
+      if (e.kind == ast::Expr::Kind::Aggregate) {
+        throw SqlError{std::string{"aggregate functions are not allowed in "} + (w.on != 0 ? "JOIN conditions" : "WHERE"), e.pos,
+                       kGroupingError};
+      }
+      if (e.kind == ast::Expr::Kind::Func && e.func == "random") not_yet("random() in a WHERE, ON or HAVING", e.pos);
+      if (e.lhs) walk(*e.lhs);
+      if (e.rhs) walk(*e.rhs);
+      for (const auto& a : e.args) walk(a);
+    };
+    std::function<void(const ast::Compare&)> each = [&](const ast::Compare& c) {
+      walk(c.lhs);
+      walk(c.rhs);
+      for (const auto& a : c.args) each(a);
+    };
+    each(w);
+  }
+
   // A conjunct: a comparison, or a predicate's tree, each comparison in it
-  // bound as a WHERE's is and IS NULL of a column (docs/frontend_design.md,
-  // *WHERE*). In a tree, $n ± k is not taken yet.
-  auto predicate(const ast::Compare& w, const auto& resolve) -> logical::Expr {
+  // bound as a WHERE's is, IS NULL and LIKE, or a BOOLEAN expression
+  // standing alone (docs/frontend_design.md, *WHERE*). `top`: a conjunct of
+  // the clause, not inside AND, OR or NOT, the only place a key's $n ± k
+  // shape is made.
+  auto predicate(const ast::Compare& w, const Resolve& resolve, bool top = true) -> logical::Expr {
     using K = ast::Compare::Kind;
+    if (top) filter_refusals(w);
     auto tree = [&](logical::Expr::Kind kind) {
       auto e = logical::expr(kind, SqlType{SqlKind::Boolean});
-      for (const auto& a : w.args) {
-        auto computed = [](const ast::Expr& x) { return x.kind == ast::Expr::Kind::Add || x.kind == ast::Expr::Kind::Sub; };
-        if (a.kind == K::Compare && ((computed(a.lhs) && !is_constant(a.lhs)) || (computed(a.rhs) && !is_constant(a.rhs)))) {
-          not_yet("$n + k and $n - k inside AND, OR or NOT", a.pos);
-        }
-        e.args.push_back(predicate(a, resolve));
-      }
+      for (const auto& a : w.args) e.args.push_back(predicate(a, resolve, false));
       return e;
     };
     switch (w.kind) {
-      case K::Compare: return compare(w, resolve);
+      case K::Compare: return compare(w, resolve, top);
       case K::IsNull: {
-        if (w.lhs.kind != ast::Expr::Kind::Column) not_yet("IS NULL of other than a column", w.pos);
-        auto [table, c] = resolve(w.lhs);
         auto e = logical::expr(logical::Expr::Kind::IsNull, SqlType{SqlKind::Boolean});
-        e.args.push_back(logical::column_of(table, *c));
+        if (w.lhs.kind == ast::Expr::Kind::Column) {
+          auto [t, c] = resolve(w.lhs);
+          e.args.push_back(logical::column_of(t->id, *c));
+        } else if (w.lhs.kind == ast::Expr::Kind::Param) {
+          // PostgreSQL's: IS NULL gives an untyped $n no type.
+          throw SqlError{"could not determine data type of parameter $" + std::to_string(w.lhs.param + 1), w.lhs.pos,
+                         kIndeterminateDatatype};
+        } else {
+          e.args.push_back(value(w.lhs, resolve));
+        }
         return e;
       }
       case K::Like: return like(w, resolve);
@@ -4298,8 +4450,8 @@ public:
       }
       case K::Quantified: {
         if (w.lhs.kind != ast::Expr::Kind::Column) not_yet("IN, ANY or ALL of a subquery of other than a column", w.pos);
-        auto [table, c] = resolve(w.lhs);
-        auto x = logical::column_of(table, *c);
+        auto [t, c] = resolve(w.lhs);
+        auto x = logical::column_of(t->id, *c);
         if (!w.all) return any_of(x, *c, w.quantified, *w.subquery, w.pos);
         std::vector<logical::Expr> one;
         one.push_back(any_of(x, *c, negation(w.quantified), *w.subquery, w.pos));
@@ -4313,6 +4465,15 @@ public:
       // TRUE or FALSE. A NULL is never true, so as a filter it is FALSE
       // wherever no NOT is above it.
       case K::Const: return logical::constant(w.truth.value_or(false) ? 1 : 0, SqlType{SqlKind::Boolean});
+      // A BOOLEAN standing alone; a $n is one, as PostgreSQL types it.
+      case K::Value: {
+        auto v = value(w.lhs, resolve, Peer{SqlType{SqlKind::Boolean}, nullptr, nullptr, Use::Compared});
+        if (v.type.kind != SqlKind::Boolean) {
+          throw SqlError{"argument of " + w.arg_of + " must be type boolean, not type " + pg_type_name(v.type), leftmost(w.lhs),
+                         kDatatypeMismatch};
+        }
+        return v;
+      }
     }
     std::unreachable();
   }
@@ -4337,12 +4498,13 @@ public:
 
   // CAST($n AS T) beside a column of type T is $n: PostgreSQL types an
   // untyped $n by its cast, and a cast of a value to its own type changes
-  // nothing. A cast to another type is not taken yet, nor one to DECIMAL,
-  // VARCHAR(n) or CHAR(n), whose casts round, cut or pad to the modifier.
+  // nothing. Null for a cast to another type, or to DECIMAL, VARCHAR(n) or
+  // CHAR(n), whose casts round, cut or pad to the modifier: the comparison
+  // is the select list's (compared_values).
   static auto uncast_param(const ast::Expr* e, const Column& c) -> const ast::Expr* {
     if (!param_cast(*e)) return e;
     if (c.sql.kind == SqlKind::Numeric && e->cast_type == "numeric" && e->cast_typmods.empty()) return e->rhs.get();
-    if (modified_cast(*e) || cast_type(*e).kind != c.sql.kind) not_yet("a cast of a parameter to other than its column's type", e->pos);
+    if (modified_cast(*e) || cast_type(*e).kind != c.sql.kind) return nullptr;
     return e->rhs.get();
   }
 
@@ -4356,11 +4518,39 @@ public:
     return sql_type(cast_def(e));
   }
 
+  // A WHERE or ON comparison of any operands, as the select list binds one
+  // (comparison_value): a filter evaluated on each row, never a key bound
+  // (docs/frontend_design.md, *Expressions in WHERE, ON and HAVING*). Of
+  // constants only, folded.
+  auto compared_values(const ast::Compare& w, const Resolve& resolve) -> logical::Expr {
+    if (is_constant(w.lhs) && is_constant(w.rhs)) {
+      ast::Expr e{ast::Expr::Kind::Compare, {}, 0, nullptr, nullptr, w.pos};
+      e.cmp = value_compare_of(w.op);
+      e.lhs = std::make_unique<ast::Expr>(ast::clone(w.lhs));
+      e.rhs = std::make_unique<ast::Expr>(ast::clone(w.rhs));
+      return value(e, resolve);
+    }
+    return compare_values(w.lhs, w.rhs, w.op, written_op(w, w.op), w.pos, resolve);
+  }
+
+  static auto value_compare_of(ast::Compare::Op op) -> ast::ValueCompare {
+    switch (op) {
+      case ast::Compare::Op::Eq: return ast::ValueCompare::Eq;
+      case ast::Compare::Op::Lt: return ast::ValueCompare::Lt;
+      case ast::Compare::Op::Le: return ast::ValueCompare::Le;
+      case ast::Compare::Op::Gt: return ast::ValueCompare::Gt;
+      case ast::Compare::Op::Ge: return ast::ValueCompare::Ge;
+    }
+    return ast::ValueCompare::Eq;
+  }
+
   // One WHERE conjunct as column <op> operand, the column resolved by
   // `resolve`. In $n ± k, $n and the sum are INTEGERs, as PostgreSQL types
   // an unknown $n beside an integer literal; the column compared with them
-  // is an INTEGER, so the sum is compared as one, and k must fit one.
-  auto compare(const ast::Compare& w, const auto& resolve) -> logical::Expr {
+  // is an INTEGER, so the sum is compared as one, and k must fit one; a
+  // conjunct of the clause only (`top`). Every other comparison, a shape
+  // below refusing it, is the select list's (compared_values).
+  auto compare(const ast::Compare& w, const Resolve& resolve, bool top) -> logical::Expr {
     const auto* col = &w.lhs;
     const auto* rhs = &w.rhs;
     auto op = w.op;
@@ -4386,59 +4576,64 @@ public:
           std::swap(col, rhs);
           op = mirrored(op);
         }
-        auto [table, c] = resolve(*col);
-        return logical::compare(op, logical::column_of(table, *c), outer_param(*rhs, *c, w.pos));
+        auto [t, c] = resolve(*col);
+        return logical::compare(op, logical::column_of(t->id, *c), outer_param(*rhs, *c, w.pos));
       }
     }
-    if (col->kind == ast::Expr::Kind::Column && param_cast(*rhs)) rhs = uncast_param(rhs, *resolve(*col).second);
+    if (col->kind == ast::Expr::Kind::Column && param_cast(*rhs)) {
+      rhs = uncast_param(rhs, *resolve(*col).second);
+      if (rhs == nullptr) return compared_values(w, resolve);
+    }
     // A column of one relation against a column of another, inside AND, OR or
     // NOT: <> is NOT =. Two columns of one relation: a filter of its rows.
     if (col->kind == ast::Expr::Kind::Column && rhs->kind == ast::Expr::Kind::Column) {
       auto [lt, lc] = resolve(*col);
       auto [rt, rc] = resolve(*rhs);
-      if (lt != rt) return joined_compare(op, written_op(w, op), lt, *lc, rt, *rc, w.pos);
-      return columns_compare(w, op, lt, *lc, *rc);
+      if (lt->id != rt->id) return joined_compare(op, written_op(w, op), lt->id, *lc, rt->id, *rc, w.pos);
+      return columns_compare(w, op, lt->id, *lc, *rc);
     }
     // A scalar subquery: its value, a parameter it sets before the plan runs.
     if (col->kind == ast::Expr::Kind::Column && rhs->kind == ast::Expr::Kind::Subquery) {
-      auto [table, c] = resolve(*col);
+      auto [t, c] = resolve(*col);
       auto s = subquery(*rhs->subquery, logical::Subquery::Kind::Value, rhs->pos);
       comparable(s.type, *c, rhs->pos);
-      return logical::compare(op, logical::column_of(table, *c), logical::param(s.param, subquery_param_type(s.type, *c)));
+      return logical::compare(op, logical::column_of(t->id, *c), logical::param(s.param, subquery_param_type(s.type, *c)));
     }
     // The clock: the statement's reading, filled in on each run.
     if (col->kind == ast::Expr::Kind::Column && rhs->kind == ast::Expr::Kind::Clock) {
-      auto [table, c] = resolve(*col);
-      return logical::compare(op, logical::column_of(table, *c), compared_clock(*rhs, *c, w.lhs.kind == ast::Expr::Kind::Clock, w));
+      auto [t, c] = resolve(*col);
+      return logical::compare(op, logical::column_of(t->id, *c), compared_clock(*rhs, *c, w.lhs.kind == ast::Expr::Kind::Clock, w));
     }
     // A constant: folded to the column's type, where it holds it exactly.
+    // A TEXT constant (of ||, lower(), a cast) beside a CHAR(n) column is
+    // not: PostgreSQL casts the column to text, so trailing spaces count
+    // (`ch = 'ab ' || ''` is false of 'ab'), as the select list compares.
+    // A VARCHAR one (the layer folds it as TEXT) is cast to the column's
+    // type, as here.
     if (col->kind == ast::Expr::Kind::Column && is_constant(*rhs)) {
-      auto [table, c] = resolve(*col);
-      auto v = coerce(fold(*rhs), *c, false, written_op(w, op));
-      return logical::compare(op, logical::column_of(table, *c), fixed(std::move(v), c->sql));
+      auto [t, c] = resolve(*col);
+      auto k = fold(*rhs);
+      auto varchar = rhs->kind == ast::Expr::Kind::Cast && rhs->cast_type == "varchar";
+      if (c->sql.kind == SqlKind::Char && !k.unknown && k.type.kind == SqlKind::Text && !varchar) return compared_values(w, resolve);
+      auto v = coerce(k, *c, false, written_op(w, op));
+      return logical::compare(op, logical::column_of(t->id, *c), fixed(std::move(v), c->sql));
     }
-    if (col->kind == ast::Expr::Kind::Clock || rhs->kind == ast::Expr::Kind::Clock) {
-      const auto& k = col->kind == ast::Expr::Kind::Clock ? *col : *rhs;
-      if (clock_words(k).starts_with("CURRENT_DATE")) not_yet("comparing the time with a constant, a parameter or the time", w.pos);
-      // The planner plans a WHERE conjunct that compares a column; one that
-      // compares none is not built yet, so neither is this.
-      not_supported("comparing " + clock_words(k) + " in WHERE or ON with other than a column", w.pos);
+    // CURRENT_DATE compared with other than a column is not taken yet; the
+    // rest of the clock is a value as in a select list.
+    if ((col->kind == ast::Expr::Kind::Clock && col->func == "current_date") ||
+        (rhs->kind == ast::Expr::Kind::Clock && rhs->func == "current_date")) {
+      not_yet("comparing the time with a constant, a parameter or the time", w.pos);
     }
-    if (col->kind != ast::Expr::Kind::Column || !operand(*rhs)) {
-      throw SqlError{std::string{w.on ? "ON" : "WHERE"} + " must compare a column with a parameter or a constant", w.pos};
-    }
-    auto [table, c] = resolve(*col);
+    if (col->kind != ast::Expr::Kind::Column || !operand(*rhs)) return compared_values(w, resolve);
+    auto [t, c] = resolve(*col);
+    auto table = t->id;
     if (rhs->kind == ast::Expr::Kind::Param) {
       use_param(rhs->param, c->type, rhs->pos, *c, table, Use::Compared);
       return logical::compare(op, logical::column_of(table, *c), logical::param(rhs->param, c->sql));
     }
-    if (c->sql.kind != SqlKind::Integer) {
-      throw SqlError{"$n + n and $n - n are supported only compared with an INTEGER column yet", rhs->pos};
-    }
+    // $n ± k as the key takes it: beside an INTEGER column, k an INTEGER.
     auto k = rhs->rhs->constant;
-    if (!std::in_range<std::int32_t>(k)) {
-      throw SqlError{"an integer literal past INTEGER is not supported here yet", rhs->rhs->pos};
-    }
+    if (!top || c->sql.kind != SqlKind::Integer || !std::in_range<std::int32_t>(k)) return compared_values(w, resolve);
     use_param(rhs->lhs->param, c->type, rhs->lhs->pos, *c, table, Use::Compared);
     auto kind = rhs->kind == ast::Expr::Kind::Add ? logical::Expr::Kind::Add : logical::Expr::Kind::Sub;
     auto operand = logical::binary(kind, logical::param(rhs->lhs->param, c->sql), logical::constant(k, c->sql), c->sql);
@@ -4528,10 +4723,11 @@ public:
         out.push_back(join_on(visible, w, hidden));
         continue;
       }
-      out.push_back(predicate(w, [&](const ast::Expr& e) {
+      Resolve resolve = [&](const ast::Expr& e) -> std::pair<const Table*, const Column*> {
         auto [side, col] = column(visible, e, hidden);
-        return std::pair{visible[side]->id, col};
-      }));
+        return {visible[side], col};
+      };
+      out.push_back(predicate(w, resolve));
     }
     return out;
   }
@@ -5898,6 +6094,7 @@ private:
   std::size_t fixed_params_{0};      // $1 .. $fixed_params_ were typed by fix_params
   std::deque<Column> typed_params_;  // what a $n typed by its place (function_value) is used as; never moves
   std::vector<Datum> fixed_;  // the constants' values, $own_params_ + 1 onwards
+  std::vector<std::uint32_t> null_consts_;  // the slots of NULL constants among them (strict_null)
   std::vector<PhysType> fixed_types_;
   std::vector<SqlType> fixed_sql_;
   std::vector<ClockSlot> clocks_;
@@ -5970,7 +6167,8 @@ void qualify(ast::Compare& c, const std::string& table) {
       qualify(c.rhs, table);
       break;
     case K::IsNull:
-    case K::Quantified: qualify(c.lhs, table); break;
+    case K::Quantified:
+    case K::Value: qualify(c.lhs, table); break;
     case K::And:
     case K::Or:
     case K::Not:
@@ -6006,7 +6204,8 @@ void swap_columns(ast::Compare& c, const ColumnSwap& swap) {
       swap_columns(c.rhs, swap);
       break;
     case K::IsNull:
-    case K::Quantified: swap_columns(c.lhs, swap); break;
+    case K::Quantified:
+    case K::Value: swap_columns(c.lhs, swap); break;
     case K::And:
     case K::Or:
     case K::Not:
@@ -6041,7 +6240,8 @@ auto over_group(const ast::Compare& c, const std::vector<ast::Expr>& group) -> b
     case K::Compare:
     case K::Like: return over_group(c.lhs, group) && over_group(c.rhs, group);
     case K::IsNull:
-    case K::Quantified: return over_group(c.lhs, group);
+    case K::Quantified:
+    case K::Value: return over_group(c.lhs, group);
     case K::And:
     case K::Or:
     case K::Not: return std::ranges::all_of(c.args, [&](const ast::Compare& a) { return over_group(a, group); });
@@ -6522,6 +6722,11 @@ private:
       case K::Or: {
         auto e = node(w.kind == K::And ? ast::Expr::Kind::And : ast::Expr::Kind::Or);
         for (const auto& a : w.args) e.args.push_back(checked_expr(a));
+        return e;
+      }
+      case K::Value: {
+        auto e = ast::clone(w.lhs);
+        if (has_subquery(e)) refuse_checked_subquery();
         return e;
       }
       case K::Const: {

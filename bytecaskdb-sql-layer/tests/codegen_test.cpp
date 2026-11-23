@@ -476,6 +476,9 @@ TEST_CASE("codegen: a correlated subquery runs at its conjunct, for the row in h
                "      bc_sub_arg_i64(cx, 2, bc_col_i64(cx, row, COL_1_2));\n    }\n"
                "    bc_sub_begin(cx, 0, BC_SUB_EXISTS, BC_T_BOOL, 4);\n    sub0(cx);\n    bc_sub_end(cx);\n"
                "    if (!(!bc_param_null(cx, 4) && bc_param_bool(cx, 4))) continue;"));
+  // Written first, it runs before the conjunct written after it is tested.
+  auto first = generate(f.cat(), "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.v = t.qty) AND qty > $1");
+  CHECK(first.source.find("bc_sub_begin") < first.source.find("bc_param_i64(cx, 0))) continue;"));
   // The wrap keeps the argument and the subquery's flags out of the
   // outer plan's NULL checks: the plan ends early only on $1.
   CHECK(has(p, "void plan(bc_ctx *cx) {\n  if (bc_param_null(cx, 0)) {\n    return;"));
@@ -534,4 +537,38 @@ TEST_CASE("codegen: a derived relation binds each of its query's groups to local
   // It reads the view's table, as the view's query does.
   CHECK(plan.objects_read == std::vector<std::uint32_t>{cat.table({kPublicSchema, "t"})->id});
   CHECK_FALSE(plan.resumable);
+}
+
+TEST_CASE("codegen: an expression filter is printed by eval after the tests before it, a block of its own where a condition gathers",
+          "[sql][codegen]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bound::bind(ast::parse("CREATE TABLE u (k BIGINT PRIMARY KEY, v BIGINT)"), f.cat()).stmt));
+  auto at = [](const std::string& s, std::string_view what) { return s.find(what); };
+  // In a loop: the comparison truth prints, then the expression's locals,
+  // then its test, in written order.
+  auto loop = generate(f.cat(), "SELECT id FROM t WHERE qty = $1 AND qty * 2 > 10").source;
+  INFO(loop);
+  REQUIRE(at(loop, "bc_mul(cx, ") != std::string::npos);
+  CHECK(at(loop, "continue;") < at(loop, "bc_mul(cx, "));
+  CHECK(loop.find("continue;", at(loop, "bc_mul(cx, ")) != std::string::npos);
+  // Written order: the expression first, so its test comes before the comparison's.
+  auto first = generate(f.cat(), "SELECT id FROM t WHERE qty * 2 > 10 AND qty = $1").source;
+  CHECK(at(first, "bc_mul(cx, ") < at(first, "bc_param_i64(cx, 0)"));
+  // Over a one-row aggregate's point lookup: a block per conjunct, entered
+  // only when the row was found, so no eval reads a missing row.
+  auto one = generate(f.cat(), "SELECT count(qty) FROM t WHERE id = $1 AND 10 / qty > 0").source;
+  INFO(one);
+  REQUIRE(at(one, "bc_div(cx, ") != std::string::npos);
+  CHECK(at(one, "bool h") < at(one, "bc_div(cx, "));
+  CHECK(one.find("if (h") < at(one, "bc_div(cx, "));
+  CHECK(one.find(" = found;") < at(one, "bc_div(cx, "));
+  // A left index join's ON: a block after the probe found its row.
+  auto outer = generate(f.cat(), "SELECT t.id FROM t LEFT JOIN u ON u.k = t.qty AND 10 / u.v > 0").source;
+  INFO(outer);
+  REQUIRE(at(outer, "bc_div(cx, ") != std::string::npos);
+  CHECK(at(outer, "bool jm") < at(outer, "bc_div(cx, "));
+  CHECK(at(outer, "if (jm") < at(outer, "bc_div(cx, "));
+  // LIKE of an expression: eval's, over the values it computes.
+  auto like = generate(f.cat(), "SELECT k FROM u WHERE lower(k || 'x') LIKE $1").source;
+  CHECK(like.find("bc_like(cx, ") != std::string::npos);
 }

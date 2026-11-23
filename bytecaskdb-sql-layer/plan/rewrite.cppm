@@ -318,12 +318,13 @@ void rewrite_derived(Node& n) {
   if (auto* in = input_of(n); in != nullptr && *in) rewrite_derived(**in);
 }
 
-// Whether e is a predicate that reads no column: a subquery's EXISTS or
-// its flags, the same for every row.
+// Whether conjunct e reads no column: a subquery's EXISTS or its flags, a
+// comparison of parameters ($1 = $2), the same for every row. A folded
+// constant is fold's, which keeps one only in a left outer join's ON.
 auto reads_none(const Expr& e) -> bool {
   std::vector<ColumnRef> cols;
   columns_of(e, cols);
-  return cols.empty() && logical::is_predicate(e);
+  return cols.empty() && !is_const(e);
 }
 
 auto reads_only(const Expr& e, const std::vector<const Table*>& tables) -> bool {

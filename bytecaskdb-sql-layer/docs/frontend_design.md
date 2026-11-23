@@ -374,8 +374,8 @@ kind the transformer doesn't take is refused with its position.
     `bc_extract` refuses those two fields of a timestamp too (BC_E_HANDLE),
     as the physical check does (`date_field_built`), so a plan written by
     hand cannot reach a value the binder never asks for.
-    `EXTRACT` in a `WHERE` or `GROUP BY` is refused as any expression
-    there is. `EXTRACT` of a `TIME WITH TIME ZONE` is not built (0A000).
+    `EXTRACT` in a `GROUP BY` is refused as any expression there is; in
+    a `WHERE` it is a filter (stage P1a). `EXTRACT` of a `TIME WITH TIME ZONE` is not built (0A000).
 - **`CASE`, `COALESCE` and `NULLIF`** of constants fold. Of a column, a
   parameter or a subquery they are values in a select list (*Expressions
   over columns*, below). The result type is PostgreSQL's union rule: unknown
@@ -458,9 +458,10 @@ kind the transformer doesn't take is refused with its position.
     PostgreSQL's operators check it: `integer out of range`, `smallint out
     of range`, `numeric field overflow`, all SQLSTATE 22003.
   - An expression involving NULL is NULL.
-- **Where expressions may appear:** `SET col = expr`, a comparison's
-  operand (`ol_o_id >= $3 - 20`), and `VALUES`. A constant expression may
-  also be a select-list target and a `HAVING` operand.
+- **Where expressions may appear:** `SET col = expr`, `VALUES`, a select
+  list, and any operand of a `WHERE` or `ON` (*Expressions in WHERE, ON and
+  HAVING (stage P)*, stage P1a). A constant expression may also be a
+  `HAVING` operand.
 - **`DEFAULT`** as a `VALUES` item of an `INSERT` or the value of a `SET`
   assignment is the column's default constant, NULL where it has none (a
   NOT NULL column without one is 23502). The binder replaces it with that
@@ -469,7 +470,11 @@ kind the transformer doesn't take is refused with its position.
 
 **`WHERE`** is a conjunction (`AND`) of comparisons (`=`, `<`, `<=`, `>`,
 `>=`) of a column with a parameter, a constant, `$n ± k` or another column,
-in any order, on any columns, and of predicates over them.
+in any order, on any columns, and of predicates over them; and, since stage
+P1a, of comparisons, `IS NULL`, `LIKE`, `IN` and `BETWEEN` of any value
+expression a select list takes, and of a BOOLEAN expression standing alone
+(*Expressions in WHERE, ON and HAVING (stage P)*). Those are filters,
+evaluated on each row a plan reads, never a key's bound.
 - A comparison with NULL is not true, so it rejects the row, as in SQL's
   three-valued logic.
 - **Predicates:** `AND`, `OR` and `NOT` of comparisons and of `col IS [NOT]
@@ -517,11 +522,12 @@ in any order, on any columns, and of predicates over them.
   (`argument of WHERE must be type boolean, not type integer`), naming as
   PostgreSQL does the `AND`, `OR` or `NOT` it is an argument of, else the
   clause (`JOIN/ON` for an `ON`), and its type: `integer` within int4,
-  `bigint` within int8, else `numeric`. A string is refused, where
-  PostgreSQL reads it as a boolean.
+  `bigint` within int8, else `numeric`. A string is read as a BOOLEAN, as
+  PostgreSQL reads an unknown (`WHERE 'abc'` is 22P02).
 - **`LIKE`** and **`ILIKE`**: `col [NOT] [I]LIKE pattern [ESCAPE e]`, of a
   TEXT or VARCHAR column and a parameter or constant pattern, typed TEXT as
-  PostgreSQL types it; a predicate leaf, matched by `bc_like` or `bc_ilike`
+  PostgreSQL types it (since stage P1a either side may be any text
+  expression, evaluated); a predicate leaf, matched by `bc_like` or `bc_ilike`
   (`plan_api_design.md`): `%` any run, `_` one character, bytewise (`COLLATE
   "C"`); `LIKE` is case-sensitive, `ILIKE` matches the ASCII letters of the
   pattern's literals in either case, as `UPPER` and `LOWER` fold (`É`
@@ -1186,7 +1192,10 @@ That includes:
   operator and function of jsonb, its casts but those with text, and the
   `json` type (0A000, *jsonb*; `jsonb_design.md`, *Stages of jsonb*);
 - `IS DISTINCT FROM`, and a predicate or a constant in `HAVING`; a
-  `NULL` constant under `NOT`, and a string constant as a `WHERE` or `ON`;
+  `NULL` constant under `NOT`; in a `WHERE` or `ON`, `random()` (42601), an
+  aggregate (42803), `expr IN (SELECT …)` of an expression, and `CURRENT_DATE`
+  compared with other than a column (*Expressions in WHERE, ON and HAVING
+  (stage P)*, *What stays refused*);
 - correlated subqueries but the slice above (#836), nested subqueries and the others above, a subquery in `FROM`, and a derived relation but a grouped view aggregated over;
 - `DISTINCT ON`, `DISTINCT` of a constant or over groups it does not select
   every key of, an aggregate of `DISTINCT` values of an expression (0A000),
@@ -1221,7 +1230,7 @@ That includes:
   `GROUP BY`, `SET`, an aggregated select list or the `ORDER BY` of a
   grouped or aggregated query (#685, #686), `ORDER BY random()` and
   `ORDER BY t.*`;
-- `OVERLAY` of columns and parameters, a string function in a `WHERE`,
+- `OVERLAY` of columns and parameters,
   `||` of a boolean, float or date value, `LENGTH`, `CONCAT`,
   `REPLACE`, the regular-expression `SUBSTRING`, `bytea` string functions
   (#671);
@@ -1231,9 +1240,9 @@ That includes:
 - a cast of anything but a constant, a parameter, or a string value to
   `text` or `varchar` of no length (a `NAME` to `name`); a cast of a
   parameter to `DECIMAL`, `VARCHAR(n)` or `CHAR(n)`, to a type another use
-  of it does not give it, or, in `VALUES`, `SET` or a `WHERE`, to other
-  than its column's type; a cast parameter inside an expression in `SET`,
-  a `WHERE` or `HAVING`, or in an aggregated select list; a numeric literal of more than 18 digits, a string literal in arithmetic, unary `-` or `abs`
+  of it does not give it, or, in `VALUES` or `SET`, to other than its
+  column's type; a cast parameter inside an expression in `SET` or
+  `HAVING`, or in an aggregated select list; a numeric literal of more than 18 digits, a string literal in arithmetic, unary `-` or `abs`
   of a parameter, and a constant beside an aggregate;
 - `EXTRACT(EPOCH FROM …)` and `EXTRACT(JULIAN FROM …)` of a timestamp,
   and `EXTRACT` of a unit given other than as a name or a string;
@@ -1566,9 +1575,12 @@ until then.
 
 ### Expressions in WHERE, ON and HAVING (stage P)
 
-Status: **design, approved by the owner on 2026-11-22 with every
-recommendation under *Owner's decisions on stage P*.** Nothing in this section
-is built. It is a dependency of `jsonb_design.md` (*Expressions in WHERE
+Status: **P1a built; P1b, P2 and P3 design, approved by the owner on
+2026-11-22 with every recommendation under *Owner's decisions on stage P*.**
+P1a is the *Stages of stage P* table's first row: expression operands in a
+`WHERE`, an `ON` and an `UPDATE`'s or `DELETE`'s `WHERE`, tried in written
+order. `HAVING` (P3), PG 17's conjunct order (P1b) and an operand of no
+column computed once (P2) are not built. It is a dependency of `jsonb_design.md` (*Expressions in WHERE
 and ON*; stage 3's `->>` in a `WHERE`) and of Mattermost (#889). The
 planner's part is `planner_design.md`, *Expression filters (stage P)*.
 Behaviour observed on PostgreSQL 17.12 is cited as "PG 17"; every PG 17
@@ -2045,6 +2057,11 @@ row is one PR; P1a alone unblocks jsonb stage 3's `->>` in a `WHERE`.
   strict `WHERE` above a left join (`push_down`, `plan/rewrite.cppm:347-400`),
   so it can return rows where PG 17 raises. The rows, when PG 17 returns
   any, are the same. Open question 8.
+- **A NULL parameter of a strict operator.** PG 17's custom plan folds
+  a NULL `$n` as it folds a NULL constant; the layer binds no parameter's
+  value, so `10/a > $1 OR a = 0` with `$1` NULL evaluates `10/a` and is
+  22012 where PG 17 returns the `a = 0` row. A NULL constant is folded
+  (*What stage P1a built*). PG 17's generic plan is the layer's.
 - **CASE and COALESCE arms PG 17 drops.** `CASE WHEN false THEN 1/0 > 0
   ELSE true END` and `COALESCE(1, 1/0)` run in PG 17 and stay 42601
   (*Constants and CASE arms*).
@@ -2122,6 +2139,56 @@ outer-join reduction is tracked as a planner improvement of its own.
   result does.
 - **Generated code size.** Each expression conjunct prints its locals;
   compile time grows with the expression, as the select list's does.
+
+#### What stage P1a built, and where it differs from the plan above
+
+P1a is built as the *Stages of stage P* table's first row, with these
+points settled in the code:
+
+- **Parser:** a node `predicate()` does not take is `ast::Compare::Kind::
+  Value`, its expression in `lhs` and the 42804's argument name in
+  `arg_of` (the clause, `JOIN/ON`, or the `AND`, `OR` or `NOT` around it);
+  a string constant and a scalar subquery standing alone are `Value`s
+  (`WHERE 'true'`, `WHERE (SELECT flag …)`). `GREATEST` and `LEAST` are
+  refused with their position.
+- **The clock:** only `CURRENT_DATE` compared with other than a column
+  stays refused (42601); `now()`, `LOCALTIME` and the rest are values as in
+  a select list. The old guard's `clock_words` named every time function
+  `CURRENT_DATE, …`, so the line above that cites it meant this.
+- **Untyped operands:** a typed constant types a `$n` beside it (`1 = $1`
+  integer, `$1 + 1` in a select list), two untyped operands of a comparison
+  are text (`$1 = 'x'`), of arithmetic 42725; `$n IS NULL` is PostgreSQL's
+  42P18 `could not determine data type of parameter $1`.
+- **Typing a conjunct:** `physical::column_compare` (a column against a
+  parameter of its type, a wider integer's, `$n ± k` of an INTEGER, or a
+  column), `physical::is_computed` and `physical::evaluated` are the one
+  test the search's `use_of`, `add_computed`, the checker and codegen ask.
+- **Written order:** the search records each conjunct's place
+  (`Rel::written`) and returns the residual in it, and codegen keeps it:
+  a conjunct testing a correlated subquery runs it at its written place,
+  for a row the conjuncts before it kept (before P1a it came after the
+  others of its Filter). PG 17 runs `EXISTS` as a semi- or anti-join, so
+  whether `EXISTS (…) AND 10 / a > 0` raises there depends on its plan.
+- **A strict operator of a NULL constant** is a NULL of its type
+  (`Binder::strict_null`), as PG 17's `eval_const_expressions` folds it,
+  in a select list as in a filter: `10/a > NULL` divides nothing and
+  `(10/a + NULL) IS NULL` is true of every row. The operands are bound
+  first, so their type errors stand. Arithmetic, comparisons, `NOT`,
+  `LIKE`, `||`, `SUBSTRING`, the string functions, `EXTRACT`, `abs`, `%`
+  and the jsonb casts are strict; `AND`, `OR`, `IS NULL`, `CASE`,
+  `COALESCE` and `random()` are not.
+- **A CHAR(n) column beside a TEXT constant** (`ch = 'ab ' || ''`,
+  `ch = lower('AB ')`) is compared as the select list compares it, the
+  column cast to text, so trailing spaces count, as PG 17 resolves
+  `bpchar = text`. A string literal, and a constant cast to VARCHAR, is
+  still folded to the column's type (PG's `bpchar = bpchar`).
+- **Positions:** the 42804 of a non-BOOLEAN conjunct, or operand of
+  `AND`, `OR` or `NOT`, is at the expression's leftmost token, as PG 17's
+  `exprLocation` (`WHERE a + 1` at `a`).
+- **Not built in P1a:** P1b's order, P2's computed operand, P3's `HAVING`,
+  expressions in `SET` (#896), join keys on expressions (#897) and `expr IN
+  (SELECT …)` (#898). PostgreSQL's HINT on a 42883 (`No operator matches …`)
+  is not given, as for a select list's.
 
 #### Edits to other documents once stage P is built
 
