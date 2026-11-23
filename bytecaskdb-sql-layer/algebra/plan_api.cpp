@@ -1724,7 +1724,8 @@ struct bc_ctx {
 
   // Sets the constraint error: the kind in the detail's high byte, the
   // object id in its low 24 bits.
-  void raise(std::uint32_t constraint, std::uint32_t object_id, std::string msg = {}) {
+  // With `detail_note`, the error's DETAIL line (a DECIMAL cast's precision).
+  void raise(std::uint32_t constraint, std::uint32_t object_id, std::string msg = {}, std::string_view detail_note = {}) {
     if (!ok()) return;
     ConstraintDetail d{constraint, object_id};
     // A kind or id the detail cannot hold is a caller's bug, as in bc_raise:
@@ -1737,6 +1738,12 @@ struct bc_ctx {
       sink().constraint(d);
     } else {
       sink().fail(BC_E_CONSTRAINT, std::move(msg), d.encode());
+      if (!detail_note.empty()) {
+        try {
+          sink().note = detail_note;
+        } catch (...) {  // the DETAIL is dropped, never the error
+        }
+      }
     }
   }
 
@@ -5916,24 +5923,313 @@ bc_view bc_jsonb_to_num(bc_ctx* cx, bc_jsonb j) {
   return {};
 }
 
-bc_view bc_number_text(bc_ctx* cx, int64_t v, uint32_t scale) {
+extern "C++" {
+namespace {
+
+namespace sqlt = bytecask::sql;
+
+static_assert(BC_TYPE_SMALLINT == static_cast<int>(sqlt::SqlKind::SmallInt) &&
+              BC_TYPE_DECIMAL == static_cast<int>(sqlt::SqlKind::Decimal) &&
+              BC_TYPE_NUMERIC == static_cast<int>(sqlt::SqlKind::Numeric) &&
+              BC_TYPE_TIMESTAMPTZ == static_cast<int>(sqlt::SqlKind::TimestampTz) &&
+              BC_TYPE_NAME == static_cast<int>(sqlt::SqlKind::Name) &&
+              BC_TYPE_JSONB == static_cast<int>(sqlt::SqlKind::Jsonb));
+
+// A bc_sql_type as its SqlKind; nullopt for a code outside the enum.
+auto sql_kind_of(std::uint32_t code) -> std::optional<sqlt::SqlKind> {
+  if (code < BC_TYPE_SMALLINT || code > BC_TYPE_JSONB) return std::nullopt;
+  return static_cast<sqlt::SqlKind>(code);
+}
+
+auto integer_kind(sqlt::SqlKind k) -> bool {
+  return k == sqlt::SqlKind::SmallInt || k == sqlt::SqlKind::Integer || k == sqlt::SqlKind::BigInt;
+}
+
+auto temporal_kind(sqlt::SqlKind k) -> bool {
+  using K = sqlt::SqlKind;
+  return k == K::Date || k == K::Time || k == K::TimeTz || k == K::Timestamp || k == K::TimestampTz;
+}
+
+// A bc_int_type as its SqlKind.
+auto int_kind_of(std::uint32_t int_type) -> std::optional<sqlt::SqlKind> {
+  switch (int_type) {
+    case BC_SMALLINT: return sqlt::SqlKind::SmallInt;
+    case BC_INTEGER: return sqlt::SqlKind::Integer;
+    case BC_BIGINT: return sqlt::SqlKind::BigInt;
+    default: return std::nullopt;
+  }
+}
+
+// DECIMAL(precision, scale), when the layer holds one.
+auto decimal_type(std::uint32_t precision, std::uint32_t scale) -> std::optional<sqlt::SqlType> {
+  if (precision < 1 || precision > sqlt::kMaxDecimalPrecision || scale > precision) return std::nullopt;
+  return sqlt::SqlType{sqlt::SqlKind::Decimal, 0, static_cast<std::uint8_t>(precision), static_cast<std::uint8_t>(scale)};
+}
+
+// A cast function's error as the plan API reports it: a value outside an
+// integer or DECIMAL target BC_C_RANGE on object_id, with its DETAIL; any
+// other BC_E_DATA with its SQLSTATE (never BC_E_CORRUPT, which an escaped
+// TextError would be).
+void fail_cast(bc_ctx* cx, const sqlt::TextError& e, sqlt::SqlKind to, std::uint32_t object_id) {
+  auto state = sqlt::known_sqlstate(e.sqlstate()).value_or(sqlt::kInvalidTextRepresentation);
+  if (state.view() == "22003" && (integer_kind(to) || to == sqlt::SqlKind::Decimal)) {
+    cx->raise(BC_C_RANGE, object_id, e.what(), e.detail());
+    return;
+  }
+  cx->fail(BC_E_DATA, state, e.what(), {e.detail(), "", e.context()});
+}
+
+// Runs `read` over the text of `text`, its size charged to the statement
+// while it runs (`times` copies of it: from_text's temporaries) and
+// released after, success or failure.
+template <typename Read>
+auto with_text(bc_ctx* cx, bc_view text, std::uint64_t times, Read&& read) -> bool {
+  auto t = cx->resolve(text);
+  if (!t || !cx->ok()) return false;
+  auto charge = t->size() * times;
+  if (!cx->take(charge)) return false;
+  struct Release {
+    bc_ctx* cx;
+    std::uint64_t n;
+    ~Release() { cx->release(n); }
+  } release{cx, charge};
+  read(text_of(*t));
+  return cx->ok();
+}
+
+auto text_view(bc_ctx* cx, const std::string& text) -> bc_view {
+  auto b = std::as_bytes(std::span{text.data(), text.size()});
+  return cx->arena_view(BytesView{b});
+}
+
+}  // namespace
+}  // extern "C++"
+
+int64_t bc_text_in_i64(bc_ctx* cx, bc_view text, uint32_t sql_type, uint32_t precision, uint32_t scale, uint32_t object_id) {
   BC_GUARD_BEGIN
-  if (scale > 18) {
-    cx->fail(BC_E_HANDLE, "bc_number_text: a scale past 18");
+  auto kind = sql_kind_of(sql_type);
+  std::optional<sqlt::SqlType> to;
+  if (kind && (integer_kind(*kind) || temporal_kind(*kind))) to = sqlt::SqlType{*kind};
+  if (kind == sqlt::SqlKind::Decimal) to = decimal_type(precision, scale);
+  if (!to) {
+    cx->fail(BC_E_HANDLE, "bc_text_in_i64: not an integer, DECIMAL or date or time type");
+    return 0;
+  }
+  std::int64_t out = 0;
+  (void)with_text(cx, text, 1, [&](std::string_view s) {
+    try {
+      out = std::get<std::int64_t>(sqlt::cast_from_text(s, *to));
+    } catch (const sqlt::TextError& e) {
+      fail_cast(cx, e, to->kind, object_id);
+    }
+  });
+  return cx->ok() ? out : 0;
+  BC_GUARD_END(cx)
+  return 0;
+}
+
+double bc_text_in_f64(bc_ctx* cx, bc_view text, uint32_t sql_type) {
+  BC_GUARD_BEGIN
+  if (sql_type != BC_TYPE_REAL && sql_type != BC_TYPE_DOUBLE) {
+    cx->fail(BC_E_HANDLE, "bc_text_in_f64: not REAL or DOUBLE PRECISION");
+    return 0.0;
+  }
+  sqlt::SqlType to{static_cast<sqlt::SqlKind>(sql_type)};
+  double out = 0.0;
+  (void)with_text(cx, text, 1, [&](std::string_view s) {
+    try {
+      out = std::get<double>(sqlt::cast_from_text(s, to));
+    } catch (const sqlt::TextError& e) {
+      fail_cast(cx, e, to.kind, 0);
+    }
+  });
+  return cx->ok() ? out : 0.0;
+  BC_GUARD_END(cx)
+  return 0.0;
+}
+
+bool bc_text_in_bool(bc_ctx* cx, bc_view text) {
+  BC_GUARD_BEGIN
+  auto out = false;
+  (void)with_text(cx, text, 1, [&](std::string_view s) {
+    try {
+      out = std::get<bool>(sqlt::cast_from_text(s, sqlt::SqlType{sqlt::SqlKind::Boolean}));
+    } catch (const sqlt::TextError& e) {
+      fail_cast(cx, e, sqlt::SqlKind::Boolean, 0);
+    }
+  });
+  return cx->ok() && out;
+  BC_GUARD_END(cx)
+  return false;
+}
+
+bc_view bc_text_in_bytes(bc_ctx* cx, bc_view text, uint32_t sql_type) {
+  BC_GUARD_BEGIN
+  if (sql_type != BC_TYPE_BYTEA && sql_type != BC_TYPE_NAME) {
+    cx->fail(BC_E_HANDLE, "bc_text_in_bytes: not BYTEA or NAME");
     return {};
   }
-  // The magnitude as unsigned, so INT64_MIN has one.
-  auto mag = v < 0 ? std::uint64_t{0} - static_cast<std::uint64_t>(v) : static_cast<std::uint64_t>(v);
-  auto digits = std::to_string(mag);
-  if (scale > 0) {
-    if (digits.size() <= scale) digits.insert(0, scale + 1 - digits.size(), '0');
-    digits.insert(digits.size() - scale, 1, '.');
-  }
-  if (v < 0) digits.insert(0, 1, '-');
-  auto b = std::as_bytes(std::span{digits.data(), digits.size()});
-  return cx->arena_view(BytesView{b});
+  sqlt::SqlType to{static_cast<sqlt::SqlKind>(sql_type)};
+  bc_view out{};
+  // The temporary and its arena copy are held at once: twice the text.
+  (void)with_text(cx, text, 2, [&](std::string_view s) {
+    try {
+      auto b = std::get<Bytes>(sqlt::cast_from_text(s, to));
+      out = cx->arena_view(BytesView{b});
+    } catch (const sqlt::TextError& e) {
+      fail_cast(cx, e, to.kind, 0);
+    }
+  });
+  return cx->ok() ? out : bc_view{};
   BC_GUARD_END(cx)
   return {};
+}
+
+bc_view bc_value_text(bc_ctx* cx, int64_t v, uint32_t sql_type, uint32_t scale) {
+  BC_GUARD_BEGIN
+  auto kind = sql_kind_of(sql_type);
+  auto ok_type = kind && (integer_kind(*kind) || temporal_kind(*kind) ||
+                          (*kind == sqlt::SqlKind::Decimal && scale <= sqlt::kMaxDecimalPrecision) ||
+                          (*kind == sqlt::SqlKind::Boolean && scale <= 1 && (v == 0 || v == 1)));
+  if (!ok_type || (*kind != sqlt::SqlKind::Decimal && *kind != sqlt::SqlKind::Boolean && scale != 0)) {
+    cx->fail(BC_E_HANDLE, "bc_value_text: not an integer, DECIMAL, BOOLEAN or date or time value");
+    return {};
+  }
+  sqlt::SqlType from{*kind, 0, sqlt::kMaxDecimalPrecision, static_cast<std::uint8_t>(scale)};
+  if (*kind == sqlt::SqlKind::Boolean) {
+    // booltext's at scale 0, boolout's (the I/O cast to a name) at 1.
+    auto to = sqlt::SqlType{scale == 0 ? sqlt::SqlKind::Text : sqlt::SqlKind::Name};
+    return text_view(cx, sqlt::cast_to_text(v != 0, from, to));
+  }
+  return text_view(cx, sqlt::cast_to_text(v, from, sqlt::SqlType{sqlt::SqlKind::Text}));
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_view bc_bytea_text(bc_ctx* cx, bc_view b) {
+  BC_GUARD_BEGIN
+  auto t = cx->resolve(b);
+  if (!t || !cx->ok()) return {};
+  // \x and two hex digits a byte, written straight into the arena.
+  static constexpr char kHex[] = "0123456789abcdef";
+  auto n = 2 + 2 * t->size();
+  if (!cx->take(n)) return {};
+  auto* p = cx->arena.alloc(n);
+  p[0] = std::byte{'\\'};
+  p[1] = std::byte{'x'};
+  for (std::size_t i = 0; i < t->size(); ++i) {
+    auto x = std::to_integer<unsigned>((*t)[i]);
+    p[2 + 2 * i] = static_cast<std::byte>(kHex[x >> 4U]);
+    p[3 + 2 * i] = static_cast<std::byte>(kHex[x & 15U]);
+  }
+  return cx->make_view(p, n);
+  BC_GUARD_END(cx)
+  return {};
+}
+
+int64_t bc_f64_to_int(bc_ctx* cx, double v, uint32_t int_type, uint32_t object_id) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return 0;
+  auto k = int_kind_of(int_type);
+  if (!k) {
+    cx->fail(BC_E_HANDLE, "bc_f64_to_int: an unknown integer type");
+    return 0;
+  }
+  try {
+    return sqlt::float_to_integer(v, sqlt::SqlType{*k});
+  } catch (const sqlt::TextError& e) {
+    fail_cast(cx, e, *k, object_id);
+    return 0;
+  }
+  BC_GUARD_END(cx)
+  return 0;
+}
+
+int64_t bc_decimal_rescale(bc_ctx* cx, int64_t v, uint32_t from_scale, uint32_t to_type, uint32_t precision, uint32_t to_scale,
+                           uint32_t object_id) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return 0;
+  auto kind = sql_kind_of(to_type);
+  std::optional<sqlt::SqlType> to;
+  if (kind && integer_kind(*kind) && precision == 0 && to_scale == 0) to = sqlt::SqlType{*kind};
+  if (kind == sqlt::SqlKind::Decimal) to = decimal_type(precision, to_scale);
+  if (!to || from_scale > sqlt::kMaxDecimalPrecision) {
+    cx->fail(BC_E_HANDLE, "bc_decimal_rescale: not an integer type or a DECIMAL, or a scale past 18");
+    return 0;
+  }
+  try {
+    return sqlt::rescale_decimal(v, static_cast<std::uint8_t>(from_scale), *to);
+  } catch (const sqlt::TextError& e) {
+    fail_cast(cx, e, to->kind, object_id);
+    return 0;
+  }
+  BC_GUARD_END(cx)
+  return 0;
+}
+
+double bc_decimal_to_f64(bc_ctx* cx, int64_t v, uint32_t scale, bool real) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return 0.0;
+  if (scale > sqlt::kMaxDecimalPrecision) {
+    cx->fail(BC_E_HANDLE, "bc_decimal_to_f64: a scale past 18");
+    return 0.0;
+  }
+  return sqlt::decimal_to_float(v, static_cast<std::uint8_t>(scale), real);
+  BC_GUARD_END(cx)
+  return 0.0;
+}
+
+int64_t bc_f64_to_decimal(bc_ctx* cx, double v, bool real, uint32_t precision, uint32_t scale, uint32_t object_id) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return 0;
+  auto to = decimal_type(precision, scale);
+  if (!to) {
+    cx->fail(BC_E_HANDLE, "bc_f64_to_decimal: not a DECIMAL's precision and scale");
+    return 0;
+  }
+  try {
+    return sqlt::float_to_decimal(v, real, *to);
+  } catch (const sqlt::TextError& e) {
+    fail_cast(cx, e, sqlt::SqlKind::Decimal, object_id);
+    return 0;
+  }
+  BC_GUARD_END(cx)
+  return 0;
+}
+
+double bc_f64_to_f32(bc_ctx* cx, double v) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return 0.0;
+  try {
+    return sqlt::double_to_real(v);
+  } catch (const sqlt::TextError& e) {
+    fail_cast(cx, e, sqlt::SqlKind::Real, 0);
+    return 0.0;
+  }
+  BC_GUARD_END(cx)
+  return 0.0;
+}
+
+double bc_i64_to_f32(int64_t v) { return bytecask::sql::integer_to_real(v); }
+
+int64_t bc_temporal_cast(bc_ctx* cx, int64_t v, uint32_t from_type, uint32_t to_type) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return 0;
+  auto from = sql_kind_of(from_type);
+  auto to = sql_kind_of(to_type);
+  if (!from || !to || !temporal_kind(*from) || !temporal_kind(*to) ||
+      sqlt::cast_kind(sqlt::SqlType{*from}, sqlt::SqlType{*to}) != sqlt::CastKind::Function) {
+    cx->fail(BC_E_HANDLE, "bc_temporal_cast: no cast between these date or time types");
+    return 0;
+  }
+  try {
+    return sqlt::convert_temporal(v, *from, *to);
+  } catch (const sqlt::TextError& e) {
+    fail_cast(cx, e, *to, 0);
+    return 0;
+  }
+  BC_GUARD_END(cx)
+  return 0;
 }
 
 bc_view bc_num_quotient(bc_ctx* cx, int64_t sum, int64_t count, uint32_t scale) {

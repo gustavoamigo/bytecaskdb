@@ -1131,8 +1131,9 @@ PostgreSQL refuses it (42804). Refused (0A000) until it has an order and arithme
 `ON`, `USING`, `NATURAL`, `NULLIF`, `IN`, `BETWEEN`, a `$n` beside it);
 `ORDER BY`, `GROUP BY`, `DISTINCT`, `UNION`, `INTERSECT`, `EXCEPT`; `+`,
 `-`, `*`, `/`, `%`, unary `-`, `abs`, `||`; an aggregate but `COUNT`, and
-`COUNT(DISTINCT …)`; a cast of it or to it (`'1.5'::numeric`,
-`$1::numeric`), but a `$n` cast to it assigned to it; a `DOUBLE PRECISION` or `REAL` value assigned
+`COUNT(DISTINCT …)`; a cast to it (`'1.5'::numeric`, `$1::numeric`),
+but jsonb's and a `$n` cast to it assigned to it, and a cast of it to
+other than text or `name`; a `DOUBLE PRECISION` or `REAL` value assigned
 to it, and it assigned to a column of another type; a subquery of it; a
 domain or procedure argument of it.
 
@@ -1238,7 +1239,8 @@ text_col`), which PostgreSQL cuts to 63 bytes, it is refused (0A000).
 **Refused**, with a message and the node's position: everything not above.
 That includes:
 - a `NUMERIC` column without a precision compared, ordered, grouped,
-  computed, aggregated (but by `COUNT`) or cast, or as a key (0A000,
+  computed, aggregated (but by `COUNT`), cast to other than text or
+  `name`, or as a key (0A000,
   *NUMERIC without a precision*);
 - a jsonb value compared, ordered, grouped, `DISTINCT`, or as a key, every
   operator and function of jsonb but its accessors, `jsonb_typeof` and
@@ -1296,8 +1298,13 @@ That includes:
   a `HAVING` comparing `MIN` or `MAX` of a `CHAR(n)`, or a grouped
   `CHAR(n)` column, with a text value, which PostgreSQL compares as text,
   trailing spaces counting (0A000, *MIN and MAX of text*, #904);
-- a cast of anything but a constant, a parameter, or a string value to
-  `text` or `varchar` of no length (a `NAME` to `name`); a cast of a
+- a cast to `VARCHAR(n)` or `CHAR(n)`, and of a float to text (42601,
+  #907); a cast of a `CHAR(n)` to other than a string type (0A000); a cast
+  to or from `NUMERIC` of no precision but jsonb to it and it to text or
+  `name` (0A000, *NUMERIC without a precision*); a cast in `UPDATE`'s
+  `SET` of other than a constant or a parameter (42601, #904 stage S1);
+  text in a date or time form the layer's input does not read, which
+  PostgreSQL reads (`'today'`), is 22007 (*Known differences*); a cast of a
   parameter to `DECIMAL`, `VARCHAR(n)` or `CHAR(n)`, to a type another use
   of it does not give it, or, in `VALUES` or `SET`, to other than its
   column's type; a cast parameter inside an expression in `SET` or
@@ -1358,7 +1365,10 @@ recompile after a DDL folds them again, to the types they meet then.
   to `VARCHAR(n)` or `CHAR(n)`, which PostgreSQL's cast truncates or pads,
   is not taken yet.
 - A cast of any other typed constant follows PostgreSQL's cast table
-  (`pg_cast`), and its I/O casts to and from a string:
+  (`pg_cast`), and its I/O casts to and from a string, by the one table and
+  the same cast functions a cast computed per row uses (`cast_kind` and
+  the cast functions of `sql/text.cppm`, #904 stage C1, *Casts of an
+  expression*):
   - a number to any number type: an integer to a narrower integer range
     checked (22003); a numeric to an integer rounded half away from zero, a
     float to the nearest even (`rint`), NaN and infinity 22003; to a
@@ -1367,8 +1377,10 @@ recompile after a DDL folds them again, to the types they meet then.
     22003 past its range;
   - `boolean` to `integer` (1 or 0) and `integer` to `boolean` (non-zero is
     true), and no other integer type either way;
-  - any type to `text` by its output function (`true`, not `t`); a float is
-    not taken yet, since the layer's float text is not PostgreSQL's;
+  - any type to `text` by its output function (`true`, not `t`), and to
+    `name` by its output function cut to 63 bytes (a boolean's `t`, the I/O
+    cast); a float is not taken yet, since the layer's float text is not
+    PostgreSQL's;
   - a typed string to any type by that type's input function;
   - every other pair is 42846, a NULL of it too (`NULL::integer::date`).
 - Integer arithmetic of constants is checked against its result type's
@@ -1376,7 +1388,9 @@ recompile after a DDL folds them again, to the types they meet then.
 - A cast of a date, time, timestamp or timestamptz constant: to text its
   text; to its own type itself; a timestamp or timestamptz to a date (the
   floor in UTC, so 1969-12-31 23:00 is 1969-12-31) or a time; a date to a
-  timestamp or timestamptz (22008 if the instant passes 64 bits); a
+  timestamp or timestamptz (22008 `date out of range for timestamp` past
+  294276 AD, and `timestamp out of range` past the layer's 64-bit
+  microseconds from 1970, some 30 years earlier); a
   timestamp to a timestamptz and back (the same microseconds, the session
   being UTC); a time with time zone to a time (its offset dropped), and a
   time or a timestamptz to a time with time zone (the time, or the
@@ -1633,7 +1647,7 @@ until then.
   reads their leading digits), so one column's quotient has several scales
   and the layer's result type has one. `REAL` and `DOUBLE PRECISION`
   arithmetic and comparison as a value (unary `-` and `abs` of one are
-  taken). A cast, an
+  taken). An
   aggregate inside an expression (an expression is taken inside an
   aggregate, *Aggregates*), an expression in the select list of an
   aggregated query or under `DISTINCT`, an expression in the `ORDER BY` of
@@ -2269,9 +2283,11 @@ WHERE" and "string function in a WHERE" gaps); `jsonb_design.md`,
 
 Status: **approved** by the owner on 2026-11-22, with every recommendation
 in *Open questions on #904*; tracking issue #904. Stage M1, `MIN` and `MAX`
-of text, is built (*MIN and MAX of text*, its as-built notes), and so is
+of text, is built (*MIN and MAX of text*, its as-built notes), and so are
 stage C0, the text input fixes (*Casts of an expression*, **Integer input,
-constants included**, its as-built notes); the other stages are not yet. It covers the six gaps #904 lists,
+constants included**, its as-built notes), and stage C1, casts of any
+expression (*Casts of an expression*, **As built (C1)**); the other stages
+are not yet. It covers the six gaps #904 lists,
 found while building jsonb stage 3: a cast of an expression, `GROUP BY`
 of an expression, `SELECT DISTINCT` and `COUNT(DISTINCT …)` of an
 expression, an expression in `UPDATE … SET` (#896), `MIN`/`MAX` of text,
@@ -2359,7 +2375,7 @@ inline pair list goes. `cast_kind` lives in `sql/text.cppm`
 | text to `boolean` | `'yes'` true | 22P02 `invalid input syntax for type boolean: "maybe"` |
 | text to `DECIMAL(p, s)` | rounded half away from zero to `s` | 22P02 `… type numeric: "x"`; 22003 `numeric field overflow`, DETAIL `A field with precision 2, scale 1 must round to an absolute value less than 10^1.`; `'Infinity'` 22003 `numeric field overflow`, DETAIL `A field with precision 3, scale 0 cannot hold an infinite value.`; `'NaN'` is NaN in PG 17, an error in the layer (below) |
 | text to `date`, `time`, `timestamp`, `timestamptz` | the input function's value | 22007 `invalid input syntax for type date: "x"`; 22008 `date/time field value out of range: "2024-02-30"` |
-| text to `bytea`, `jsonb` | the input function's value | 22P02 with the input function's DETAIL |
+| text to `bytea`, `jsonb` | the input function's value | 22P02 with the input function's DETAIL (bytea's names no value: `invalid input syntax for type bytea`); 22023 `invalid hexadecimal digit: "g"`, `invalid hexadecimal data: odd number of digits` |
 | integer to narrower integer | itself | 22003 `integer out of range` / `smallint out of range` (`3000000000::bigint::int`, `70000::int::smallint`), never a wrapped value |
 | date to timestamp(tz); timestamp(tz) to date or time; time to timetz and back | PG's value (midnight; the date or time part; UTC offset `+00`, dropped) | 22008 `date out of range for timestamp` (`'5874897-12-31'::date::timestamp`) |
 | real to double precision | exact | none |
@@ -2431,11 +2447,57 @@ does not (22P02); and a DECIMAL constant or parameter that is NaN or an
 infinity, compared (`WHERE d = 'Infinity'`, `WHERE d = $1`), is 22003
 where PG compares and matches no row (*Differences*).
 
+**As built (C1).** `cast_kind(from, to)` and `cast_refusal(from, to)` in
+`sql/text.cppm` are the one table: `cast_value` in the binder (a cast of
+anything that is not a constant or `$n`), `fold_cast` for a typed
+constant (it replaced `cast_typed`, `cast_temporal` and `integer_of`), the
+checker and codegen all ask it, and the cast functions beside it
+(`cast_from_text`, `cast_to_text`, `rescale_decimal`, `float_to_integer`,
+`float_to_decimal`, `decimal_to_float`, `double_to_real`,
+`integer_to_real`, `convert_temporal`) are what the constant fold and the
+plan API's helpers both call. So a constant gained what the shared
+functions do: `false::name` is `f` (boolout, the I/O cast; it was
+`false`), a date or time to `name` is its text (it was 42846),
+`'5874897-12-31'::date::timestamp` is 22008 `date out of range for
+timestamp`, a DECIMAL cast past its precision carries PG's DETAIL `A field
+with precision 3, scale 1 must round to an absolute value less than
+10^2.`, and `('1.5'::jsonb::numeric)::int` is 0A000 where it was an
+internal error (XX000). Found while building it:
+
+- **bytea input's errors** are PG 17's `byteain` and `hex_decode`'s: a bad
+  escape is 22P02 `invalid input syntax for type bytea`, naming no value,
+  unlike the other input functions; in the hex format a character that is
+  not a hex digit, high or low, is 22023 `invalid hexadecimal digit: "g"`
+  (a UTF-8 character named whole, and only space, tab, newline and return
+  skipped between pairs), and `odd number of digits` only when the text
+  ends after a high digit. The constant fold had quoted the value and
+  reported a bad low digit as odd digits.
+
+- A **relabel over a cast** is a node of its own: `bo::name::text` must
+  keep the inner cast's type (`name`, which prints `t`), so retyping the
+  operand, which a relabel of anything else does, would have printed
+  `true`. The checker takes a relabel `Cast` only over a `Cast`.
+- **`NUMERIC` of no precision to text** is taken, constants and values
+  alike: a `NUMERIC` value is its `numeric_out` text, so `v::text` and
+  `avg(a)`'s text need no evaluator (open question 2 kept every other
+  pair 0A000, and the constant fold already took this one).
+- **`CHAR(n)` to a type other than a string** is refused (0A000): PG's I/O
+  cast reads the padded text (`'ab'::char(3)::int` names `"ab "` in its
+  22P02, and `::bytea` keeps the spaces), which the layer does not hold.
+- **The layer's `TIMESTAMP` ends some 30 years before PG's** (its
+  microseconds count from 1970, PG's from 2000): a date between
+  294247-01-11 and 294276-12-31 cast to a timestamp is 22008 `timestamp out
+  of range` where PG returns a value; past it, PG's own 22008.
+- An integer's range message from the input function (`value "3000000000"
+  is out of range for type integer`) is `BC_C_RANGE`, so the API's
+  `range_sqlstate` knows its start and maps it to 22003.
+
 **What stays refused.**
 
 | Cast | SQLSTATE | Why |
 |---|---|---|
-| to or from `NUMERIC` of no precision, other than jsonb to `numeric` | 0A000, as today (`refuse_numeric`) | open question 2 |
+| to or from `NUMERIC` of no precision, other than jsonb to `numeric` and `NUMERIC` to text or `name` | 0A000, as today (`refuse_numeric`) | open question 2 |
+| of a `CHAR(n)` to other than text, `varchar` or `name` | 0A000 | PG's I/O cast reads the padded text, which the layer does not hold (as built) |
 | of a value to `VARCHAR(n)` or `CHAR(n)` | 42601, as a constant's is today | PG truncates and pads; open question 3 |
 | of a REAL or DOUBLE PRECISION to text | 42601, as a constant's is today (`cast_typed`, :1460) | the layer's float text is not `float8out`'s; open question 4 |
 | to `text[]`, `varchar[]` or any array | as today (*ARRAY[ARRAY[…]] and casts to text[]*) | not a type the layer has |
@@ -2983,7 +3045,7 @@ tests.
 |---|---|---|---|
 | M1 | `MIN`/`MAX` of text: the plan API's bytes slot, a stream's holder; depends on no other stage | `SELECT max(Id) …`, `min(Props->>'k')` | ~700 lines: binder 40, physical 40, codegen 120, plan API 180, tests 270, docs 50 |
 | C0 (built) | input fixes shared by constants, parameters and (later) casts: `integer_from` (`0x`, `0o`, `0b`, `_`, the value in its 22003), `float_from`'s `real` (`strtof`, its message), `decimal_from`'s `'Infinity'`; the `ARRAY[ARRAY]` message | `'0x1F'::int`, a hex integer parameter | ~300 lines: text 90, binder 10, tests 170, docs 30 |
-| C1 | casts of expressions: `cast_kind`, the `Cast` kind replacing `JsonbCast`, the plan API's cast helpers, cast naming; casts in procedure expressions | `WHERE (Props->>'x')::bigint > $1`, `ORDER BY (Props->>'n')::int`, `sum((Props->>'n')::int)`, `$1::text::int` | ~1,150 lines: binder 190, physical 50, codegen 150, plan API 330, tests 370, docs 60 |
+| C1 (built) | casts of expressions: `cast_kind`, the `Cast` kind replacing `JsonbCast`, the plan API's cast helpers, cast naming; casts in procedure expressions | `WHERE (Props->>'x')::bigint > $1`, `ORDER BY (Props->>'n')::int`, `sum((Props->>'n')::int)`, `$1::text::int` | ~1,150 lines: binder 190, physical 50, codegen 150, plan API 330, tests 370, docs 60 |
 | S1 | expressions in `SET` with the assignment table, the store shared with `INSERT … SELECT` (closes #824), column-order evaluation, `$n::T` of another type; needs C1's output and rounding helpers | `UPDATE … SET Message = lower(Message)`, `SET n = (Props->>'n')::int`, `SET s = Props->>'k'`, `SET flag = CASE … END`; with jsonb stage 4, `SET Props = jsonb_set(Props, $2, $3)` | ~950 lines: binder 240, physical 60, codegen 130, tests 440, docs 80 |
 | G0 | `GROUP BY` positions and output names over **column** items (the input-column-first rule, 42P10, 42702, 42601 for a non-integer constant); binder only, keys stay columns; a position naming an expression item stays 42601 until G1 | `SELECT UserId, count(*) … GROUP BY 1` | ~350 lines: parser 60, binder 110, tests 160, docs 20 |
 | G1 | `GROUP BY` of expressions (positions naming one included), keys the same for every row; `SELECT DISTINCT` of expressions; `same_expr` extended; the grouped resolver's exact-key case; `GroupKey`; expression keys in the structure, never streamed | `SELECT Props->>'k', count(*) … GROUP BY 1`, `SELECT DISTINCT Props->>'type'` | ~1,050 lines: binder 190, logical 30, search 140, physical 80, codegen 180, tests 390, docs 40 |
@@ -2997,8 +3059,13 @@ open question 12 and stage P.
 
 - **Text to date and time types.** The layer's input functions read fewer
   forms than PG's `DateTime` parser: `'today'`, `'epoch'`, `'infinity'`,
-  `'Jan 1 2024'` and `'20240101'` are values in PG 17 and 22007 in the
-  layer (open question 5). A string the layer does read gives PG's value.
+  `'Jan 1 2024'`, `'20240101'` and a timestamp's text read as a `time`
+  (`'2024-01-01 10:00'::time` is `10:00:00` in PG 17) are values in PG 17
+  and 22007 in the layer (open question 5). A string the layer does read
+  gives PG's value.
+- **Dates near the end of `TIMESTAMP`.** A date from 294247-01-11 to
+  294276-12-31 cast to a timestamp is 22008 `timestamp out of range` in the
+  layer, a value in PG 17 (as built, C1).
 - **Float text.** A REAL or DOUBLE PRECISION cast, or assigned, to text
   stays refused (open question 4).
 - **Hexadecimal floats.** `'0x1F'::float8` is 31 and `'0x1.8p1'::float8`
@@ -3423,6 +3490,13 @@ fail on them.
   is refused (0A000) until it is dropped and created again: a `SELECT *`
   view after `ALTER TABLE … ADD COLUMN`. PostgreSQL keeps the columns the
   star gave it.
+
+- **A cast computed per row errs where PG 17 returns a value** in the
+  cases *Differences from PG 17 left after #904* lists: text the layer's
+  date and time input does not read (`'today'`, a timestamp's text as a
+  `time`), NaN into a `DECIMAL(p, s)`, a date in the last 30 years of
+  PG's `TIMESTAMP`, hexadecimal floats, and `0x`, `0o`, `0b` or `_` in a
+  `DECIMAL`'s text (#911); it never gives another value.
 
 - **`ON CONFLICT DO NOTHING` skips a row whose conflicting row a
   concurrent commit deletes** (owner decision, 2026-11-19). The check reads

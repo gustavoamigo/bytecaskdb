@@ -1,6 +1,12 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 23 (revision 23 with `bc_agg_min_bytes`,
+Status: **built**, revision 24 (revision 24 with the cast helpers,
+`enum bc_sql_type`, `bc_text_in_i64`, `_f64`, `_bool` and `_bytes`,
+`bc_value_text` (which replaced `bc_number_text`), `bc_bytea_text`,
+`bc_f64_to_int`, `bc_decimal_rescale`, `bc_decimal_to_f64`,
+`bc_f64_to_decimal`, `bc_f64_to_f32`, `bc_i64_to_f32` and
+`bc_temporal_cast`, for casts of any expression (#904, stage C1,
+*Casts computed per row* below); revision 23 with `bc_agg_min_bytes`,
 `bc_agg_max_bytes` and `bc_agg_bytes`, `MIN` and `MAX` of text (#904,
 stage M1); revision 22 with jsonb's accessors and casts
 out, `bc_jsonb_field`, `bc_jsonb_element`, `bc_jsonb_path` and their `_text`
@@ -831,7 +837,8 @@ bool    bc_bytes_eq(bc_ctx *, bc_view, bc_view);
 int     bc_bytes_cmp(bc_ctx *, bc_view, bc_view);       /* memcmp order */
 bool    bc_bytes_prefix(bc_ctx *, bc_view prefix, bc_view);
 bc_view bc_concat(bc_ctx *, bc_view a, bc_view b);             /* a then b: new bytes the statement holds */
-bc_view bc_number_text(bc_ctx *, int64_t v, uint32_t scale);    /* an integer or a DECIMAL at `scale`, as PostgreSQL prints it */
+bc_view bc_value_text(bc_ctx *, int64_t v, uint32_t sql_type, uint32_t scale);  /* an integer, a DECIMAL at `scale`, a date
+                                                   or time type or a BOOLEAN as PostgreSQL prints it (revision 24) */
 bc_view bc_num_quotient(bc_ctx *, int64_t sum, int64_t count, uint32_t scale);  /* PostgreSQL's AVG of an integer or a
                                                    DECIMAL, numeric text (BC_T_NUM): numeric_div of sum, at `scale`,
                                                    by count at select_div_scale's scale, rounded half away from
@@ -889,6 +896,38 @@ order, so `-0.0` equals `0.0` and NaN equals NaN and is above every other
 value. A filter on a DOUBLE or REAL column compares by it
 (`bc_cmp_f64(a, b) < 0` for `a < b`); C's operators would make NaN equal to
 nothing and below nothing. It allocates nothing and cannot fail.
+
+#### Casts computed per row
+
+Revision 24 (#904, stage C1; `planner_design.md`, *Plan API calls for
+runtime casts*, whose table and as-built notes are the reference). Each is
+a thin wrapper over a cast function of `sql/text.cppm`, the one the
+binder's constant fold calls, so a constant and a row's value cast alike.
+
+```c
+enum bc_sql_type { BC_TYPE_SMALLINT = 1, /* … the layer's SqlKind codes … */ BC_TYPE_JSONB };
+int64_t bc_text_in_i64(bc_ctx *, bc_view text, uint32_t sql_type, uint32_t precision, uint32_t scale, uint32_t object_id);
+double  bc_text_in_f64(bc_ctx *, bc_view text, uint32_t sql_type);
+bool    bc_text_in_bool(bc_ctx *, bc_view text);
+bc_view bc_text_in_bytes(bc_ctx *, bc_view text, uint32_t sql_type);   /* BYTEA, or NAME cut to 63 bytes */
+bc_view bc_value_text(bc_ctx *, int64_t v, uint32_t sql_type, uint32_t scale);
+bc_view bc_bytea_text(bc_ctx *, bc_view b);
+int64_t bc_f64_to_int(bc_ctx *, double v, uint32_t int_type, uint32_t object_id);
+int64_t bc_decimal_rescale(bc_ctx *, int64_t v, uint32_t from_scale, uint32_t to_type, uint32_t precision, uint32_t to_scale,
+                           uint32_t object_id);
+double  bc_decimal_to_f64(bc_ctx *, int64_t v, uint32_t scale, bool real);
+int64_t bc_f64_to_decimal(bc_ctx *, double v, bool real, uint32_t precision, uint32_t scale, uint32_t object_id);
+double  bc_f64_to_f32(bc_ctx *, double v);
+double  bc_i64_to_f32(int64_t v);
+int64_t bc_temporal_cast(bc_ctx *, int64_t v, uint32_t from_type, uint32_t to_type);
+```
+
+An integer or DECIMAL result outside its type is `BC_E_CONSTRAINT`,
+`BC_C_RANGE` on `object_id`, with PostgreSQL's message and a DECIMAL's
+DETAIL in `bc_error_note`; any other error is `BC_E_DATA` with its
+SQLSTATE, message and DETAIL. An input helper charges its text's size (twice
+for `bc_text_in_bytes`) before it parses and releases it after; the views
+it and the output helpers make are the step's arena's, charged.
 
 `bc_check_int` is the range check of a computed integer: it returns `v` when it is inside the SQL type the
 compiler resolved, `BC_SMALLINT` or `BC_INTEGER`, and otherwise sets

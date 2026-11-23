@@ -211,6 +211,73 @@ struct DateUnit {
 // layer's one time zone. `f` is one date_field_built takes.
 [[nodiscard]] auto extract_field(DateField f, SqlKind source, std::int64_t v) -> std::int64_t;
 
+// Casts between the layer's types (docs/frontend_design.md, *Casts of an
+// expression*): the one list of which casts exist, shared by the binder's
+// constant fold, the checker (plan/physical.cppm), codegen and the plan
+// API's cast helpers, so a constant, a parameter and a value computed per
+// row cast alike or are refused alike.
+//
+// What a cast does, as pg_cast and CoerceViaIO say: nothing (a relabel:
+// the bytes kept, the type changed); a function of the value; the output
+// function of one type read by the input function of the other (a string
+// on either side); or no cast at all (42846).
+enum class CastKind : std::uint8_t { None, Relabel, Function, InOut };
+[[nodiscard]] auto cast_kind(SqlType from, SqlType to) -> CastKind;
+
+// A cast PostgreSQL has that the layer does not take yet, and why: to or
+// from NUMERIC of no precision (but jsonb to it, and it to a string type,
+// its text); to VARCHAR(n) or CHAR(n), which cut and pad; a float to a
+// string, whose text is not float8out's yet; a CHAR(n) to other than a
+// string type, whose padded text the layer does not hold; jsonb to
+// DECIMAL(p, s). None for a cast cast_kind says is none or a relabel.
+enum class CastRefusal : std::uint8_t { None, Numeric, Length, FloatText, CharInput, JsonbDecimal };
+[[nodiscard]] auto cast_refusal(SqlType from, SqlType to) -> CastRefusal;
+
+// The cast functions, of a value not NULL. Each throws TextError with
+// PostgreSQL 17's SQLSTATE, message and DETAIL.
+//
+// Text read by `to`'s input function, as a cast reads it: a DECIMAL rounded
+// half away from zero to its scale, and outside its precision 22003
+// "numeric field overflow" with numeric's DETAIL; any other value outside
+// the type out_of_range's message (22003, 22008). from_text's errors else.
+[[nodiscard]] auto cast_from_text(std::string_view text, SqlType to) -> Datum;
+// A value's text as a cast to TEXT or NAME gives it: a BOOLEAN's is
+// booltext's ("true") to text and boolout's ("t") to a name, which is an
+// I/O cast; a CHAR(n)'s without trailing spaces (rtrim1); every other
+// type's output function's (to_text). Cut to a NAME's 63 bytes for `to`
+// NAME.
+[[nodiscard]] auto cast_to_text(const Datum& v, SqlType from, SqlType to) -> std::string;
+// A DECIMAL at `from_scale` (an integer at 0) as `to`: an integer type,
+// rounded half away from zero, outside it "integer out of range" (22003,
+// the type's name); or a DECIMAL(p, s), rounded half away from zero to s,
+// past p 22003 "numeric field overflow" with numeric's DETAIL.
+[[nodiscard]] auto rescale_decimal(std::int64_t v, std::uint8_t from_scale, SqlType to) -> std::int64_t;
+// numeric's 22003 DETAIL for a value past DECIMAL(p, s)'s precision.
+[[nodiscard]] auto decimal_overflow_detail(SqlType to) -> std::string;
+// A float as an integer type: rint (ties to even); NaN, an infinity or a
+// value outside the type 22003 "integer out of range" (the type's name).
+[[nodiscard]] auto float_to_integer(double d, SqlType to) -> std::int64_t;
+// A float as DECIMAL(p, s), as float8_numeric (float4_numeric for `real`)
+// reads it: its 15 (6) significant digits' text, read by numeric's input
+// and rounded to s. NaN and the infinities 22003 with numeric's DETAIL.
+[[nodiscard]] auto float_to_decimal(double d, bool real, SqlType to) -> std::int64_t;
+// A DECIMAL as a double, or the nearest REAL (as a double) for `real`: its
+// decimal text read correctly rounded, as numeric_float8 and
+// numeric_float4 read it. Never fails.
+[[nodiscard]] auto decimal_to_float(std::int64_t v, std::uint8_t scale, bool real) -> double;
+// A double as the nearest REAL: 22003 "value out of range: overflow" or
+// "underflow" for a finite value REAL does not reach.
+[[nodiscard]] auto double_to_real(double d) -> double;
+// An integer as the nearest REAL, rounded once (int8 to float4 is not
+// int8 to float8 to float4).
+[[nodiscard]] auto integer_to_real(std::int64_t v) -> double;
+// A date or time value as another date or time type (cast_kind's function
+// casts between them): a date to a timestamp at midnight, 22008 "date out
+// of range for timestamp" past 294276 AD; a timestamp to its date or time
+// of day (in UTC); a time to a time with time zone at offset 0, and back;
+// a timestamp to a timestamptz and back, unchanged in the layer's UTC.
+[[nodiscard]] auto convert_temporal(std::int64_t v, SqlKind from, SqlKind to) -> std::int64_t;
+
 }  // namespace bytecask::sql
 
 namespace bytecask::sql {
@@ -841,19 +908,30 @@ auto hex_digit(char c) -> int {
   return -1;
 }
 
+// PG's hex_decode: only these four separate digit pairs, and a bad digit is
+// named whole (a UTF-8 character, not its first byte).
+auto hex_space(char c) -> bool { return c == ' ' || c == '\n' || c == '\t' || c == '\r'; }
+
+[[noreturn]] void bad_hex_digit(std::string_view s, std::size_t at) {
+  auto lead = static_cast<unsigned char>(s[at]);
+  auto len = lead >= 0xF0 ? 4U : lead >= 0xE0 ? 3U : lead >= 0xC0 ? 2U : 1U;
+  throw TextError("invalid hexadecimal digit: \"" + std::string{s.substr(at, len)} + "\"", "22023");
+}
+
 auto bytea_from(std::string_view text) -> Bytes {
   Bytes out;
   if (text.starts_with("\\x")) {
     auto s = text.substr(2);
     for (std::size_t i = 0; i < s.size();) {
-      if (is_space(s[i])) {
+      if (hex_space(s[i])) {
         ++i;
         continue;
       }
       auto hi = hex_digit(s[i]);
-      auto lo = i + 1 < s.size() ? hex_digit(s[i + 1]) : -1;
-      if (hi < 0) throw TextError("invalid hexadecimal digit: \"" + std::string(1, s[i]) + "\"", "22023");
-      if (lo < 0) throw TextError("invalid hexadecimal data: odd number of digits", "22023");
+      if (hi < 0) bad_hex_digit(s, i);
+      if (i + 1 >= s.size()) throw TextError("invalid hexadecimal data: odd number of digits", "22023");
+      auto lo = hex_digit(s[i + 1]);
+      if (lo < 0) bad_hex_digit(s, i + 1);
       out.push_back(static_cast<std::byte>(hi * 16 + lo));
       i += 2;
     }
@@ -877,7 +955,8 @@ auto bytea_from(std::string_view text) -> Bytes {
       i += 4;
       continue;
     }
-    bad_text("bytea", text);
+    // PG's byteain names no value here, unlike the other input functions.
+    throw TextError("invalid input syntax for type bytea", "22P02");
   }
   return out;
 }
@@ -1283,6 +1362,219 @@ auto numeric_in(std::string_view text) -> std::string {
   rest_is_space(at + parts.end);
   if (!numeric_in_range(parts)) numeric_overflow();
   return numeric_text(negative, parts, std::string_view{digits}.substr(0, parts.ndigits));
+}
+
+namespace {
+
+auto is_integer_kind(SqlKind k) -> bool { return k == SqlKind::SmallInt || k == SqlKind::Integer || k == SqlKind::BigInt; }
+auto is_float_kind(SqlKind k) -> bool { return k == SqlKind::Real || k == SqlKind::Double; }
+auto is_string_kind(SqlKind k) -> bool {
+  return k == SqlKind::Text || k == SqlKind::Varchar || k == SqlKind::Char || k == SqlKind::Name;
+}
+auto is_number_kind(SqlKind k) -> bool {
+  return is_integer_kind(k) || is_float_kind(k) || k == SqlKind::Decimal || k == SqlKind::Numeric;
+}
+auto is_instant(SqlKind k) -> bool { return k == SqlKind::Timestamp || k == SqlKind::TimestampTz; }
+
+auto integer_name(SqlKind k) -> std::string {
+  return k == SqlKind::SmallInt ? "smallint" : k == SqlKind::Integer ? "integer" : "bigint";
+}
+
+[[noreturn]] void integer_out_of_range(SqlKind k) { throw TextError(integer_name(k) + " out of range", "22003"); }
+
+// 294277-01-01, PostgreSQL's TIMESTAMP_END_JULIAN, in days since 1970-01-01.
+constexpr std::int64_t kEndTimestampDays = 106'762'940;
+
+}  // namespace
+
+auto cast_kind(SqlType from, SqlType to) -> CastKind {
+  using K = SqlKind;
+  auto f = from.kind;
+  auto t = to.kind;
+  if (from == to) return CastKind::Relabel;
+  // To a string type: of a text, a relabel (VARCHAR of no length is TEXT);
+  // a CHAR(n)'s text without its trailing spaces, a name's cut, and a
+  // length's cut or pad are functions; any other type's output function.
+  if (is_string_kind(t)) {
+    if (t == K::Text && (f == K::Text || f == K::Varchar || f == K::Name)) return CastKind::Relabel;
+    if (is_string_kind(f)) return CastKind::Function;
+    return f == K::Boolean && t != K::Name ? CastKind::Function : CastKind::InOut;  // booltext; boolout to a name
+  }
+  // From a string type: the target's input function.
+  if (is_string_kind(f)) return CastKind::InOut;
+  switch (t) {
+    case K::SmallInt:
+    case K::Integer:
+    case K::BigInt:
+      if (is_number_kind(f) || f == K::Jsonb || (f == K::Boolean && t == K::Integer)) return CastKind::Function;
+      return CastKind::None;
+    case K::Real:
+    case K::Double:
+    case K::Decimal:
+    case K::Numeric: return is_number_kind(f) || f == K::Jsonb ? CastKind::Function : CastKind::None;
+    case K::Boolean: return f == K::Integer || f == K::Jsonb ? CastKind::Function : CastKind::None;
+    case K::Date: return is_instant(f) ? CastKind::Function : CastKind::None;
+    case K::Time: return is_instant(f) || f == K::TimeTz ? CastKind::Function : CastKind::None;
+    case K::Timestamp:
+    case K::TimestampTz: return f == K::Date || is_instant(f) ? CastKind::Function : CastKind::None;
+    case K::TimeTz: return f == K::Time || f == K::TimestampTz ? CastKind::Function : CastKind::None;
+    case K::Bytea:
+    case K::Jsonb: return CastKind::None;
+    case K::Text:
+    case K::Varchar:
+    case K::Char:
+    case K::Name: break;  // above
+  }
+  return CastKind::None;
+}
+
+auto cast_refusal(SqlType from, SqlType to) -> CastRefusal {
+  using K = SqlKind;
+  auto kind = cast_kind(from, to);
+  if (kind == CastKind::None || kind == CastKind::Relabel) return CastRefusal::None;
+  if (to.kind == K::Varchar || to.kind == K::Char) return CastRefusal::Length;
+  if (from.kind == K::Numeric && to.kind != K::Text && to.kind != K::Name) return CastRefusal::Numeric;
+  if (to.kind == K::Numeric && from.kind != K::Jsonb) return CastRefusal::Numeric;
+  if (is_float_kind(from.kind) && is_string_kind(to.kind)) return CastRefusal::FloatText;
+  if (from.kind == K::Char && !is_string_kind(to.kind)) return CastRefusal::CharInput;
+  if (from.kind == K::Jsonb && to.kind == K::Decimal) return CastRefusal::JsonbDecimal;
+  return CastRefusal::None;
+}
+
+auto decimal_overflow_detail(SqlType to) -> std::string {
+  // numeric's apply_typmod: 10^0 is written 1.
+  auto digits = static_cast<int>(to.precision) - static_cast<int>(to.scale);
+  return "A field with precision " + std::to_string(to.precision) + ", scale " + std::to_string(to.scale) +
+         " must round to an absolute value less than " + (digits > 0 ? "10^" + std::to_string(digits) : std::string{"1"}) +
+         ".";
+}
+
+auto cast_from_text(std::string_view text, SqlType to) -> Datum {
+  Datum d;
+  try {
+    d = from_text(text, to, true);
+  } catch (const TextError& e) {
+    // Past 64 bits: the same overflow as past the precision, with its DETAIL.
+    if (to.kind == SqlKind::Decimal && e.detail().empty() && std::string_view{e.what()} == "numeric field overflow") {
+      throw TextError("numeric field overflow", "22003", decimal_overflow_detail(to), "");
+    }
+    throw;
+  }
+  if (auto why = out_of_range(to, d)) {
+    if (to.kind == SqlKind::Decimal) throw TextError(*why, "22003", decimal_overflow_detail(to), "");
+    auto state = range_sqlstate(*why);
+    throw TextError(*why, state == "22008" ? "22008" : state == "22021" ? "22021" : state == "22001" ? "22001" : "22003");
+  }
+  return d;
+}
+
+auto cast_to_text(const Datum& v, SqlType from, SqlType to) -> std::string {
+  std::string out;
+  if (from.kind == SqlKind::Boolean) {
+    auto b = std::get<bool>(v);
+    out = to.kind == SqlKind::Name ? (b ? "t" : "f") : (b ? "true" : "false");
+  } else {
+    out = to_text(v, from);
+    if (from.kind == SqlKind::Char) {
+      while (!out.empty() && out.back() == ' ') out.pop_back();
+    }
+  }
+  if (to.kind == SqlKind::Name) {
+    auto b = std::as_bytes(std::span{out.data(), out.size()});
+    out.resize(name_prefix(b).size());
+  }
+  return out;
+}
+
+auto rescale_decimal(std::int64_t v, std::uint8_t from_scale, SqlType to) -> std::int64_t {
+  auto to_scale = to.kind == SqlKind::Decimal ? to.scale : std::uint8_t{0};
+  if (from_scale > kMaxDecimalPrecision || to_scale > kMaxDecimalPrecision) {
+    throw std::invalid_argument{"a DECIMAL scale past 18"};
+  }
+  auto overflow = [&] [[noreturn]] {
+    if (to.kind == SqlKind::Decimal) throw TextError("numeric field overflow", "22003", decimal_overflow_detail(to), "");
+    integer_out_of_range(to.kind);
+  };
+  // The magnitude, INT64_MIN's too, rounded half away from zero.
+  auto negative = v < 0;
+  auto mag = negative ? 0 - static_cast<std::uint64_t>(v) : static_cast<std::uint64_t>(v);
+  if (to_scale >= from_scale) {
+    auto factor = static_cast<std::uint64_t>(kPowersOfTen[to_scale - from_scale]);
+    if (mag != 0 && mag > std::numeric_limits<std::uint64_t>::max() / factor) overflow();
+    mag *= factor;
+  } else {
+    auto unit = static_cast<std::uint64_t>(kPowersOfTen[from_scale - to_scale]);
+    auto rest = mag % unit;
+    mag /= unit;
+    if (rest >= unit - rest) ++mag;  // 2 * rest >= unit, without overflow
+  }
+  auto limit = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+  if (mag > limit + (negative ? 1U : 0U)) overflow();
+  auto out = negative ? static_cast<std::int64_t>(0 - mag) : static_cast<std::int64_t>(mag);
+  if (out_of_range(to.kind == SqlKind::Decimal ? to : SqlType{to.kind}, out)) overflow();
+  return out;
+}
+
+auto float_to_integer(double d, SqlType to) -> std::int64_t {
+  auto r = std::rint(d);
+  // 2^63 is the first double past int64_t; -2^63 is in range.
+  if (!std::isfinite(r) || r >= 9223372036854775808.0 || r < -9223372036854775808.0) integer_out_of_range(to.kind);
+  auto v = static_cast<std::int64_t>(r);
+  if (out_of_range(SqlType{to.kind}, v)) integer_out_of_range(to.kind);
+  return v;
+}
+
+auto float_to_decimal(double d, bool real, SqlType to) -> std::int64_t {
+  auto special = [&](std::string_view what) {
+    throw TextError("numeric field overflow", "22003",
+                    "A field with precision " + std::to_string(to.precision) + ", scale " + std::to_string(to.scale) +
+                        " cannot hold " + std::string{what} + ".",
+                    "");
+  };
+  if (std::isnan(d)) special("NaN");
+  if (std::isinf(d)) special("an infinite value");
+  std::array<char, 64> buf{};
+  auto r = real ? std::to_chars(buf.data(), buf.data() + buf.size(), static_cast<float>(d), std::chars_format::general, 6)
+                : std::to_chars(buf.data(), buf.data() + buf.size(), d, std::chars_format::general, 15);
+  return std::get<std::int64_t>(cast_from_text(std::string_view{buf.data(), static_cast<std::size_t>(r.ptr - buf.data())}, to));
+}
+
+auto decimal_to_float(std::int64_t v, std::uint8_t scale, bool real) -> double {
+  auto text = decimal_text(v, scale);
+  if (real) {
+    float f = 0;
+    (void)std::from_chars(text.data(), text.data() + text.size(), f);
+    return static_cast<double>(f);
+  }
+  double d = 0;
+  (void)std::from_chars(text.data(), text.data() + text.size(), d);
+  return d;
+}
+
+auto double_to_real(double d) -> double {
+  if (auto why = out_of_range(SqlType{SqlKind::Real}, d)) throw TextError(*why, "22003");
+  return static_cast<double>(static_cast<float>(d));
+}
+
+auto integer_to_real(std::int64_t v) -> double { return static_cast<double>(static_cast<float>(v)); }
+
+auto convert_temporal(std::int64_t v, SqlKind from, SqlKind to) -> std::int64_t {
+  using K = SqlKind;
+  auto day_of = [](std::int64_t us) { return floor_div(us, kMicrosPerDay); };
+  if (from == to || (is_instant(from) && is_instant(to))) return v;
+  if (from == K::Date && is_instant(to)) {
+    if (v >= kEndTimestampDays) throw TextError("date out of range for timestamp", "22008");
+    // The layer's microseconds count from 1970, not 2000: its TIMESTAMP ends
+    // about 30 years before PostgreSQL's (docs/types_design.md).
+    if (v > std::numeric_limits<std::int64_t>::max() / kMicrosPerDay) throw TextError("timestamp out of range", "22008");
+    return v * kMicrosPerDay;  // kMinDate's micros are kMinTimestamp: in range
+  }
+  if (is_instant(from) && to == K::Date) return day_of(v);
+  if (is_instant(from) && to == K::Time) return v - day_of(v) * kMicrosPerDay;
+  if (from == K::TimestampTz && to == K::TimeTz) return timetz_pack({v - day_of(v) * kMicrosPerDay, 0});
+  if (from == K::Time && to == K::TimeTz) return timetz_pack({v, 0});
+  if (from == K::TimeTz && to == K::Time) return timetz_unpack(v).time;
+  throw std::invalid_argument{"convert_temporal: no cast between these types"};
 }
 
 }  // namespace bytecask::sql

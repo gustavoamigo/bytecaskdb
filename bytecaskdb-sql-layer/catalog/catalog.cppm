@@ -280,9 +280,10 @@ struct ComparedType {
 [[nodiscard]] auto out_of_range(SqlType t, BytesView v) -> std::optional<std::string>;
 [[nodiscard]] inline auto out_of_range(SqlType, bool) -> std::optional<std::string> { return std::nullopt; }
 [[nodiscard]] auto out_of_range(SqlType t, const Datum& d) -> std::optional<std::string>;
-// The SQLSTATE PostgreSQL reports for an out_of_range message, found by how
-// it starts (a message may go on: "… for parameter $2"): 22003, 22001,
-// 22021 or 22008. Empty for a message out_of_range never writes.
+// The SQLSTATE PostgreSQL reports for an out_of_range message, or an integer
+// input's range message a cast raises as BC_C_RANGE (value "…" is out of
+// range for type integer), found by how it starts (a message may go on:
+// "… for parameter $2"): 22003, 22001, 22021 or 22008. Empty for any other.
 [[nodiscard]] auto range_sqlstate(std::string_view message) noexcept -> std::string_view;
 // Every message start range_sqlstate knows, with its SQLSTATE: a test makes
 // out_of_range write each one.
@@ -1758,6 +1759,7 @@ constexpr RangeMessage kRangeMessages[] = {
     {"smallint out of range", "22003"},
     {"bigint out of range", "22003"},
     {"integer out of range", "22003"},
+    {"value \"", "22003"},  // an integer type's input: value "…" is out of range for type integer
     {"value out of range: overflow", "22003"},   // REAL
     {"value out of range: underflow", "22003"},  // REAL
     {"numeric field overflow", "22003"},         // DECIMAL(p, s)

@@ -69,7 +69,7 @@ struct ColumnRef {
 // expressions) only.
 struct Expr {
   enum class Kind { Column, Param, Const, Add, Sub, Mul, Div, Compare, Aggregate, And, Or, Not, IsNull, Like, Truth, InSet, Case, Coalesce,
-                    Concat, Substr, Random, Mod, Neg, Abs, TextFn, Extract, JsonbCast, Jsonb };
+                    Concat, Substr, Random, Mod, Neg, Abs, TextFn, Extract, Cast, Jsonb };
   enum class Fn { Count, Sum, Min, Max, Avg };
   // TextFn's function: PostgreSQL's of the same name, over UTF-8 text.
   enum class Text { Upper, Lower, CharLength, OctetLength, Btrim, Ltrim, Rtrim, Position };
@@ -100,9 +100,9 @@ struct Expr {
                                 // Random: its two bounds, both included; Mod: two, of the result's type and scale;
                                 // Neg, Abs: one, of the result's type; TextFn: the text, then the trim's
                                 // characters if given, or POSITION's needle; Extract: one, a DATE, TIME,
-                                // TIMESTAMP or TIMESTAMPTZ; JsonbCast: one, a jsonb to its text (the
-                                // expression's type TEXT), a string read as jsonb (type jsonb), or a jsonb
-                                // to BOOLEAN, an integer, REAL, DOUBLE PRECISION or NUMERIC;
+                                // TIMESTAMP or TIMESTAMPTZ; Cast: one, its operand, cast to the
+                                // expression's type by a pair cast_kind (sql/text.cppm) has and the layer
+                                // takes; a relabel only over another Cast, whose type it keeps;
                                 // Jsonb: the jsonb, then the key (text), the index (an integer) or the path
                                 // (a PathIn of text or a PathArray of text elements, any NULL); Typeof and
                                 // ArrayLength: the jsonb alone

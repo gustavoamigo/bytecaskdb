@@ -1334,6 +1334,40 @@ class SqlMachine(Sides, RuleBasedStateMachine):
 
     @precondition(lambda self: self.tables)
     @rule(data=st.data())
+    def cast_a_column(self, data):
+        # A cast of a column, or of an expression over it, computed for one
+        # row (#904 stage C1): integer, float, boolean, DECIMAL and bytes to
+        # and from text, between integers and DECIMALs, valid and invalid
+        # strings alike. Where either side raises, both must, with one
+        # SQLSTATE; one row, so which row raises first cannot differ.
+        t = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
+        keys = self.existing_keys(t)
+        if not keys:
+            return
+        key = data.draw(st.sampled_from(keys), label="key")
+        col = data.draw(st.sampled_from(t.columns), label="cast column")
+        c, kind = col.name, col.type.kind
+        forms = {
+            "int": ["{c}::text", "{c}::smallint", "{c}::integer", "{c}::numeric(5,1)::text", "{c}::double precision",
+                    "{c}::real", "({c}::text)::bigint", "({c} % 7)::text::smallint", "{c}::boolean"],
+            "decimal": ["{c}::integer", "{c}::bigint", "{c}::text", "{c}::numeric(4,1)::text", "{c}::double precision",
+                        "({c}::text || '0')::numeric(18,2)::text"],
+            "float": ["{c}::integer", "{c}::bigint", "{c}::real"],
+            "real": ["{c}::smallint", "{c}::double precision"],
+            "bool": ["{c}::integer", "{c}::text", "{c}::name::text"],
+            # Not to a float or a DECIMAL: PG reads hexadecimal there, the
+            # layer does not (frontend_design.md, *Differences from PG 17
+            # left after #904*).
+            "text": ["{c}::integer", "{c}::bigint", "{c}::smallint", "{c}::boolean", "({c} || '1')::integer",
+                     "{c}::name::text", "(' ' || {c} || '0')::integer"],
+            "bytes": ["{c}::text"],
+        }[kind]
+        exprs = [f.format(c=c) for f in data.draw(st.lists(st.sampled_from(forms), min_size=1, max_size=3), label="casts")]
+        where = " AND ".join(f"{k} = {o.sql_literal(t.column(k).type, v)}" for k, v in zip(t.pk, key))
+        self.both(f"SELECT {', '.join(exprs)} FROM {t.name} WHERE {where}")
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
     def count_by_key(self, data):
         t = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
         where, _, _ = self.where_on_a_path(data, t)
@@ -2854,6 +2888,17 @@ def test_every_range_message_maps_to_its_sqlstate(tmp_path):
             assert str(e).startswith("bigint out of range"), str(e)
         else:
             raise AssertionError("b - 1 below BIGINT's range was written")
+        # A text cast to an integer type: its input function's range message.
+        db.execute("CREATE TABLE rt (k BIGINT PRIMARY KEY, t TEXT)")
+        db.execute("INSERT INTO rt VALUES ($1, $2)", (1, "3000000000"))
+        try:
+            db.execute("SELECT t::integer FROM rt")
+        except bytecask_sql.ExecError as e:
+            assert e.constraint == "range" and o.layer_sqlstate(e) == "22003", str(e)
+            assert str(e) == 'value "3000000000" is out of range for type integer', str(e)
+            seen.update(start for start, _ in messages if str(e).startswith(start))
+        else:
+            raise AssertionError("t::integer past INTEGER's range was returned")
         assert seen == {start for start, _ in messages}, {start for start, _ in messages} - seen
     finally:
         db.close()

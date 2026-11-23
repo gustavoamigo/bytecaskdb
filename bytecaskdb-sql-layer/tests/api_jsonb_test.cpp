@@ -171,7 +171,7 @@ TEST_CASE("embedded API jsonb: what stage 1 refuses, each with PostgreSQL's SQLS
            Refusal{"SELECT id FROM j WHERE v ? 'a'", "0A000"},
            Refusal{"SELECT to_jsonb(1)", "0A000"},
            Refusal{"UPDATE j SET s = v", "0A000"},
-           Refusal{"SELECT v::varchar(3) FROM j", "0A000"},
+           Refusal{"SELECT v::varchar(3) FROM j", "42601"},
            Refusal{"CREATE TABLE k3 (v json)", "0A000"},
            Refusal{"SELECT '1'::json", "0A000"},
            Refusal{"CREATE DOMAIN d AS jsonb", "0A000"},

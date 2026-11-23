@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 23). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 24). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime
@@ -360,8 +360,6 @@ bool    bc_bytes_prefix(bc_ctx *, bc_view prefix, bc_view);
 /* Text built from values (docs/frontend_design.md, *Expressions over
    columns*), each a new view of bytes the statement holds:
    - bc_concat: a, then b;
-   - bc_number_text: v, an integer or a DECIMAL at `scale`, as PostgreSQL
-     prints one (-12.50 at scale 2);
    - bc_substr: PostgreSQL's substring(s FROM from FOR count) of UTF-8 text,
      in characters: a start before the first character takes from it, those
      before counting toward `count`; INT64_MAX is to the end; a negative
@@ -426,7 +424,63 @@ bool     bc_jsonb_to_bool(bc_ctx *, bc_jsonb j);
 int64_t  bc_jsonb_to_i64(bc_ctx *, bc_jsonb j, uint32_t int_type, uint32_t object_id);
 double   bc_jsonb_to_f64(bc_ctx *, bc_jsonb j, bool real);
 bc_view  bc_jsonb_to_num(bc_ctx *, bc_jsonb j);
-bc_view bc_number_text(bc_ctx *, int64_t v, uint32_t scale);
+/* Casts computed per row (docs/planner_design.md, *Plan API calls for runtime
+   casts*), each over the same functions the binder folds a constant's cast
+   with (sql/text.cppm), so a constant, a parameter and a row's value cast
+   alike. A SQL type is a bc_sql_type (the layer's SqlKind codes); a DECIMAL
+   travels as its scaled value with its precision and scale.
+   - bc_text_in_i64: text read by the input function of an integer, DECIMAL
+     (rounded half away from zero to `scale`, checked against `precision`)
+     or date or time type (UTC);
+   - bc_text_in_f64: by float8in, or float4in for BC_TYPE_REAL (the REAL as
+     a double);
+   - bc_text_in_bool: by boolin;
+   - bc_text_in_bytes: by byteain (BC_TYPE_BYTEA), or namein (BC_TYPE_NAME,
+     cut to 63 bytes), into the step's arena;
+   - bc_value_text: an integer, a DECIMAL at `scale`, a date or time type's
+     output, or a BOOLEAN's (v 0 or 1) as booltext writes it ("true") at
+     scale 0 and boolout ("t") at scale 1, into the step's arena;
+   - bc_bytea_text: byteaout's hex text, into the step's arena;
+   - bc_f64_to_int: rint, then the bc_int_type's range;
+   - bc_decimal_rescale: a DECIMAL at from_scale (an integer at 0) to an
+     integer type (to_type) or to DECIMAL(precision, to_scale), rounded half
+     away from zero;
+   - bc_decimal_to_f64: its decimal text read correctly rounded, as a double
+     or (real) the nearest REAL;
+   - bc_f64_to_decimal: float8_numeric (float4_numeric for real): 15 (6)
+     significant digits read as DECIMAL(precision, scale);
+   - bc_f64_to_f32: the nearest REAL, as a double; bc_i64_to_f32: an
+     integer's nearest REAL, rounded once;
+   - bc_temporal_cast: date to timestamp(tz) at midnight, timestamp(tz) to
+     date or time, timestamp to timestamptz and back, time to timetz and
+     back, timestamptz to timetz, as PostgreSQL in UTC.
+   An integer or DECIMAL result outside its type is BC_E_CONSTRAINT,
+   BC_C_RANGE on object_id, with PostgreSQL's message (and a DECIMAL's
+   DETAIL in bc_error_note), as bc_check_int; every other error, text that
+   is no value of the type included, is BC_E_DATA with its SQLSTATE,
+   message and DETAIL (22P02, 22007, 22008, a float's 22003). An input
+   helper charges its text's size to the statement while it reads it
+   (54000 past the budget, before it parses); a type or scale outside these
+   lists is BC_E_HANDLE. */
+enum bc_sql_type {
+  BC_TYPE_SMALLINT = 1, BC_TYPE_INTEGER, BC_TYPE_BIGINT, BC_TYPE_REAL, BC_TYPE_DOUBLE, BC_TYPE_BOOLEAN,
+  BC_TYPE_BYTEA, BC_TYPE_TEXT, BC_TYPE_VARCHAR, BC_TYPE_DECIMAL, BC_TYPE_TIMESTAMP, BC_TYPE_DATE, BC_TYPE_TIME,
+  BC_TYPE_NUMERIC, BC_TYPE_TIMESTAMPTZ, BC_TYPE_CHAR, BC_TYPE_NAME, BC_TYPE_TIMETZ, BC_TYPE_JSONB
+};
+int64_t bc_text_in_i64(bc_ctx *, bc_view text, uint32_t sql_type, uint32_t precision, uint32_t scale, uint32_t object_id);
+double  bc_text_in_f64(bc_ctx *, bc_view text, uint32_t sql_type);
+bool    bc_text_in_bool(bc_ctx *, bc_view text);
+bc_view bc_text_in_bytes(bc_ctx *, bc_view text, uint32_t sql_type);
+bc_view bc_value_text(bc_ctx *, int64_t v, uint32_t sql_type, uint32_t scale);
+bc_view bc_bytea_text(bc_ctx *, bc_view b);
+int64_t bc_f64_to_int(bc_ctx *, double v, uint32_t int_type, uint32_t object_id);
+int64_t bc_decimal_rescale(bc_ctx *, int64_t v, uint32_t from_scale, uint32_t to_type, uint32_t precision, uint32_t to_scale,
+                           uint32_t object_id);
+double  bc_decimal_to_f64(bc_ctx *, int64_t v, uint32_t scale, bool real);
+int64_t bc_f64_to_decimal(bc_ctx *, double v, bool real, uint32_t precision, uint32_t scale, uint32_t object_id);
+double  bc_f64_to_f32(bc_ctx *, double v);
+double  bc_i64_to_f32(int64_t v);
+int64_t bc_temporal_cast(bc_ctx *, int64_t v, uint32_t from_type, uint32_t to_type);
 /* PostgreSQL's AVG of an integer or a DECIMAL, as numeric text (BC_T_NUM):
    numeric_div of sum (a total at `scale`) by count, at the scale
    select_div_scale chooses, rounded half away from zero. count < 1 or a

@@ -1358,138 +1358,77 @@ auto compare_constants(Constant x, Constant y, ast::ValueCompare op, std::int32_
 
 auto text_of(const Constant& c) -> std::string;
 
-// A date, time or timestamp cast to another type, as PostgreSQL casts it:
-// to text; to its own type; a timestamp or timestamptz to a date or a time
-// (read in UTC); a date to a timestamp or timestamptz; a timestamp to a
-// timestamptz and back; a time with time zone to a time (its offset
-// dropped); a time, or a timestamptz's time in UTC, to a time with time
-// zone at offset 0. A time to a date, a timestamp or a timestamptz, a date
-// to a time, and a time with time zone to or from any other, have no cast
-// (42846).
-auto cast_temporal(const Constant& arg, SqlType t, std::int32_t pos) -> Constant {
-  auto from = arg.type.kind;
-  auto null = std::holds_alternative<std::monostate>(arg.value);
-  auto result = [&](Datum v) -> Constant { return {std::move(v), t, false, {}, pos}; };
-  if (t.kind == SqlKind::Text) return null ? result(std::monostate{}) : result(bytes_of(text_of(arg)));
-  if (from == t.kind) return {arg.value, t, false, {}, pos};
-  using K = SqlKind;
-  if ((from == K::Timestamp || from == K::TimestampTz) && (t.kind == K::Date || t.kind == K::Time)) {
-    if (null) return result(std::monostate{});
-    auto us = std::get<std::int64_t>(arg.value);
-    auto days = us >= 0 ? us / kMicrosPerDay : -((-us + kMicrosPerDay - 1) / kMicrosPerDay);
-    return result(t.kind == K::Date ? days : us - days * kMicrosPerDay);
+// A cast PostgreSQL has that the layer does not take yet (cast_refusal), as
+// the constant fold and a cast computed per row refuse it alike.
+void refuse_cast(SqlType from, SqlType to, std::int32_t pos) {
+  switch (cast_refusal(from, to)) {
+    case CastRefusal::None: return;
+    case CastRefusal::Length: not_yet(to.kind == SqlKind::Varchar ? "a cast to VARCHAR(n)" : "a cast to CHAR(n)", pos);
+    case CastRefusal::Numeric:
+      refuse_numeric(from.kind == SqlKind::Numeric ? "a cast of a NUMERIC to " + pg_type_name(to) : "a cast to NUMERIC", pos);
+    case CastRefusal::FloatText: not_yet("a cast of a floating-point value to text", pos);
+    case CastRefusal::CharInput: not_supported("a cast of a CHAR(n) value to " + pg_type_name(to), pos);
+    case CastRefusal::JsonbDecimal:
+      not_supported("a cast of jsonb to numeric(" + std::to_string(to.precision) + "," + std::to_string(to.scale) + ")", pos);
   }
-  if (from == K::TimestampTz && t.kind == K::TimeTz) {
-    if (null) return result(std::monostate{});
-    auto us = std::get<std::int64_t>(arg.value);
-    auto days = us >= 0 ? us / kMicrosPerDay : -((-us + kMicrosPerDay - 1) / kMicrosPerDay);
-    return result(timetz_pack({us - days * kMicrosPerDay, 0}));
-  }
-  if (from == K::TimeTz && t.kind == K::Time) {
-    if (null) return result(std::monostate{});
-    return result(timetz_unpack(std::get<std::int64_t>(arg.value)).time);
-  }
-  if (from == K::Time && t.kind == K::TimeTz) {
-    if (null) return result(std::monostate{});
-    return result(*exact_temporal(arg, t.kind));
-  }
-  if (from == K::Date && (t.kind == K::Timestamp || t.kind == K::TimestampTz)) {
-    if (null) return result(std::monostate{});
-    auto v = exact_temporal(arg, t.kind);
-    if (!v) throw SqlError{"timestamp out of range", pos, kDatetimeFieldOverflow};
-    return result(*v);
-  }
-  if ((from == K::Timestamp && t.kind == K::TimestampTz) || (from == K::TimestampTz && t.kind == K::Timestamp)) {
-    return {arg.value, t, false, {}, pos};
-  }
-  throw SqlError{"cannot cast type " + pg_type_name(arg.type) + " to " + pg_type_name(t), pos, kCannotCoerce};
 }
 
-// A number cast to an integer type, as PostgreSQL's cast functions do it: a
-// numeric rounded half away from zero, a float to the nearest even (rint);
-// out of the type's range, or a float that is NaN or infinite, is 22003.
-auto integer_of(const Constant& arg, SqlType t, std::int32_t pos) -> std::int64_t {
-  auto out_of_range_error = [&] {
-    return SqlError{pg_type_name(t) + " out of range", pos, kNumericValueOutOfRange};
-  };
-  std::int64_t v = 0;
-  if (is_integer(arg.type)) {
-    v = std::get<std::int64_t>(arg.value);
-  } else if (arg.type.kind == SqlKind::Decimal) {
-    auto scaled = std::get<std::int64_t>(arg.value);
-    auto unit = kPowersOfTen[arg.type.scale];
-    auto whole = scaled / unit;
-    auto rest = scaled % unit;
-    if (rest != 0 && 2 * (rest < 0 ? -rest : rest) >= unit) whole += scaled < 0 ? -1 : 1;
-    v = whole;
-  } else {
-    auto d = std::rint(std::get<double>(arg.value));
-    // 2^63 is the first double past int64_t; -2^63 is in range.
-    if (!std::isfinite(d) || d >= 9223372036854775808.0 || d < -9223372036854775808.0) throw out_of_range_error();
-    v = static_cast<std::int64_t>(d);
-  }
-  if (out_of_range(t, v)) throw out_of_range_error();
-  return v;
+// PostgreSQL's 42846 for a pair cast_kind has no cast for.
+[[noreturn]] void no_cast(SqlType from, SqlType to, std::int32_t pos) {
+  throw SqlError{"cannot cast type " + pg_type_name(from) + " to " + pg_type_name(to), pos, kCannotCoerce};
 }
 
-// A typed constant cast to t, as PostgreSQL casts it: a number to any number
-// type by pg_cast's functions; a BOOLEAN to an INTEGER and back; any type to
-// TEXT by its output function (a float, whose text differs, is not taken
-// yet); a string to any type by that type's input function. Every other pair
-// has no cast (42846), a NULL of it included.
-auto cast_typed(const Constant& arg, SqlType t, std::int32_t pos) -> Constant {
+// A typed constant cast to t, by the one cast table (cast_kind) and the
+// cast functions of sql/text.cppm, the ones a value cast per row is cast by
+// (docs/frontend_design.md, *Casts of an expression*): a relabel keeps the
+// value; jsonb to a boolean or a number is stage 3's (cast_jsonb_out); a
+// pair with no cast is 42846 and one the layer does not take yet is
+// refused (refuse_cast), a NULL of it included. An error is the cast
+// function's, at the cast.
+auto fold_cast(const Constant& arg, SqlType t, std::int32_t pos) -> Constant {
   using K = SqlKind;
-  auto from = type_class(arg.type.kind);
-  auto to = type_class(t.kind);
-  auto exists = from == TypeClass::String || to == TypeClass::String || arg.type.kind == t.kind ||
-                (from == TypeClass::Number && to == TypeClass::Number) ||
-                (arg.type.kind == K::Boolean && t.kind == K::Integer) || (arg.type.kind == K::Integer && t.kind == K::Boolean);
-  // jsonb to a boolean or a number (docs/jsonb_design.md, stage 3); to a
-  // DECIMAL(p, s), which would round its numeric, not built.
-  if (arg.type.kind == K::Jsonb && (to == TypeClass::Number || to == TypeClass::Boolean)) {
-    if (auto c = cast_jsonb_out(arg, t, pos)) return *c;
-    not_supported("a cast of jsonb to " + pg_type_name(t) + "(" + std::to_string(t.precision) + "," + std::to_string(t.scale) + ")", pos);
-  }
-  if (!exists) throw SqlError{"cannot cast type " + pg_type_name(arg.type) + " to " + pg_type_name(t), pos, kCannotCoerce};
-  if (to == TypeClass::String && is_float(arg.type)) not_yet("a cast of a floating-point value to text", pos);
+  auto kind = cast_kind(arg.type, t);
+  if (kind == CastKind::None) no_cast(arg.type, t, pos);
+  refuse_cast(arg.type, t, pos);
+  if (arg.type.kind == K::Jsonb && kind == CastKind::Function) return *cast_jsonb_out(arg, t, pos);
   auto result = [&](Datum v) -> Constant { return {std::move(v), t, false, {}, pos}; };
   if (std::holds_alternative<std::monostate>(arg.value)) return result(std::monostate{});
-  if (to == TypeClass::String) {
-    auto b = bytes_of(text_of(arg));
-    if (t.kind == K::Name) b.resize(name_prefix(b).size());  // namein's cut, from any typed string
-    return result(std::move(b));
-  }
-  if (from == TypeClass::String) {
-    const auto& b = std::get<Bytes>(arg.value);
-    Constant text{std::monostate{}, SqlType{K::Text}, false, std::string(b.size(), '\0'), pos};  // typed: the cast's error
-    std::ranges::transform(b, text.text.begin(), [](std::byte x) { return static_cast<char>(x); });
-    return result(read_as(text, t, true));
-  }
-  if (arg.type.kind == K::Boolean && t.kind == K::Integer) return result(std::int64_t{std::get<bool>(arg.value) ? 1 : 0});
-  if (arg.type.kind == K::Integer && t.kind == K::Boolean) return result(std::get<std::int64_t>(arg.value) != 0);
-  if (from != TypeClass::Number) return result(arg.value);  // a BOOLEAN or a BYTEA to its own type
-  if (is_integer(t)) return result(integer_of(arg, t, pos));
-  if (is_float(t)) {
-    auto d = is_float(arg.type) ? std::get<double>(arg.value) : std::stod(text_of(arg));
-    if (t.kind == K::Real && std::isfinite(d) && (std::fabs(d) > std::numeric_limits<float>::max() ||
-                                                  (d != 0 && std::fabs(d) < std::numeric_limits<float>::denorm_min()))) {
-      throw SqlError{std::string{"value out of range: "} + (std::fabs(d) > 1 ? "overflow" : "underflow"), pos,
-                     kNumericValueOutOfRange};
+  if (kind == CastKind::Relabel) return result(arg.value);
+  try {
+    const auto& v = arg.value;
+    if (is_string(t)) return result(bytes_of(cast_to_text(v, arg.type, t)));
+    if (holds_string(arg.type)) {
+      const auto& b = std::get<Bytes>(v);
+      return result(cast_from_text(std::string_view{reinterpret_cast<const char*>(b.data()), b.size()}, t));
     }
-    return result(t.kind == K::Real ? static_cast<double>(static_cast<float>(d)) : d);
+    if (type_class(arg.type.kind) == TypeClass::Temporal) {
+      return result(convert_temporal(std::get<std::int64_t>(v), arg.type.kind, t.kind));
+    }
+    if (arg.type.kind == K::Boolean) return result(std::int64_t{std::get<bool>(v) ? 1 : 0});
+    if (t.kind == K::Boolean) return result(std::get<std::int64_t>(v) != 0);
+    if (is_float(arg.type)) {
+      auto d = std::get<double>(v);
+      if (is_integer(t)) return result(float_to_integer(d, t));
+      if (t.kind == K::Decimal) return result(float_to_decimal(d, arg.type.kind == K::Real, t));
+      return result(t.kind == K::Real ? double_to_real(d) : d);
+    }
+    // An integer or a DECIMAL.
+    auto n = std::get<std::int64_t>(v);
+    if (is_float(t)) {
+      if (arg.type.kind == K::Decimal) return result(decimal_to_float(n, arg.type.scale, t.kind == K::Real));
+      return result(t.kind == K::Real ? integer_to_real(n) : static_cast<double>(n));
+    }
+    return result(rescale_decimal(n, decimal_scale(arg.type), t));
+  } catch (const TextError& e) {
+    throw input_error(e, pos);
   }
-  // To a DECIMAL: through its text, as the input function reads it, rounded
-  // to the scale; a float at its type's digits, as float8_numeric does.
-  if (is_float(arg.type) && !std::isfinite(std::get<double>(arg.value))) not_yet("NaN or Infinity as a numeric", pos);
-  Constant text{std::monostate{}, SqlType{K::Text}, false, text_of(arg), pos};  // typed: the cast's error
-  return result(read_as(text, t, true));
 }
 
 // type 'text', '…'::type and CAST(… AS type): a string literal read as the
-// type, as its input function reads it, a DECIMAL rounded to its scale;
-// NULL of the type; a typed constant cast by cast_typed, or by cast_temporal
-// for a date, time or timestamp. A cast to VARCHAR(n) or CHAR(n), which
-// PostgreSQL's cast truncates or pads, is not taken yet.
+// type, as its input function reads it (cast_from_text), a DECIMAL rounded
+// to its scale; NULL of the type; a typed constant cast by fold_cast. A cast
+// to VARCHAR(n) or CHAR(n), which PostgreSQL's cast truncates or pads, is
+// not taken yet.
 auto cast_constant(const ast::Expr& e, const Constant& arg) -> Constant {
   // jsonb_numeric: a NUMERIC of no precision, which no other cast gives yet.
   if (is_jsonb(arg) && e.cast_type == "numeric" && e.cast_typmods.empty() && e.cast_schema.empty()) {
@@ -1498,11 +1437,13 @@ auto cast_constant(const ast::Expr& e, const Constant& arg) -> Constant {
   auto t = sql_type(cast_def(e));
   if (t.kind == SqlKind::Varchar) not_yet("a cast to VARCHAR(n)", e.pos);
   if (t.kind == SqlKind::Char) not_yet("a cast to CHAR(n)", e.pos);
-  auto temporal = !arg.unknown && type_class(arg.type.kind) == TypeClass::Temporal;
-  if (temporal) return cast_temporal(arg, t, e.pos);
-  if (!arg.unknown) return cast_typed(arg, t, e.pos);
+  if (!arg.unknown) return fold_cast(arg, t, e.pos);
   if (std::holds_alternative<std::monostate>(arg.value)) return {std::monostate{}, t, false, {}, e.pos};
-  return {read_as(arg, t, true), t, false, {}, e.pos};
+  try {
+    return {cast_from_text(arg.text, t), t, false, {}, e.pos};
+  } catch (const TextError& err) {
+    literal_input_error(arg, err);
+  }
 }
 
 auto fold(const ast::Expr& e) -> Constant;
@@ -2396,7 +2337,7 @@ auto coerce_value(const Constant& k, const Column& c, bool assigned, std::string
         return timetz_unpack(std::get<std::int64_t>(k.value)).time;
       }
       if (assigned && k.type.kind == SqlKind::TimestampTz && c.sql.kind == SqlKind::TimeTz) {
-        return cast_temporal(k, c.sql, k.pos).value;
+        return convert_temporal(std::get<std::int64_t>(k.value), k.type.kind, c.sql.kind);
       }
       // A pair PostgreSQL has no cast for: a date and a time, a time to a
       // date or a timestamp, a timestamp to a time with time zone.
@@ -2620,15 +2561,7 @@ auto clock_slot_kind(ClockDefault::Fn fn, SqlKind as) -> ClockSlot::Kind {
 // None between a date and a time, from a time to a date or a timestamp, or
 // from a timestamp to a time with time zone.
 auto temporal_cast(SqlKind from, SqlKind to) -> bool {
-  using K = SqlKind;
-  auto stamp = [](K k) { return k == K::Timestamp || k == K::TimestampTz; };
-  auto time = [](K k) { return k == K::Time || k == K::TimeTz; };
-  if (from == to || (stamp(from) && stamp(to)) || (time(from) && time(to))) return true;
-  if (from == K::Date) return stamp(to);
-  if (to == K::Date) return stamp(from);
-  if (to == K::Time) return stamp(from);
-  if (to == K::TimeTz) return from == K::TimestampTz;
-  return false;
+  return cast_kind(SqlType{from}, SqlType{to}) != CastKind::None;
 }
 
 // A placeholder for a reading's slot, of its physical type: never the
@@ -3195,7 +3128,7 @@ public:
     auto c = fold(e);
     auto name = [&]() -> std::string {
       switch (e.kind) {
-        case ast::Expr::Kind::Cast: return e.cast_type;
+        case ast::Expr::Kind::Cast: return figure_colname(e).first;
         case ast::Expr::Kind::Case: return "case";
         case ast::Expr::Kind::Coalesce: return "coalesce";
         case ast::Expr::Kind::NullIf: return "nullif";
@@ -3293,7 +3226,7 @@ public:
         case K::Substr:
         case K::TextFn:
         case K::Extract:
-        case K::JsonbCast: return true;
+        case K::Cast: return true;
         case K::Jsonb: return x.jsonb != logical::Expr::Jsonb::PathArray;  // a NULL element is the path's
         case K::Column:
         case K::Param:
@@ -3358,25 +3291,8 @@ public:
       case K::Neg: return sign_value(e, resolve);
       case K::Cast: {
         // $n::T types $n as T, as PostgreSQL types an untyped $n by its
-        // cast; a cast of anything else that is not a constant is not
-        // taken yet.
-        if (!param_cast(e)) {
-          if (e.rhs->kind == K::Column && resolve(*e.rhs).second->sql.kind == SqlKind::Numeric) refuse_numeric("a cast of a NUMERIC", e.pos);
-          if (auto j = jsonb_cast(e, resolve)) return std::move(*j);
-          // A NAME, TEXT or VARCHAR to TEXT (or VARCHAR of no length), or a
-          // NAME to NAME, keeps its bytes: a relabelling, as PostgreSQL's
-          // binary-coercible cast.
-          // VARCHAR without a length is TEXT, as everywhere in the layer.
-          if (e.cast_typmods.empty() && (e.cast_type == "text" || e.cast_type == "varchar" || e.cast_type == "name")) {
-            auto v = value(*e.rhs, resolve);
-            auto to = e.cast_type == "name" ? SqlKind::Name : SqlKind::Text;
-            if (to == SqlKind::Text ? is_string(v.type) : v.type.kind == SqlKind::Name) {
-              v.type = SqlType{to};
-              return v;
-            }
-          }
-          not_yet("a cast of other than a constant or a parameter", e.pos);
-        }
+        // cast; a cast of anything else is computed per row (cast_value).
+        if (!param_cast(e)) return cast_value(e, resolve);
         if (e.cast_type == "numeric" && e.cast_typmods.empty()) refuse_numeric("a cast of a parameter to NUMERIC", e.pos);
         if (modified_cast(e)) not_yet("a cast of a parameter to DECIMAL, VARCHAR(n) or CHAR(n)", e.pos);
         return typed_param(*e.rhs, cast_type(e), Use::Operand);
@@ -3941,45 +3857,34 @@ public:
     return strict_null(std::move(out));
   }
 
-  // A cast at run time between jsonb and text (docs/jsonb_design.md, *Casts
-  // to and from jsonb and json*): a jsonb's text (jsonb_out's) as TEXT or
-  // VARCHAR, a string read by jsonb_in, and a jsonb to a boolean or a
-  // number (stage 3); to any other type, and any other type to jsonb,
-  // PostgreSQL has no cast (42846).
-  // nullopt when neither side is a jsonb: the caller's cast.
-  auto jsonb_cast(const ast::Expr& e, const Resolve& resolve) -> std::optional<logical::Expr> {
-    auto to_jsonb = e.cast_type == "jsonb" && e.cast_schema.empty();
-    if (!to_jsonb && !jsonb_operand(*e.rhs, resolve)) return std::nullopt;
-    auto v = value(*e.rhs, resolve);
-    if (to_jsonb && v.type.kind == SqlKind::Jsonb) return v;
-    auto cast = [&](SqlType to) {
-      auto out = logical::expr(logical::Expr::Kind::JsonbCast, to);
-      out.args.push_back(std::move(v));
-      return out;
-    };
-    if (to_jsonb) {
-      if (type_class(v.type.kind) == TypeClass::String) return cast(SqlType{SqlKind::Jsonb});
-      throw SqlError{"cannot cast type " + pg_type_name(v.type) + " to jsonb", e.pos, kCannotCoerce};
+  // x::T of a value that is not a constant (folded) or a parameter (typed by
+  // its cast): computed for each row by the cast cast_kind gives the pair
+  // (docs/frontend_design.md, *Casts of an expression*). A relabel is the
+  // operand retyped; a pair with no cast is 42846 at the cast, and one the
+  // layer does not take yet refused (refuse_cast); jsonb to NUMERIC of no
+  // precision is jsonb_numeric (docs/jsonb_design.md, stage 3). Strict: a
+  // NULL constant operand is a NULL of T.
+  auto cast_value(const ast::Expr& e, const Resolve& resolve) -> logical::Expr { return cast_of(e, value(*e.rhs, resolve)); }
+
+  // Cast e of the operand v, bound.
+  auto cast_of(const ast::Expr& e, logical::Expr v) -> logical::Expr {
+    auto to = e.cast_type == "numeric" && e.cast_typmods.empty() && e.cast_schema.empty() ? SqlType{SqlKind::Numeric}
+                                                                                          : cast_type(e);
+    if (to.kind == SqlKind::Varchar) not_yet("a cast to VARCHAR(n)", e.pos);
+    if (to.kind == SqlKind::Char) not_yet("a cast to CHAR(n)", e.pos);
+    auto kind = cast_kind(v.type, to);
+    if (kind == CastKind::None) no_cast(v.type, to, e.pos);
+    refuse_cast(v.type, to, e.pos);
+    // A relabel retypes its operand, but a cast's type is what it computes
+    // (bo::name is boolout's text): over a cast it is a node of its own.
+    if (kind == CastKind::Relabel && v.kind != logical::Expr::Kind::Cast) {
+      v.type = to;
+      return v;
     }
-    if (v.type.kind != SqlKind::Jsonb) return std::nullopt;
-    // jsonb_numeric: a NUMERIC of no precision, which no other cast gives yet.
-    auto to = e.cast_type == "numeric" && e.cast_typmods.empty() ? SqlType{SqlKind::Numeric} : cast_type(e);
-    if (to.kind == SqlKind::Text) return cast(to);  // TEXT, and VARCHAR of no length
-    switch (type_class(to.kind)) {
-      case TypeClass::String: not_supported("a cast of jsonb to " + pg_type_name(to) + ", which cuts or pads its text", e.pos);
-      case TypeClass::Number:
-      case TypeClass::Boolean:
-        // jsonb_bool, jsonb_int2/4/8, jsonb_float4/8 and jsonb_numeric; a
-        // DECIMAL(p, s) would round the numeric after, not built.
-        if (to.kind == SqlKind::Decimal) {
-          not_supported("a cast of jsonb to numeric(" + std::to_string(to.precision) + "," + std::to_string(to.scale) + ")", e.pos);
-        }
-        return cast(to);
-      case TypeClass::Temporal:
-      case TypeClass::Bytea:
-      case TypeClass::Jsonb: break;
-    }
-    throw SqlError{"cannot cast type jsonb to " + pg_type_name(to), e.pos, kCannotCoerce};
+    if (kind == CastKind::Relabel && v.type == to) return v;
+    auto out = logical::expr(logical::Expr::Kind::Cast, to);
+    out.args.push_back(std::move(v));
+    return strict_null(std::move(out));
   }
 
   auto arithmetic_value(const ast::Expr& e, const Resolve& resolve) -> logical::Expr {
@@ -4728,7 +4633,7 @@ public:
       case ast::Expr::Kind::Not:
       case ast::Expr::Kind::And:
       case ast::Expr::Kind::Or: not_yet("IS NULL, AND, OR and NOT of other than constants as a value", e.pos);
-      case ast::Expr::Kind::Cast: not_yet("a cast of other than a constant or a parameter", e.pos);
+      case ast::Expr::Kind::Cast: not_yet("a cast of a value expression in SET (#904 stage S1)", e.pos);
       case ast::Expr::Kind::Clock: {
         auto d = clock_default(e.func, e.constant, target.sql, target.name, e.pos, true);
         return clock_reading(d, target);
@@ -6253,20 +6158,77 @@ public:
   // A select-list item of no aggregated query, named as PostgreSQL names
   // it: a column by its name, a CASE, COALESCE or NULLIF by the word, a
   // function by its own, $n::T by its type, any other expression ?column?.
+  // PostgreSQL 17's FigureColname: an expression's output name and how
+  // strongly it holds it (2: a column, a function, COALESCE, NULLIF, a
+  // clock; 1: the type of a cast or "case"; 0: none, an operator, a
+  // constant or a parameter). A cast whose operand's name is weaker than
+  // 2 takes its type's name; CASE its ELSE's when that is strong. A
+  // scalar subquery's is its column's, which plain_output binds.
+  static auto figure_colname(const ast::Expr& e) -> std::pair<std::string, int> {
+    using K = ast::Expr::Kind;
+    switch (e.kind) {
+      case K::Column: return {e.column, 2};
+      case K::Func:
+        if (e.func == "||" || e.func == "%" || is_jsonb_accessor(e.func)) return {"?column?", 0};
+        return {e.func, 2};
+      case K::Coalesce: return {"coalesce", 2};
+      case K::NullIf: return {"nullif", 2};
+      case K::Clock: return {e.column.empty() ? e.func : e.column, 2};
+      case K::Aggregate: {
+        std::string n{aggregate_name(e.fn)};
+        std::ranges::transform(n, n.begin(), [](char c) { return static_cast<char>(c - 'A' + 'a'); });
+        return {n, 2};
+      }
+      case K::Case:
+        if (e.rhs) {
+          if (auto r = figure_colname(*e.rhs); r.second > 1) return r;
+        }
+        return {"case", 1};
+      case K::Cast: {
+        auto r = figure_colname(*e.rhs);
+        if (r.second <= 1) return {e.cast_type, 1};
+        return r;
+      }
+      case K::Param:
+      case K::Const:
+      case K::Literal:
+      case K::Add:
+      case K::Sub:
+      case K::Mul:
+      case K::Div:
+      case K::Star:
+      case K::Plus:
+      case K::Neg:
+      case K::Compare:
+      case K::IsNull:
+      case K::Not:
+      case K::And:
+      case K::Or:
+      case K::Subquery:
+      case K::Default: break;
+    }
+    return {"?column?", 0};
+  }
+
   auto plain_output(const ast::Expr& e, const Resolve& resolve) -> logical::Output {
     if (e.kind == ast::Expr::Kind::Clock) return clock(e);
     if (e.kind == ast::Expr::Kind::Subquery) return subquery_output(e);
     if (is_constant(e)) return constant_output(e);
-    // A cast of a cast is named as the inner one's operand names it: a
-    // column by its name, a parameter or an operator by the outer type
-    // (PostgreSQL's FigureColname: an inner cast's name is weak).
-    if (e.kind == ast::Expr::Kind::Cast && e.rhs->kind == ast::Expr::Kind::Cast) {
-      const auto* inner = e.rhs.get();
-      while (inner->kind == ast::Expr::Kind::Cast) inner = inner->rhs.get();
-      if (inner->kind == ast::Expr::Kind::Column) return {value(e, resolve), inner->column};
-      if (inner->kind == ast::Expr::Kind::Param || (inner->kind == ast::Expr::Kind::Func && is_jsonb_accessor(inner->func))) {
-        return {value(e, resolve), e.cast_type};
+    // A cast is named by PostgreSQL's FigureColname (figure_colname); of a
+    // scalar subquery, by the subquery's column, bound once here.
+    if (e.kind == ast::Expr::Kind::Cast && !param_cast(e)) {
+      std::vector<const ast::Expr*> casts;
+      const auto* inner = &e;
+      while (inner->kind == ast::Expr::Kind::Cast) {
+        casts.push_back(inner);
+        inner = inner->rhs.get();
       }
+      if (inner->kind == ast::Expr::Kind::Subquery) {
+        auto out = subquery_output(*inner);
+        for (auto it = casts.rbegin(); it != casts.rend(); ++it) out.expr = cast_of(**it, std::move(out.expr));
+        return out;
+      }
+      return {value(e, resolve), figure_colname(e).first};
     }
     if (e.kind != ast::Expr::Kind::Column) {
       auto name = e.kind == ast::Expr::Kind::Case                       ? std::string{"case"}
@@ -6274,13 +6236,6 @@ public:
                   : e.kind == ast::Expr::Kind::NullIf                   ? std::string{"nullif"}
                   : e.kind == ast::Expr::Kind::Func && e.func != "||" && e.func != "%" && !is_jsonb_accessor(e.func) ? e.func
                   : param_cast(e)                                       ? e.cast_type
-                  // x::T is named by x, as PostgreSQL names it.
-                  : e.kind == ast::Expr::Kind::Cast && e.rhs->kind == ast::Expr::Kind::Column ? e.rhs->column
-                  // An operator gives no name: its cast's type does.
-                  : e.kind == ast::Expr::Kind::Cast && e.rhs->kind == ast::Expr::Kind::Func && is_jsonb_accessor(e.rhs->func)
-                      ? e.cast_type
-                  : e.kind == ast::Expr::Kind::Cast && e.rhs->kind == ast::Expr::Kind::Clock
-                      ? (e.rhs->column.empty() ? e.rhs->func : e.rhs->column)
                                                                         : std::string{"?column?"};
       return {value(e, resolve), name};
     }

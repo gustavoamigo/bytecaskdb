@@ -42,6 +42,7 @@ export module bytecask.sql.codegen;
 export import bytecask.sql.binder;
 export import bytecask.sql.search;
 import bytecask.sql.rewrite;
+import bytecask.sql.text;
 
 export namespace bytecask::sql {
 
@@ -895,7 +896,7 @@ private:
       case Expr::Kind::Substr:
       case Expr::Kind::TextFn:
       case Expr::Kind::Extract:
-      case Expr::Kind::JsonbCast:
+      case Expr::Kind::Cast:
       case Expr::Kind::Jsonb:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
@@ -944,7 +945,7 @@ private:
       case Expr::Kind::Substr:
       case Expr::Kind::TextFn:
       case Expr::Kind::Extract:
-      case Expr::Kind::JsonbCast:
+      case Expr::Kind::Cast:
       case Expr::Kind::Jsonb:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
@@ -1731,25 +1732,7 @@ private:
       case Expr::Kind::Substr: return eval_substr(e);
       case Expr::Kind::TextFn: return eval_text(e);
       case Expr::Kind::Extract: return eval_extract(e);
-      case Expr::Kind::JsonbCast: {
-        // jsonb_out's text, or text read by jsonb_in: the only two crossings;
-        // or a jsonb to a boolean or a number.
-        auto v = eval(e.args[0]);
-        switch (e.phys()) {
-          case PhysType::Jsonb: return guarded("bc_jsonb", "", v.null, "bc_jsonb_in(cx, " + v.value + ")", PhysType::Jsonb);
-          case PhysType::Bytes: return guarded("bc_view", "bc_empty(cx)", v.null, "bc_jsonb_text(cx, " + v.value + ")", PhysType::Bytes);
-          case PhysType::Bool: return guarded("bool", "0", v.null, "bc_jsonb_to_bool(cx, " + v.value + ")", PhysType::Bool);
-          case PhysType::I64: {
-            auto width = e.type.kind == SqlKind::SmallInt ? "BC_SMALLINT" : e.type.kind == SqlKind::Integer ? "BC_INTEGER" : "BC_BIGINT";
-            return guarded("int64_t", "0", v.null, "bc_jsonb_to_i64(cx, " + v.value + ", " + width + ", 0)", PhysType::I64);
-          }
-          case PhysType::F64:
-            return guarded("double", "0.0", v.null,
-                           "bc_jsonb_to_f64(cx, " + v.value + ", " + (e.type.kind == SqlKind::Real ? "1" : "0") + ")", PhysType::F64);
-          case PhysType::Num: return guarded("bc_view", "bc_empty(cx)", v.null, "bc_jsonb_to_num(cx, " + v.value + ")", PhysType::Num);
-        }
-        throw std::logic_error{"physical plan: a jsonb cast codegen does not print"};
-      }
+      case Expr::Kind::Cast: return eval_cast(e);
       case Expr::Kind::Jsonb: return eval_jsonb(e);
       case Expr::Kind::Random: {
         auto lo = eval(e.args[0]);
@@ -1854,7 +1837,7 @@ private:
       case Expr::Kind::Substr:
       case Expr::Kind::TextFn:
       case Expr::Kind::Extract:
-      case Expr::Kind::JsonbCast:
+      case Expr::Kind::Cast:
       case Expr::Kind::Jsonb:
       case Expr::Kind::Random:
       case Expr::Kind::Mod:
@@ -1990,13 +1973,141 @@ private:
     return guarded("int64_t", "0", x.null, value, PhysType::I64);
   }
 
+  // A SQL type as the plan API's bc_sql_type names it.
+  static auto sql_type_code(SqlKind k) -> std::string {
+    switch (k) {
+      case SqlKind::SmallInt: return "BC_TYPE_SMALLINT";
+      case SqlKind::Integer: return "BC_TYPE_INTEGER";
+      case SqlKind::BigInt: return "BC_TYPE_BIGINT";
+      case SqlKind::Real: return "BC_TYPE_REAL";
+      case SqlKind::Double: return "BC_TYPE_DOUBLE";
+      case SqlKind::Boolean: return "BC_TYPE_BOOLEAN";
+      case SqlKind::Bytea: return "BC_TYPE_BYTEA";
+      case SqlKind::Text: return "BC_TYPE_TEXT";
+      case SqlKind::Varchar: return "BC_TYPE_VARCHAR";
+      case SqlKind::Decimal: return "BC_TYPE_DECIMAL";
+      case SqlKind::Timestamp: return "BC_TYPE_TIMESTAMP";
+      case SqlKind::Date: return "BC_TYPE_DATE";
+      case SqlKind::Time: return "BC_TYPE_TIME";
+      case SqlKind::Numeric: return "BC_TYPE_NUMERIC";
+      case SqlKind::TimestampTz: return "BC_TYPE_TIMESTAMPTZ";
+      case SqlKind::Char: return "BC_TYPE_CHAR";
+      case SqlKind::Name: return "BC_TYPE_NAME";
+      case SqlKind::TimeTz: return "BC_TYPE_TIMETZ";
+      case SqlKind::Jsonb: return "BC_TYPE_JSONB";
+    }
+    throw std::logic_error{"physical plan: an unknown SQL type"};
+  }
+
+  static auto int_type_code(SqlKind k) -> std::string {
+    return k == SqlKind::SmallInt ? "BC_SMALLINT" : k == SqlKind::Integer ? "BC_INTEGER" : "BC_BIGINT";
+  }
+
+  // x::T computed per row (docs/planner_design.md, *Casts in the search, the
+  // check and codegen*), its operand's NULL never reaching a call: pure C
+  // where nothing can fail, else the plan API's cast helpers over the
+  // functions the binder folds a constant's cast with. A range error names
+  // no object (0).
+  auto eval_cast(const Expr& e) -> Val {
+    using K = SqlKind;
+    auto v = eval(e.args[0]);
+    const auto from = e.args[0].type;
+    const auto to = e.type;
+    auto is_int = [](K k) { return k == K::SmallInt || k == K::Integer || k == K::BigInt; };
+    auto is_float = [](K k) { return k == K::Real || k == K::Double; };
+    auto is_text = [](K k) { return k == K::Text || k == K::Varchar || k == K::Name || k == K::Char; };
+    auto is_time = [](K k) { return k == K::Date || k == K::Time || k == K::TimeTz || k == K::Timestamp || k == K::TimestampTz; };
+    auto call = [&](const std::string& ctype, const std::string& fallback, const std::string& value) {
+      return guarded(ctype, fallback, v.null, value, e.phys());
+    };
+    auto view = [&](const std::string& value) { return call("bc_view", "bc_empty(cx)", value); };
+    auto i64 = [&](const std::string& value) { return call("int64_t", "0", value); };
+    auto f64 = [&](const std::string& value) { return call("double", "0.0", value); };
+    auto n = [](auto x) { return std::to_string(x); };
+    // A relabel over a cast: the cast's value, of another type of the same bytes.
+    if (cast_kind(from, to) == CastKind::Relabel) return v;
+    // jsonb's casts out, and text to jsonb (stage 3's calls).
+    if (to.kind == K::Jsonb) return guarded("bc_jsonb", "", v.null, "bc_jsonb_in(cx, " + v.value + ")", PhysType::Jsonb);
+    if (from.kind == K::Jsonb) {
+      if (is_text(to.kind)) {
+        auto text = "bc_jsonb_text(cx, " + v.value + ")";
+        return view(to.kind == K::Name ? "bc_text_in_bytes(cx, " + text + ", BC_TYPE_NAME)" : text);
+      }
+      if (to.kind == K::Boolean) return call("bool", "0", "bc_jsonb_to_bool(cx, " + v.value + ")");
+      if (is_int(to.kind)) return i64("bc_jsonb_to_i64(cx, " + v.value + ", " + int_type_code(to.kind) + ", 0)");
+      if (is_float(to.kind)) return f64("bc_jsonb_to_f64(cx, " + v.value + ", " + (to.kind == K::Real ? "1" : "0") + ")");
+      if (to.kind == K::Numeric) return view("bc_jsonb_to_num(cx, " + v.value + ")");
+      throw std::logic_error{"physical plan: a jsonb cast codegen does not print"};
+    }
+    // To a string type: a CHAR(n)'s value without its trailing spaces, a
+    // NAME's cut; any other type's output function.
+    if (is_text(to.kind)) {
+      std::string text;
+      if (is_text(from.kind) || from.kind == K::Numeric) {
+        text = from.kind == K::Char ? "bc_trim(cx, " + v.value + ", bc_empty(cx), BC_TRIM_TRAILING | BC_TRIM_SPACES)" : v.value;
+      } else if (from.kind == K::Bytea) {
+        text = "bc_bytea_text(cx, " + v.value + ")";
+      } else if (from.kind == K::Boolean) {
+        // booltext to text; boolout, the I/O cast, to a name.
+        text = "bc_value_text(cx, " + v.value + " ? 1 : 0, BC_TYPE_BOOLEAN, " + (to.kind == K::Name ? "1" : "0") + ")";
+      } else {
+        text = "bc_value_text(cx, " + v.value + ", " + sql_type_code(from.kind) + ", " + n(decimal_scale(from)) + ")";
+      }
+      if (to.kind == K::Name && from.kind != K::Name) text = "bc_text_in_bytes(cx, " + text + ", BC_TYPE_NAME)";
+      return view(text);
+    }
+    // From a string type: the target's input function.
+    if (is_text(from.kind)) {
+      if (is_int(to.kind) || is_time(to.kind) || to.kind == K::Decimal) {
+        return i64("bc_text_in_i64(cx, " + v.value + ", " + sql_type_code(to.kind) + ", " + n(to.precision) + ", " +
+                   n(to.scale) + ", 0)");
+      }
+      if (is_float(to.kind)) return f64("bc_text_in_f64(cx, " + v.value + ", " + sql_type_code(to.kind) + ")");
+      if (to.kind == K::Boolean) return call("bool", "0", "bc_text_in_bool(cx, " + v.value + ")");
+      if (to.kind == K::Bytea) return view("bc_text_in_bytes(cx, " + v.value + ", BC_TYPE_BYTEA)");
+      throw std::logic_error{"physical plan: a cast from text codegen does not print"};
+    }
+    if (is_time(from.kind)) {
+      if (from.kind == to.kind || ((from.kind == K::Timestamp || from.kind == K::TimestampTz) &&
+                                   (to.kind == K::Timestamp || to.kind == K::TimestampTz))) {
+        return i64(v.value);  // unchanged in the layer's UTC
+      }
+      return i64("bc_temporal_cast(cx, " + v.value + ", " + sql_type_code(from.kind) + ", " + sql_type_code(to.kind) + ")");
+    }
+    if (from.kind == K::Boolean) return i64(v.value + " ? 1 : 0");
+    if (to.kind == K::Boolean) return call("bool", "0", v.value + " != 0");
+    if (is_float(from.kind)) {
+      if (is_int(to.kind)) return i64("bc_f64_to_int(cx, " + v.value + ", " + int_type_code(to.kind) + ", 0)");
+      if (to.kind == K::Decimal) {
+        return i64("bc_f64_to_decimal(cx, " + v.value + ", " + (from.kind == K::Real ? "1" : "0") + ", " + n(to.precision) +
+                   ", " + n(to.scale) + ", 0)");
+      }
+      return f64(to.kind == K::Real ? "bc_f64_to_f32(cx, " + v.value + ")" : v.value);
+    }
+    // An integer or a DECIMAL.
+    if (is_float(to.kind)) {
+      if (from.kind == K::Decimal) {
+        return f64("bc_decimal_to_f64(cx, " + v.value + ", " + n(from.scale) + ", " + (to.kind == K::Real ? "1" : "0") + ")");
+      }
+      return f64(to.kind == K::Real ? "bc_i64_to_f32(" + v.value + ")" : "bc_i64_to_f64(" + v.value + ")");
+    }
+    if (from.kind != K::Decimal && is_int(to.kind)) {
+      // Widening is the value; narrowing is range-checked, never wrapped.
+      auto narrows = to.kind == K::SmallInt || (to.kind == K::Integer && from.kind == K::BigInt);
+      return i64(narrows ? "bc_check_int(cx, " + v.value + ", " + int_type_code(to.kind) + ", 0)" : v.value);
+    }
+    return i64("bc_decimal_rescale(cx, " + v.value + ", " + n(decimal_scale(from)) + ", " + sql_type_code(to.kind) + ", " +
+               n(to.precision) + ", " + n(to.scale) + ", 0)");
+  }
+
   // a || b: text with text, an integer or a DECIMAL through its text. NULL if
   // either is.
   auto eval_concat(const Expr& e) -> Val {
     auto text = [&](const Expr& arg) {
       auto v = eval(arg);
       if (v.type == PhysType::Bytes) return v;
-      v.value = "bc_number_text(cx, " + v.value + ", " + std::to_string(decimal_scale(arg.type)) + ")";
+      v.value = "bc_value_text(cx, " + v.value + ", " + sql_type_code(arg.type.kind) + ", " +
+                std::to_string(decimal_scale(arg.type)) + ")";
       return v;
     };
     auto a = text(e.args[0]);

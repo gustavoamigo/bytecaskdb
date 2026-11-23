@@ -465,3 +465,29 @@
   teardown:
     - DROP TABLE wt
     - DROP TABLE wu
+
+- name: a cast in a WHERE, an ON and an ORDER BY is evaluated per row, raising only for rows reached
+  features: [pg:cast-operator]
+  setup:
+    - CREATE TABLE wc (id INTEGER PRIMARY KEY, s TEXT, j JSONB)
+    - "INSERT INTO wc VALUES (1, '7', '{\"n\": \"3\"}'), (2, 'x', '{\"n\": \"10\"}'), (3, '2', NULL)"
+  steps:
+    - sql: SELECT id FROM wc WHERE id = 1 AND s::integer = 7
+      expected: [[1]]
+    - sql: SELECT id FROM wc WHERE s::integer = 7
+      error: "22P02"
+    - sql: SELECT id FROM wc WHERE (j->>'n')::integer > 5
+      expected: [[2]]
+    - sql: SELECT id FROM wc WHERE (j->>'n')::integer > $1
+      params: [2]
+      expected: [[1], [2]]
+    - sql: SELECT id FROM wc ORDER BY (j->>'n')::integer DESC NULLS LAST, id
+      expected: [[2], [1], [3]]
+      ordered: true
+    - sql: SELECT a.id, b.id FROM wc a JOIN wc b ON (a.j->>'n')::integer = b.id + 1 ORDER BY 1
+      expected: [[1, 2]]
+    - sql: SELECT sum((j->>'n')::integer), max(s::text) FROM wc
+      expected: [[13, x]]
+    - sql: SELECT id FROM wc WHERE id <> 2 ORDER BY s::integer
+      expected: [[3], [1]]
+      ordered: true

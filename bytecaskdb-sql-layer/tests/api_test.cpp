@@ -4171,7 +4171,7 @@ TEST_CASE("embedded API: a TIME WITH TIME ZONE column keeps its time and offset,
     CHECK(message("UPDATE tz SET plain = CURRENT_DATE WHERE n = 1") ==
           "42804 column \"plain\" is of type time without time zone but expression is of type date");
     CHECK(state("SELECT CAST(TIMETZ '12:00' AS TIMESTAMP)") == "42846");
-    CHECK(state("SELECT CAST(LOCALTIMESTAMP AS TIMETZ)") == "42601");  // a cast of the clock: not yet
+    CHECK(state("SELECT CAST(LOCALTIMESTAMP AS TIMETZ)") == "42846");  // a timestamp has no cast to timetz
     CHECK(state("SELECT CAST(TIMESTAMP '2020-01-01' AS TIMETZ)") == "42846");
     CHECK(state("SELECT TIMETZ '12:00+16'") == "22009");
     CHECK(state("SELECT TIMETZ '24:00:01'") == "22008");
@@ -5687,4 +5687,133 @@ TEST_CASE("embedded API: a held MIN or MAX of text is charged to the statement, 
   // One value held at a time fits; one per group, six of 12 KB, does not.
   CHECK(state("SELECT max(t) FROM mb") == "ran");
   CHECK(state("SELECT g, max(t) FROM mb GROUP BY g") == "54000");
+}
+
+TEST_CASE("embedded API: casts of expressions give PostgreSQL 17's values and errors", "[sql][api][cast]") {
+  sql_test::TempDir dir{"api_casts"};
+  auto db = Database::open(dir.path());
+  (void)db->execute(
+      "CREATE TABLE c (id INT PRIMARY KEY, s TEXT, n INT, b BIGINT, d NUMERIC(5,2), f DOUBLE PRECISION, r REAL, "
+      "ch CHAR(3), dt DATE, ts TIMESTAMP, bo BOOLEAN, by BYTEA, j JSONB, sm SMALLINT)");
+  (void)db->execute(
+      "INSERT INTO c VALUES (1, '12', 70000, 3000000000, 2.50, 2.5, 1.5, 'ab', '2024-03-01', '2024-03-01 10:00', true, "
+      "'\\x6162', '{\"n\": \"7\"}', 7)");
+  (void)db->execute("INSERT INTO c (id, s, f, d, dt) VALUES (2, 'x', 3.5, -2.50, '5874897-12-31')");
+  (void)db->execute("INSERT INTO c (id, s) VALUES (3, NULL)");
+  auto text = [](const Value& v) -> std::string {
+    if (std::holds_alternative<std::monostate>(v)) return "NULL";
+    const auto& b = std::get<std::vector<std::byte>>(v);
+    return {reinterpret_cast<const char*>(b.data()), b.size()};  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+  };
+  // Each column of the one row `sql` returns, each a text value.
+  auto row = [&](std::string_view sql) {
+    auto r = db->execute(sql);
+    REQUIRE(r.rows.size() == 1);
+    std::vector<std::string> out;
+    for (const auto& v : r.rows[0]) out.push_back(text(v));
+    return out;
+  };
+  // An error as its SQLSTATE, message and DETAIL, and whether it is a range error (BC_C_RANGE).
+  auto error = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      auto out = std::string{sqlstate(e)} + " " + e.what();
+      if (!e.note().empty()) out += " | " + std::string{e.note()};
+      if (e.constraint() && e.constraint()->constraint == BC_C_RANGE) out += " (range)";
+      return out;
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what();
+    }
+    return "ran";
+  };
+
+  SECTION("values, each as PostgreSQL 17 casts it") {
+    CHECK(row("SELECT (s::int + 1)::text, (j->>'n')::int::text, n::bigint::text, d::int::text, (d * 3)::int::text, "
+              "f::int::text, r::int::text, f::numeric(3,0)::text, d::float8::numeric(3,1)::text, bo::int::text, "
+              "n::bool::text, bo::text, bo::name::text, dt::timestamp::text, ts::date::text, ts::time::text, by::text, "
+              "ch::text || '|', j::text, sm::numeric(3,1)::text, r::float8::numeric(2,1)::text FROM c WHERE id = 1") ==
+          std::vector<std::string>{"13", "7", "70000", "3", "8", "2", "2", "3", "2.5", "1", "true", "true", "t",
+                                   "2024-03-01 00:00:00", "2024-03-01", "10:00:00", "\\x6162", "ab|", "{\"n\": \"7\"}",
+                                   "7.0", "1.5"});
+    // rint ties to even; a DECIMAL rounds half away from zero.
+    CHECK(row("SELECT f::int::text, d::int::text, d::numeric(2,0)::text FROM c WHERE id = 2") ==
+          std::vector<std::string>{"4", "-3", "-3"});
+    // A text cut to a name's 63 bytes; read by each input function.
+    std::string name63;
+    for (auto k = 0; k < 63; ++k) name63.push_back(k % 2 == 0 ? '1' : '2');
+    CHECK(row("SELECT (s || s || s || s || s || s || s || s || s || s || s || s || s || s || s || s || s || s || s || s || "
+              "s || s || s || s || s || s || s || s || s || s || s || s || s || s || s)::name::text, "
+              "(' 0x1F ' || s)::text, ('1' || s)::numeric(6,1)::text, (s || '.5')::numeric(3,0)::text, "
+              "('2024-01-0' || '2')::date::text, ('ye' || 's')::bool::text, ('\\x' || s)::bytea::text, "
+              "('1' || s)::real::numeric(4,0)::text FROM c WHERE id = 1") ==
+          std::vector<std::string>{name63,
+                                   " 0x1F 12", "112.0", "13", "2024-01-02", "true", "\\x12", "112"});
+    // NULL is NULL, and no cast runs for it.
+    CHECK(row("SELECT s::int::text, (j->>'n')::int::text FROM c WHERE id = 3") == std::vector<std::string>{"NULL", "NULL"});
+    // A cast in a WHERE, an ORDER BY and an aggregate's argument.
+    CHECK(ids(db->execute("SELECT id FROM c WHERE id = 1 AND s::int = 12")) == std::vector<std::int64_t>{1});
+    CHECK(ids(db->execute("SELECT id FROM c WHERE s IS NOT NULL AND id <> 2 ORDER BY s::int DESC")) == std::vector<std::int64_t>{1});
+    CHECK(db->execute("SELECT sum(s::int) FROM c WHERE id = 1").rows == Grid{{i(12)}});
+    CHECK(ids(db->execute("SELECT id FROM c WHERE id = $1::text::int", {bytes("1")})) == std::vector<std::int64_t>{1});
+  }
+
+  SECTION("errors: the cast function's SQLSTATE, message and DETAIL; an integer or DECIMAL out of range is BC_C_RANGE") {
+    // Raised only for a row the statement evaluates the cast on.
+    CHECK(error("SELECT id FROM c WHERE s::int = 7") == "22P02 invalid input syntax for type integer: \"x\"");
+    CHECK(error("SELECT b::int FROM c WHERE id = 1") == "22003 integer out of range (range)");
+    CHECK(error("SELECT n::smallint FROM c WHERE id = 1") == "22003 smallint out of range (range)");
+    CHECK(error("SELECT (b::text)::int FROM c WHERE id = 1") ==
+          "22003 value \"3000000000\" is out of range for type integer (range)");
+    CHECK(error("SELECT (s || '00')::numeric(3,1) FROM c WHERE id = 1") ==
+          "22003 numeric field overflow | A field with precision 3, scale 1 must round to an absolute value less than "
+          "10^2. (range)");
+    CHECK(error("SELECT dt::timestamp FROM c WHERE id = 2") == "22008 date out of range for timestamp");
+    CHECK(error("SELECT (s || 'e39')::real FROM c WHERE id = 1") == "22003 \"12e39\" is out of range for type real");
+    CHECK(error("SELECT ('NaN' || s)::float8 FROM c WHERE id = 3") == "ran");  // NULL: no cast runs
+    CHECK(error("SELECT ('-inf' || s)::float8::numeric(3,0) FROM c WHERE id = 2") == "22P02 invalid input syntax for type double precision: \"-infx\"");
+    CHECK(error("SELECT (s || 'inity')::float8 FROM c WHERE id = 2") == "22P02 invalid input syntax for type double precision: \"xinity\"");
+    CHECK(error("SELECT ('2024-02-3' || '0')::date") == "22008 date/time field value out of range: \"2024-02-30\"");
+    CHECK(error("SELECT (s || '-01')::date FROM c WHERE id = 2") == "22007 invalid input syntax for type date: \"x-01\"");
+    CHECK(error("SELECT (s || 'zz')::bytea FROM c WHERE id = 2") == "ran");
+    CHECK(error("SELECT ('\\x' || s)::bytea FROM c WHERE id = 2") == "22023 invalid hexadecimal digit: \"x\"");
+    CHECK(error("SELECT ('\\x6' || s)::bytea FROM c WHERE id = 2") == "22023 invalid hexadecimal digit: \"x\"");
+    CHECK(error("SELECT ('\\x6 ' || s)::bytea FROM c WHERE id = 1") == "22023 invalid hexadecimal digit: \" \"");
+    CHECK(error("SELECT ('\\x61 ' || s || '6')::bytea FROM c WHERE id = 1") ==
+          "22023 invalid hexadecimal data: odd number of digits");
+    CHECK(error("SELECT ('a\\' || s)::bytea FROM c WHERE id = 2") == "22P02 invalid input syntax for type bytea");
+    CHECK(error("SELECT 'a\\400'::bytea") == "22P02 invalid input syntax for type bytea");
+    CHECK(error("SELECT (s || 'x')::bool FROM c WHERE id = 1") == "22P02 invalid input syntax for type boolean: \"12x\"");
+    CHECK(error("SELECT (j->'n')::int FROM c WHERE id = 1") == "22023 cannot cast jsonb string to type integer");
+    CHECK(error("SELECT f::numeric(3,0) FROM c WHERE id = 1") == "ran");
+    CHECK(error("SELECT ('1e39')::float8::real") == "22003 value out of range: overflow");
+  }
+
+  SECTION("a procedure's expressions cast as a select list's") {
+    (void)db->execute(R"(CREATE PROCEDURE cast_p(x TEXT, INOUT y INTEGER, INOUT z TEXT) LANGUAGE plpgsql AS $$
+BEGIN
+  y := (x || '0')::integer + 1;
+  z := (y * 2)::text || '|' || y::bigint::text;
+END $$)");
+    auto out = db->call("cast_p", {bytes("4"), Value{}, Value{}});
+    CHECK(out.rows == Grid{{i(41), Value{bytes("82|41")}}});
+    try {
+      (void)db->call("cast_p", {bytes("z"), Value{}, Value{}});
+      FAIL("a cast of 'z0' to integer ran");
+    } catch (const ExecError& e) {
+      CHECK(sqlstate(e) == "22P02");
+      CHECK(std::string{e.what()} == "invalid input syntax for type integer: \"z0\"");
+    }
+  }
+
+  SECTION("NaN and infinity of a float into a DECIMAL, and a float past REAL") {
+    (void)db->execute("INSERT INTO c (id, f) VALUES (4, 'NaN'), (5, '-Infinity'), (6, '1e39'), (7, '1e-50')");
+    CHECK(error("SELECT f::numeric(3,0) FROM c WHERE id = 4") ==
+          "22003 numeric field overflow | A field with precision 3, scale 0 cannot hold NaN. (range)");
+    CHECK(error("SELECT f::numeric(3,0) FROM c WHERE id = 5") ==
+          "22003 numeric field overflow | A field with precision 3, scale 0 cannot hold an infinite value. (range)");
+    CHECK(error("SELECT f::int FROM c WHERE id = 4") == "22003 integer out of range (range)");
+    CHECK(error("SELECT f::real FROM c WHERE id = 6") == "22003 value out of range: overflow");
+    CHECK(error("SELECT f::real FROM c WHERE id = 7") == "22003 value out of range: underflow");
+  }
 }

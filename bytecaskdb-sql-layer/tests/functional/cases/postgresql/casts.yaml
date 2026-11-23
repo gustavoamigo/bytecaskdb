@@ -181,3 +181,142 @@
       error: "22003"
     - sql: SELECT 'Infinityx'::numeric(3,0)
       error: "22P02"
+
+- name: a cast of a column is computed for each row (casts of expressions)
+  features: [pg:cast-operator]
+  setup:
+    - CREATE TABLE cx (id INTEGER PRIMARY KEY, s TEXT, n INTEGER, b BIGINT, d NUMERIC(5,2), f DOUBLE PRECISION, r REAL, ch CHAR(3), dt DATE, ts TIMESTAMP, tz TIMESTAMPTZ, tm TIME, ttz TIMETZ, bo BOOLEAN, by BYTEA, nm NAME, sm SMALLINT)
+    - INSERT INTO cx VALUES (1, '12', 5, 3000000000, 2.50, 2.5, 1.5, 'ab', '2024-03-01', '2024-03-01 10:00', '2024-03-01 10:00+00', '10:00', '10:00+00', true, '\x6162', 'nm', 7)
+    - INSERT INTO cx VALUES (2, ' 0x1F ', -7, -5, -2.50, 3.5, -2.5, 'q', '2024-02-29', '1999-12-31 23:59:59.5', '2000-01-01 00:00+00', '23:59:59', '01:00+00', false, '\x', 'z', -3)
+    - INSERT INTO cx (id) VALUES (3)
+  steps:
+    - sql: SELECT s::integer, s::bigint + 1, s::smallint FROM cx ORDER BY id
+      expected: [[null, null, null], [12, 13, 12], [31, 32, 31]]
+    - sql: SELECT n::text, b::text, d::text, bo::text, bo::name, dt::text, ts::text, tz::text, tm::text, ttz::text, by::text, nm::text, ch::text || '|' FROM cx ORDER BY id
+      expected:
+        - [null, null, null, null, null, null, null, null, null, null, null, null, null]
+        - [-7, -5, "-2.50", "false", f, "2024-02-29", "1999-12-31 23:59:59.5", "2000-01-01 00:00:00+00", "23:59:59", 01:00:00+00, \x, z, q|]
+        - [5, 3000000000, "2.50", "true", t, "2024-03-01", "2024-03-01 10:00:00", "2024-03-01 10:00:00+00", "10:00:00", 10:00:00+00, \x6162, nm, ab|]
+    - sql: SELECT n::bigint, d::integer, d::smallint, d::numeric(3,0), n::numeric(4,1), f::integer, r::integer, f::numeric(3,0), r::numeric(3,1), n::boolean, bo::integer FROM cx ORDER BY id
+      expected:
+        - [null, null, null, null, null, null, null, null, null, null, null]
+        - [-7, -3, -3, -3, "-7.0", 4, -2, 4, "-2.5", t, 0]
+        - [5, 3, 3, 3, "5.0", 2, 2, 3, "1.5", t, 1]
+    - sql: SELECT d::float8, d::real, n::float8, f::real, r::float8 FROM cx ORDER BY id
+      expected:
+        - [null, null, null, null, null]
+        - ["-2.5", "-2.5", -7, "3.5", "-2.5"]
+        - ["2.5", "2.5", 5, "2.5", "1.5"]
+    - sql: SELECT dt::timestamp, dt::timestamptz, ts::date, ts::time, tz::date, tz::time, tz::timetz, tm::timetz, ttz::time, ts::timestamptz, tz::timestamp FROM cx ORDER BY id
+      expected:
+        - [null, null, null, null, null, null, null, null, null, null, null]
+        - ["2024-02-29 00:00:00", "2024-02-29 00:00:00+00", "1999-12-31", 23:59:59.5, "2000-01-01", 00:00:00, 00:00:00+00, 23:59:59+00, 01:00:00, "1999-12-31 23:59:59.5+00", "2000-01-01 00:00:00"]
+        - ["2024-03-01 00:00:00", "2024-03-01 00:00:00+00", "2024-03-01", "10:00:00", "2024-03-01", "10:00:00", 10:00:00+00, 10:00:00+00, "10:00:00", "2024-03-01 10:00:00+00", "2024-03-01 10:00:00"]
+    - sql: SELECT s::name, s::bytea, ch::name, ch::varchar FROM cx ORDER BY id
+      expected:
+        - [null, null, null, null]
+        - [" 0x1F ", \x203078314620, q, q]
+        - [12, \x3132, ab, ab]
+    - sql: SELECT (s || '0')::integer, (d * 3)::integer, (n + 1)::text FROM cx ORDER BY id
+      error: "22P02"
+    - sql: SELECT CAST(s AS integer) + 1 FROM cx WHERE id = 1
+      expected: [[13]]
+
+- name: a cast of a column raises the cast function's error for a row it reaches
+  features: [pg:cast-operator]
+  setup:
+    - CREATE TABLE ce (id INTEGER PRIMARY KEY, s TEXT, b BIGINT, d NUMERIC(5,2), f DOUBLE PRECISION, dt DATE)
+    - INSERT INTO ce VALUES (1, 'ab', 3000000000, 999.99, '1e39', '5874897-12-31'), (2, '3000000000', 70000, 1.00, 2.5, '2024-01-01'), (3, '2024-02-30', NULL, NULL, NULL, NULL), (4, '1e39', NULL, NULL, NULL, NULL), (5, '123.456', NULL, NULL, NULL, NULL), (6, 'maybe', NULL, NULL, NULL, NULL)
+  steps:
+    - sql: SELECT s::integer FROM ce WHERE id = 1
+      error: "22P02"
+    - sql: SELECT s::integer FROM ce WHERE id = 2
+      error: "22003"
+    - sql: SELECT b::integer FROM ce WHERE id = 1
+      error: "22003"
+    - sql: SELECT b::smallint FROM ce WHERE id = 2
+      error: "22003"
+    - sql: SELECT d::numeric(4,2) FROM ce WHERE id = 1
+      error: "22003"
+    - sql: SELECT f::real FROM ce WHERE id = 1
+      error: "22003"
+    - sql: SELECT f::integer FROM ce WHERE id = 1
+      error: "22003"
+    - sql: SELECT dt::timestamp FROM ce WHERE id = 1
+      error: "22008"
+    - sql: SELECT s::date FROM ce WHERE id = 3
+      error: "22008"
+    - sql: SELECT s::date FROM ce WHERE id = 1
+      error: "22007"
+    - sql: SELECT s::real FROM ce WHERE id = 4
+      error: "22003"
+    - sql: SELECT s::numeric(5,2) FROM ce WHERE id = 5
+      expected: [["123.46"]]
+    - sql: SELECT s::numeric(4,2) FROM ce WHERE id = 5
+      error: "22003"
+    - sql: SELECT s::boolean FROM ce WHERE id = 6
+      error: "22P02"
+    - sql: SELECT s::integer FROM ce WHERE id = 99
+      expected: []
+
+- name: a cast PostgreSQL has no cast for is refused at the cast, whatever the rows
+  features: [pg:cast-operator]
+  setup:
+    - CREATE TABLE cn (id INTEGER PRIMARY KEY, dt DATE, sm SMALLINT, tm TIME, ts TIMESTAMP, n INTEGER)
+  steps:
+    - sql: SELECT dt::integer FROM cn
+      error: "42846"
+    - sql: SELECT sm::boolean FROM cn
+      error: "42846"
+    - sql: SELECT tm::timestamp FROM cn
+      error: "42846"
+    - sql: SELECT ts::timetz FROM cn
+      error: "42846"
+    - sql: SELECT n::date FROM cn
+      error: "42846"
+    - sql: SELECT n::jsonb FROM cn
+      error: "42846"
+
+- name: a parameter cast twice, its text read per execution
+  features: [pg:cast-operator]
+  setup:
+    - CREATE TABLE cp (id INTEGER PRIMARY KEY, s TEXT)
+    - INSERT INTO cp VALUES (1, '7'), (2, 'x')
+  steps:
+    - sql: SELECT $1::text::integer + 1
+      params: ["41"]
+      expected: [[42]]
+    - sql: SELECT $1::text::integer
+      params: ["zz"]
+      error: "22P02"
+    - sql: SELECT id FROM cp WHERE id = $1::text::integer
+      params: ["2"]
+      expected: [[2]]
+    - sql: SELECT ($1::jsonb -> 0)::integer::text
+      params: ["[3]"]
+      expected: [[3]]
+
+- name: bytea input errors per row and for a constant
+  features: [pg:cast-operator]
+  setup:
+    - CREATE TABLE cby (id INTEGER PRIMARY KEY, s TEXT)
+    - INSERT INTO cby VALUES (1, 'x'), (2, '12'), (3, '')
+  steps:
+    - sql: SELECT ('a\' || s)::bytea FROM cby WHERE id = 1
+      error: "22P02"
+    - sql: SELECT ('a\400' || s)::bytea FROM cby WHERE id = 3
+      error: "22P02"
+    - sql: SELECT ('\X61' || s)::bytea FROM cby WHERE id = 3
+      error: "22P02"
+    - sql: SELECT ('\x6' || s)::bytea FROM cby WHERE id = 1
+      error: "22023"
+    - sql: SELECT ('\x6 ' || s)::bytea FROM cby WHERE id = 2
+      error: "22023"
+    - sql: SELECT ('\x61 ' || s)::bytea FROM cby WHERE id = 2
+      expected: [[\x6112]]
+    - sql: SELECT ('\x6' || s)::bytea FROM cby WHERE id = 3
+      error: "22023"
+    - sql: SELECT 'a\400'::bytea
+      error: "22P02"
+    - sql: SELECT '\x6g'::bytea
+      error: "22023"
