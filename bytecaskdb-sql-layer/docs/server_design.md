@@ -801,6 +801,7 @@ Each `SqlType` has an OID, a length and a modifier, as `pg_type` and
 | `DATE` | 1082 | 4 | -1 |
 | `TIME` | 1083 | 8 | -1 |
 | `TIME WITH TIME ZONE` | 1266 | 12 | -1 |
+| `jsonb` | 3802 | -1 | -1 |
 
 A result column's type is the one the compiler gives it
 (`Compiled::column_types`), so the server only reports it:
@@ -827,6 +828,11 @@ above:
   back only by rounding a tie to even takes one more digit (`1e23` is
   `9.999999999999999e+22`);
 - `t` and `f`;
+- `jsonb` as `jsonb_out` writes it (`jsonb_design.md`, *jsonb output
+  text*); a parameter the layer types jsonb is read as `jsonb_in` reads
+  it, whatever OID the client gave, its 22P02 with PostgreSQL's DETAIL and
+  CONTEXT (D and W) at `Bind`, where PostgreSQL refuses OIDs 25 and 1043
+  with 42804;
 - `bytea` as `\x` and lower-case hex;
 - text as its bytes;
 - `TIMESTAMP` as `YYYY-MM-DD HH:MM:SS`, then `.` and the fraction digits

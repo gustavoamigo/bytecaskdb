@@ -177,21 +177,33 @@ auto suffix(PhysType t) -> std::string {
     case PhysType::Bool: return "bool";
     case PhysType::Bytes: return "bytes";
     case PhysType::Num: return "num";
+    case PhysType::Jsonb: return "jsonb";
   }
   return "i64";
 }
 
 // The suffix of a key's, a sort key's or a set's call for a value of type t:
-// a NUMERIC is carried and emitted, never keyed, compared or deduplicated.
+// a NUMERIC and a jsonb are carried and emitted, never keyed, compared or
+// deduplicated.
 auto key_suffix(PhysType t) -> std::string {
-  if (t == PhysType::Num) throw std::logic_error{"physical plan: a NUMERIC in a key, a sort key or a set"};
+  if (!keyable(t)) throw std::logic_error{"physical plan: a NUMERIC or a jsonb in a key, a sort key or a set"};
   return suffix(t);
 }
 
 // The suffix of a call that only carries a value of type t, never orders or
-// compares it (a sort key part that carries it, a column read or a row's
-// set): a NUMERIC rides as its text, bytes.
-auto carry_suffix(PhysType t) -> std::string { return t == PhysType::Num ? "bytes" : suffix(t); }
+// compares it (a column read, a parameter or a row's set): a NUMERIC rides
+// as its text, bytes; a jsonb as a bc_jsonb.
+auto carry_suffix(PhysType t) -> std::string {
+  switch (t) {
+    case PhysType::Num: return "bytes";
+    case PhysType::I64:
+    case PhysType::F64:
+    case PhysType::Bool:
+    case PhysType::Bytes:
+    case PhysType::Jsonb: return suffix(t);
+  }
+  return suffix(t);
+}
 
 // One line of the plan's header, as a // comment. SQL and names are the
 // user's, and none of their bytes may reach the C lexer as anything but
@@ -361,9 +373,11 @@ auto zero(PhysType t) -> std::string {
     case PhysType::Bool: return "false";
     case PhysType::Bytes:
     case PhysType::Num: return "bc_empty(cx)";
+    case PhysType::Jsonb: throw std::logic_error{"physical plan: a jsonb has no zero expression: declared()"};
   }
   return "INT64_C(0)";
 }
+
 
 auto c_type(PhysType t) -> std::string {
   switch (t) {
@@ -372,8 +386,17 @@ auto c_type(PhysType t) -> std::string {
     case PhysType::Bool: return "bool";
     case PhysType::Bytes:
     case PhysType::Num: return "bc_view";
+    case PhysType::Jsonb: return "bc_jsonb";
   }
   return "int64_t";
+}
+
+// A local of type t named `name`, declared at its zero: a jsonb's handle
+// field by field, since a struct initializer compiles to a memset call that a
+// plan cannot link.
+auto declared(PhysType t, const std::string& name) -> std::string {
+  if (t == PhysType::Jsonb) return "bc_jsonb " + name + "; " + name + ".i = 0; " + name + ".g = 0;";
+  return c_type(t) + " " + name + " = " + zero(t) + ";";
 }
 
 auto param(PhysType t, std::uint32_t n) -> std::string {
@@ -492,6 +515,7 @@ auto compare_text(SqlType at, SqlType bt, Op op, const std::string& a, const std
   switch (x) {
     case PhysType::Bytes: return "bc_bytes_cmp(cx, " + a + ", " + b + ") " + op_text(op) + " 0";
     case PhysType::Num: throw std::logic_error{"physical plan: a comparison of a NUMERIC"};
+    case PhysType::Jsonb: throw std::logic_error{"physical plan: a comparison of a jsonb"};
     case PhysType::F64:
     case PhysType::I64:
     case PhysType::Bool: break;
@@ -660,6 +684,7 @@ public:
       case PhysType::Bool: return "BC_T_BOOL";
       case PhysType::Bytes: return "BC_T_BYTES";
       case PhysType::Num: return "BC_T_NUM";
+      case PhysType::Jsonb: return "BC_T_JSONB";
     }
     return "BC_T_I64";
   }
@@ -869,6 +894,7 @@ private:
       case Expr::Kind::Substr:
       case Expr::Kind::TextFn:
       case Expr::Kind::Extract:
+      case Expr::Kind::JsonbCast:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
       case Expr::Kind::Abs:
@@ -916,6 +942,7 @@ private:
       case Expr::Kind::Substr:
       case Expr::Kind::TextFn:
       case Expr::Kind::Extract:
+      case Expr::Kind::JsonbCast:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
       case Expr::Kind::Abs:
@@ -1674,6 +1701,12 @@ private:
       case Expr::Kind::Substr: return eval_substr(e);
       case Expr::Kind::TextFn: return eval_text(e);
       case Expr::Kind::Extract: return eval_extract(e);
+      case Expr::Kind::JsonbCast: {
+        // jsonb_out's text, or text read by jsonb_in: the only two crossings.
+        auto v = eval(e.args[0]);
+        if (e.phys() == PhysType::Jsonb) return guarded("bc_jsonb", "", v.null, "bc_jsonb_in(cx, " + v.value + ")", PhysType::Jsonb);
+        return guarded("bc_view", "bc_empty(cx)", v.null, "bc_jsonb_text(cx, " + v.value + ")", PhysType::Bytes);
+      }
       case Expr::Kind::Random: {
         auto lo = eval(e.args[0]);
         auto hi = eval(e.args[1]);
@@ -1748,6 +1781,7 @@ private:
       case Expr::Kind::Substr:
       case Expr::Kind::TextFn:
       case Expr::Kind::Extract:
+      case Expr::Kind::JsonbCast:
       case Expr::Kind::Random:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
@@ -1805,6 +1839,7 @@ private:
       case SqlKind::Real:
       case SqlKind::Double:
       case SqlKind::Numeric:
+      case SqlKind::Jsonb:
       case SqlKind::Boolean:
       case SqlKind::Text:
       case SqlKind::Varchar:
@@ -1886,7 +1921,7 @@ private:
   auto guarded(const std::string& ctype, const std::string& fallback, const std::string& null, const std::string& value,
                PhysType type) -> Val {
     auto id = std::to_string(exprs_++);
-    w_.line(ctype + " v" + id + " = " + fallback + ";");
+    w_.line(type == PhysType::Jsonb ? declared(type, "v" + id) : ctype + " v" + id + " = " + fallback + ";");
     if (null.empty()) {
       w_.line("v" + id + " = " + value + ";");
       return {"", "v" + id, type};
@@ -1943,6 +1978,7 @@ private:
       case PhysType::Bool: w_.line("bool v" + id + " = 0;"); break;
       case PhysType::Bytes:
       case PhysType::Num: w_.line("bc_view v" + id + "; v" + id + ".i = 0; v" + id + ".g = 0;"); break;
+      case PhysType::Jsonb: w_.line("bc_jsonb v" + id + "; v" + id + ".i = 0; v" + id + ".g = 0;"); break;
     }
     w_.line("bool n" + id + " = 1;");
     return id;
@@ -2755,7 +2791,7 @@ private:
           std::tie(is_null, value) = group_value(o);
         }
         w_.line("bool " + n + " = " + (is_null.empty() ? "false" : is_null) + ";");
-        w_.line(c_type(type) + " " + v + " = " + zero(type) + ";");
+        w_.line(declared(type, v));
         w_.line("if (!" + n + ") " + v + " = " + value + ";");
       }
       rows_.push_back({d.table, name, false, 0, false, "c", true, true});
@@ -3132,8 +3168,13 @@ private:
       const auto x = fresh("x");
       const auto at = std::to_string(part++);
       w_.line("bool " + n + " = bc_sort_key_part_null(cx, " + held + ", " + at + ");");
-      w_.line(c_type(type) + " " + x + " = " + zero(type) + ";");
-      w_.line("if (!" + n + ") " + x + " = bc_sort_key_part_" + carry_suffix(type) + "(cx, " + held + ", " + at + ");");
+      w_.line(declared(type, x));
+      // A jsonb rides as its text and is read back by jsonb_in: the same value.
+      if (type == PhysType::Jsonb) {
+        w_.line("if (!" + n + ") " + x + " = bc_jsonb_in(cx, bc_sort_key_part_bytes(cx, " + held + ", " + at + "));");
+      } else {
+        w_.line("if (!" + n + ") " + x + " = bc_sort_key_part_" + carry_suffix(type) + "(cx, " + held + ", " + at + ");");
+      }
       if (type == PhysType::F64) {
         const auto neg = std::to_string(part++);
         w_.line("if (bc_sort_key_part_bool(cx, " + held + ", " + neg + ")) " + x + " *= -1.0;");
@@ -3168,7 +3209,11 @@ private:
     const auto d = fresh("k");
     w.line("bc_sort_key " + d + " = bc_sort_key_begin(cx);");
     for (const auto& v : row) {
-      part(d, v, "BC_SORT_ASC, BC_SORT_NULLS_LAST", carry_suffix(v.type));
+      if (v.type == PhysType::Jsonb) {
+        part(d, Val{v.null, "bc_jsonb_text(cx, " + v.value + ")", PhysType::Bytes}, "BC_SORT_ASC, BC_SORT_NULLS_LAST", "bytes");
+      } else {
+        part(d, v, "BC_SORT_ASC, BC_SORT_NULLS_LAST", carry_suffix(v.type));
+      }
       // The key holds -0.0 as 0.0; the sign of a zero rides in a part of its own.
       if (v.type == PhysType::F64) {
         w.line("bc_sort_key_bool(cx, " + d + ", !" + v.null + " && " + v.value + " == 0.0 && 1.0 / " + v.value +
@@ -3204,7 +3249,7 @@ private:
         auto n = fresh("n");
         auto x = fresh("x");
         w.line("bool " + n + " = " + v.null + ";");
-        w.line(c_type(v.type) + " " + x + " = " + zero(v.type) + ";");
+        w.line(declared(v.type, x));
         w.line("if (!" + n + ") " + x + " = " + v.value + ";");
         out.push_back({n, x, v.type});
       }
@@ -3579,6 +3624,7 @@ private:
         case PhysType::Bool: return "bc_var_set_bool(px, " + slot + ", " + v.value + ");";
         case PhysType::Bytes: return "bc_var_set_bytes(px, " + slot + ", " + v.value + ");";
         case PhysType::Num: throw std::logic_error{"procedure: a variable set to a NUMERIC"};
+        case PhysType::Jsonb: throw std::logic_error{"procedure: a variable set to a jsonb"};
       }
       return {};
     }();

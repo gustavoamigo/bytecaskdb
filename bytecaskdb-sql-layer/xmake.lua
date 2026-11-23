@@ -172,6 +172,21 @@ target("sql_layer_bench")
     add_rules("bytecask.native_flags")
     add_files("bench/*.cpp")
 
+-- libFuzzer targets of jsonb's decoder and parser (docs/jsonb_design.md,
+-- *Tests of jsonb by stage*): their properties also run, over generated
+-- mutations, in sql_layer_tests. Not built by default and not run in CI.
+-- Build: CLANG_TARGET_TRIPLE=$(clang --print-target-triple) xmake f --sanitizer=fuzzer,address -m debug --sql_layer=y -y
+--        xmake build fuzz_sql_jsonb_decode   (or fuzz_sql_jsonb_parse)
+for _, name in ipairs({"decode", "parse"}) do
+    target("fuzz_sql_jsonb_" .. name)
+        set_kind("binary")
+        set_default(false)
+        add_deps("sql_layer")
+        add_rules("bytecask.native_flags")
+        add_files("tests/fuzz/fuzz_jsonb_" .. name .. ".cpp")
+    target_end()
+end
+
 -- The TPROC-C harness (docs/testing_design.md, *The TPROC-C harness*):
 -- TPROC-C through the embedded API, and Elle histories through SQL. Not
 -- built by default and not run in CI; its smoke test is in sql_layer_tests.

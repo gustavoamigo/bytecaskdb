@@ -58,6 +58,7 @@
 
 
 import bytecask.sql.api;
+import bytecask.sql.jsonb;
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -157,8 +158,9 @@ auto to_python(const sql::Value& v, sql::SqlType t) -> nb::object {
   if (const auto* b = std::get_if<sql::Bytes>(&v)) {
     // A NUMERIC: its text (sql::Rows).
     if (t.kind == sql::SqlKind::Numeric) return nb::borrow(decimal_type)(nb::str(bytes_view(*b).data(), b->size()));
+    // A jsonb: its text, at every edge (sql::Rows).
     if (t.kind == sql::SqlKind::Text || t.kind == sql::SqlKind::Varchar || t.kind == sql::SqlKind::Char ||
-        t.kind == sql::SqlKind::Name) {
+        t.kind == sql::SqlKind::Name || t.kind == sql::SqlKind::Jsonb) {
       auto s = bytes_view(*b);
       auto* o = PyUnicode_DecodeUTF8(s.data(), std::ssize(s), "strict");
       if (o == nullptr) throw nb::python_error();  // stored bytes that are not UTF-8: UnicodeDecodeError
@@ -209,7 +211,14 @@ auto catalog(const sql::Database& db) -> nb::list {
       col["name"] = c.name;
       col["type"] = sql::sql_type_name(c.sql);
       col["nullable"] = c.nullable;
-      col["default"] = to_python(c.default_value, c.sql);
+      // A jsonb's default is held as its stored value: its text here.
+      if (const auto* b = std::get_if<sql::Bytes>(&c.default_value); b != nullptr && c.sql.kind == sql::SqlKind::Jsonb) {
+        std::string text;
+        if (!sql::jsonb::value_text(*b, text).ok()) throw std::runtime_error("default of jsonb column " + c.name + " does not decode");
+        col["default"] = nb::str(text.data(), text.size());
+      } else {
+        col["default"] = to_python(c.default_value, c.sql);
+      }
       columns.append(col);
     }
     nb::list pk;

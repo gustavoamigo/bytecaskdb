@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 20). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 21). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime
@@ -34,6 +34,12 @@ typedef struct { uint32_t i; uint64_t g; } bc_group;
 typedef struct { uint32_t i; uint64_t g; } bc_key;    /* a table's or index's key under construction */
 typedef struct { uint32_t i; uint64_t g; } bc_sort_key;  /* a sort key under construction */
 typedef struct { uint32_t i; uint64_t g; } bc_row;    /* a row under construction */
+/* A jsonb value: a view of one node of the binary layout (docs/jsonb_design.md,
+   *Binary layout of a jsonb value*), without its format byte. Only bc_*jsonb*
+   calls take or return one: its entry is tagged as jsonb, every jsonb call
+   refuses a view that is not, and every bytes call one that is (BC_E_HANDLE),
+   so text and binary never meet. */
+typedef struct { uint32_t i; uint64_t g; } bc_jsonb;
 
 typedef void (*bc_plan_fn)(bc_ctx *);               /* every plan has this signature */
 
@@ -162,7 +168,10 @@ typedef struct {
    column of it is read with bc_col_bytes and set with bc_row_set_bytes or
    bc_row_set_param, which store the text as numeric_in reads it and refuse
    text that is no number (BC_C_RANGE). */
-enum bc_type { BC_T_I64 = 1, BC_T_F64 = 2, BC_T_BOOL = 3, BC_T_BYTES = 4, BC_T_NUM = 5 };
+/* BC_T_JSONB: a jsonb value, a bc_jsonb; a result or a jsonb column's, never a
+   key's part. Read with bc_col_jsonb, set with bc_row_set_jsonb or
+   bc_row_set_param, emitted as its text (jsonb_out's). */
+enum bc_type { BC_T_I64 = 1, BC_T_F64 = 2, BC_T_BOOL = 3, BC_T_BYTES = 4, BC_T_NUM = 5, BC_T_JSONB = 6 };
 
 /* Runtime: creating, running and committing. Called by the server, never by a plan. */
 bc_ctx *bc_ctx_new(bc_db *db, const bc_catalog *cat);
@@ -309,6 +318,9 @@ double   bc_param_f64(bc_ctx *, uint32_t i);
 bool     bc_param_bool(bc_ctx *, uint32_t i);
 bc_view  bc_param_bytes(bc_ctx *, uint32_t i);
 bool     bc_param_null(bc_ctx *, uint32_t i);
+bc_jsonb bc_param_jsonb(bc_ctx *, uint32_t i);   /* parameter i's text, parsed as jsonb_in reads it, once per
+                                                    execution; lives until reset. Text that is no JSON is
+                                                    BC_E_DATA (22P02, 22P05, 22003, 54001, 22021) */
 
 void     bc_emit_begin(bc_ctx *);                     /* a row of the plan's result layout */
 void     bc_emit_i64(bc_ctx *, int64_t);
@@ -316,8 +328,9 @@ void     bc_emit_f64(bc_ctx *, double);
 void     bc_emit_bool(bc_ctx *, bool);
 void     bc_emit_bytes(bc_ctx *, bc_view);
 void     bc_emit_num(bc_ctx *, bc_view);              /* a BC_T_NUM column: numeric text, as bc_num_quotient's */
+void     bc_emit_jsonb(bc_ctx *, bc_jsonb);           /* a BC_T_JSONB column: the value's text (jsonb_out's) */
 void     bc_emit_null(bc_ctx *);
-void     bc_emit_col(bc_ctx *, bc_view row, uint32_t col);                /* the column, NULL as NULL */
+void     bc_emit_col(bc_ctx *, bc_view row, uint32_t col);                /* the column, NULL as NULL; a jsonb's text */
 void     bc_emit_key_part(bc_ctx *, uint32_t table_or_index, bc_view key, uint32_t part);   /* not a DOUBLE part: BC_E_HANDLE */
 void     bc_emit_end(bc_ctx *);
 void     bc_emit_count(bc_ctx *, int64_t affected);   /* write statements: the row count */
@@ -362,6 +375,14 @@ bool    bc_bytes_prefix(bc_ctx *, bc_view prefix, bc_view);
    bytes; bc_position, the 1-based character `needle` first starts at in s,
    0 for none and 1 for an empty needle. */
 bc_view bc_concat(bc_ctx *, bc_view a, bc_view b);
+/* jsonb and text, the two crossings between the forms (docs/jsonb_design.md,
+   *One form for a jsonb value at each boundary*). bc_jsonb_in: text parsed as
+   jsonb_in reads it (BC_E_DATA with its SQLSTATE, DETAIL and CONTEXT for text
+   that is no JSON); bc_jsonb_text: the value's text (jsonb_out's) in a new
+   view. Both charged; a text past 1 GiB - 1 is BC_E_LIMIT, before it is
+   allocated. */
+bc_jsonb bc_jsonb_in(bc_ctx *, bc_view text);
+bc_view  bc_jsonb_text(bc_ctx *, bc_jsonb);
 bc_view bc_number_text(bc_ctx *, int64_t v, uint32_t scale);
 /* PostgreSQL's AVG of an integer or a DECIMAL, as numeric text (BC_T_NUM):
    numeric_div of sum (a total at `scale`) by count, at the scale
@@ -490,6 +511,9 @@ int64_t  bc_col_i64(bc_ctx *, bc_view row, uint32_t col);
 double   bc_col_f64(bc_ctx *, bc_view row, uint32_t col);
 bool     bc_col_bool(bc_ctx *, bc_view row, uint32_t col);
 bc_view  bc_col_bytes(bc_ctx *, bc_view row, uint32_t col);  /* a sub-view; same lifetime as row; a NUMERIC's text */
+bc_jsonb bc_col_jsonb(bc_ctx *, bc_view row, uint32_t col);  /* a jsonb column's node, its format byte checked
+                                                                (BC_E_CORRUPT otherwise): a sub-view, same lifetime
+                                                                as row */
 bc_view  bc_col_key(bc_ctx *, bc_view row, uint32_t col);    /* the value as a mem-comparable key part, NULL
                                                                 included: equal values give equal bytes. A
                                                                 group key, with no key ceiling; same lifetime
@@ -503,7 +527,10 @@ void     bc_row_set_f64(bc_ctx *, bc_row, uint32_t col, double);
 void     bc_row_set_bool(bc_ctx *, bc_row, uint32_t col, bool);
 void     bc_row_set_bytes(bc_ctx *, bc_row, uint32_t col, bc_view);  /* a NUMERIC column: text read as numeric_in */
 void     bc_row_set_null(bc_ctx *, bc_row, uint32_t col);
-void     bc_row_set_param(bc_ctx *, bc_row, uint32_t col, uint32_t i);   /* parameter i, NULL included */
+void     bc_row_set_param(bc_ctx *, bc_row, uint32_t col, uint32_t i);   /* parameter i, NULL included; into a jsonb
+                                                                            column, its text parsed (BC_E_DATA) */
+void     bc_row_set_jsonb(bc_ctx *, bc_row, uint32_t col, bc_jsonb);    /* after the full check of the value
+                                                                            (BC_E_CORRUPT), its format byte and node */
 bc_view  bc_row_end(bc_ctx *, bc_row);
 bc_view  bc_pin(bc_ctx *, bc_view);                 /* a copy that lives until reset */
 bc_view  bc_null_row(bc_ctx *, uint32_t table);     /* a row of the table's layout, every column NULL: an outer

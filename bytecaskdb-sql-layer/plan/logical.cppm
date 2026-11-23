@@ -69,7 +69,7 @@ struct ColumnRef {
 // expressions) only.
 struct Expr {
   enum class Kind { Column, Param, Const, Add, Sub, Mul, Div, Compare, Aggregate, And, Or, Not, IsNull, Like, Truth, InSet, Case, Coalesce,
-                    Concat, Substr, Random, Mod, Neg, Abs, TextFn, Extract };
+                    Concat, Substr, Random, Mod, Neg, Abs, TextFn, Extract, JsonbCast };
   enum class Fn { Count, Sum, Min, Max, Avg };
   // TextFn's function: PostgreSQL's of the same name, over UTF-8 text.
   enum class Text { Upper, Lower, CharLength, OctetLength, Btrim, Ltrim, Rtrim, Position };
@@ -95,7 +95,8 @@ struct Expr {
                                 // Random: its two bounds, both included; Mod: two, of the result's type and scale;
                                 // Neg, Abs: one, of the result's type; TextFn: the text, then the trim's
                                 // characters if given, or POSITION's needle; Extract: one, a DATE, TIME,
-                                // TIMESTAMP or TIMESTAMPTZ
+                                // TIMESTAMP or TIMESTAMPTZ; JsonbCast: one, a jsonb to its text (the
+                                // expression's type TEXT) or a string read as jsonb (type jsonb)
 
   [[nodiscard]] auto phys() const -> PhysType { return phys_type(type); }
 

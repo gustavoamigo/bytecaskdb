@@ -2,11 +2,12 @@
 
 Status: **design, approved by the owner on 2026-11-21 with these
 answers: Q1 binary, Q2–Q3, Q5, Q7–Q11 as recommended; Q4 and Q6 deferred
-to the next phase.** Stage 0 is built (runtime errors carry their
-SQLSTATE, DETAIL, HINT and CONTEXT: `BC_E_DATA`, plan API revision 20);
-nothing of jsonb itself is.
-Proposed home: `bytecaskdb-sql-layer/docs/jsonb_design.md`, with
-`types_design.md` :48 losing `JSON` from its rejected list.
+to the next phase.** Stages 0 and 1 are built: runtime errors carry their
+SQLSTATE, DETAIL, HINT and CONTEXT (`BC_E_DATA`, plan API revision 20), and
+the jsonb column type with its text in and out, casts with text, `DEFAULT`,
+`IS [NOT] NULL`, `COUNT`, `CASE` and `COALESCE` (`sql/jsonb.cppm`, plan API
+revision 21; *Stages of jsonb*, stage 1, says what it built and how it
+differs from this design). Stages 1b, 1c and 2 to 6 are not built.
 
 This document covers PostgreSQL's `jsonb` type, and `json` where it is
 cheap: what the layer matches exactly, how a value is stored, the plan API
@@ -575,9 +576,10 @@ object of p pairs.
    and child count are u32, which holds because input is under 2^30.
 
 No subtree is copied as its level closes, so the cost does not grow with
-depth. Peak memory is the node array (a node of 24 bytes, at most (L + 1)
-/ 2 nodes for L input bytes, so about 12 bytes per input byte), the key
-index (4 bytes per pair) and the encoded value, which is never larger
+depth. Peak memory is the node array (a node of 28 bytes, at most (L + 1)
+/ 2 nodes for L input bytes, so about 14 bytes per input byte), the key
+index (4 bytes per pair), the de-escaped keys that hold a `\` and the
+encoded value, which is never larger
 than the input plus one format byte, 3 bytes per container, 4 per
 element, 8 per pair and 8 per number.
 Each is charged as it grows, so a value too large for the budget is
@@ -1353,6 +1355,66 @@ estimates of changed lines, code and tests.
   and the predicate switches; `BC_T_JSONB`, `bc_jsonb` and the stage 1
   calls; runtime set paths; wire OID 3802; catalog default; Python `str`.
   Revision 21.
+
+  **As built.** Everything above, with these choices the code made:
+  - The number scanner is a module of its own, `sql/numeric.cppm`
+    (`numeric_parse`, `numeric_in_range`, `numeric_text`), which
+    `numeric_in` and the jsonb parser both call: the catalog loads defaults
+    through the jsonb module, so the scanner sits below the catalog, where
+    `sql/text.cppm` cannot.
+  - Pass 3 writes no node twice and keeps no stack: each node's size field
+    becomes its position once its parent has laid out its table, and the
+    nodes are written in document order, a dropped duplicate's subtree
+    skipped. Pass 2 de-escapes each key that holds a `\` once, into a
+    charged pool, before any object is sorted.
+  - One walk serves the full check, the output length and the output text
+    (a counting sink and a writing sink), so every read of a whole value
+    checks every rule, key order and UTF-8 included, and the two output
+    passes cannot disagree.
+  - A constant is folded to its canonical text by `jsonb_in`
+    (`sql/text.cppm`), whose `TextError` now carries a DETAIL and a
+    CONTEXT, and a statement error (`ast::SqlError`) a CONTEXT, sent as
+    W.
+  - The binder's `JsonbCast` expression is the run-time cast: a string to
+    jsonb (`bc_jsonb_in`) and a jsonb to `text` or `varchar` of no length
+    (`bc_jsonb_text`). Its other casts are refused as *Casts to and from
+    jsonb and json* sorts them: to `boolean` and the numbers is stage 3
+    (0A000), to `varchar(n)`, `char` and `name` 0A000, to anything else
+    42846.
+  - Not built in stage 1, each 0A000: a jsonb column's value assigned to
+    a string column (an assignment cast; `INSERT … SELECT v::text` works,
+    and a jsonb constant is assigned as its text), `||` of a jsonb column
+    with text (of a constant it is text concatenation). `UPDATE … SET` of
+    a cast is the layer's 42601 for a cast of a column in `SET`, any type.
+  - Constants are refused as columns are: a comparison, `||` or `-` of
+    jsonb constants is 0A000 after an unknown literal beside the jsonb is
+    read by `jsonb_in` (its 22P02 first), and a pair PostgreSQL has no
+    operator for is 42883 with its operand types (`unknown` for a
+    literal).
+  - The parser refuses jsonb's operators (`->`, `->>`, `#>`, `#>>`, `@>`,
+    `<@`, `?`, `?|`, `?&`, `#-`, `@?`, `@@`) and the JSON functions
+    (`jsonb_…`, `json_…`, `to_json[b]`, `row_to_json`, `array_to_json`)
+    with 0A000 wherever they are written, before it reads the operands.
+    Forms the parser takes for no type keep their 42601 with jsonb: `IN`,
+    `BETWEEN`, `IS DISTINCT FROM` and `LIKE` in a select list, and
+    `COLLATE` (PostgreSQL's is 42804, *collations are not supported by
+    type jsonb*).
+  - An assignment refused 42804 carries PostgreSQL's HINT (*You will need
+    to rewrite or cast the expression.*) at every site: a constant, a
+    parameter, a column, `INSERT … SELECT` and `DEFAULT`.
+  - A `DEFAULT` takes a string cast to jsonb (`'{}'::jsonb`), the one cast
+    the parser takes in a `DEFAULT`.
+  - The allocation-failure sweep over the parser and the output writer
+    asserts its reach: each charge names its buffer (`jsonb::Site`: the
+    parser's nodes, key index and key pool, a walk's stack), and the test
+    marks the buffer, or the encoded value or text, whose allocation each
+    injected failure hit; every one must be hit.
+  - A set operation's sorter carries a jsonb through its text, read back
+    by `bc_jsonb_in`, the same value.
+  - The fuzz targets are `fuzz_sql_jsonb_decode` and `fuzz_sql_jsonb_parse`
+    (`tests/fuzz/`, built as the root's fuzz targets are); their
+    properties (`tests/fuzz/jsonb_properties.h`) also run over seeded
+    mutations in `sql_layer_tests`.
 - **Stage 1b: binary-format parameters** (about 300 lines; owner's
   decision 3).
 - **Stage 1c: the json type** (about 700 lines, down from 900: no column

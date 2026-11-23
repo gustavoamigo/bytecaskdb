@@ -66,20 +66,26 @@ public:
   // folded, when the statement is planned (1/0).
   [[nodiscard]] auto at_analysis() const noexcept -> bool { return at_analysis_; }
   void mark_at_analysis() noexcept { at_analysis_ = true; }
-  // PostgreSQL's DETAIL and HINT for the error, empty where it has none.
-  // Shared, so copying the error cannot throw.
-  [[nodiscard]] auto detail() const noexcept -> std::string_view { return notes_ ? std::string_view{notes_->first} : ""; }
-  [[nodiscard]] auto hint() const noexcept -> std::string_view { return notes_ ? std::string_view{notes_->second} : ""; }
-  [[nodiscard]] auto with_notes(std::string detail, std::string hint) && -> SqlError&& {
-    notes_ = std::make_shared<const std::pair<std::string, std::string>>(std::move(detail), std::move(hint));
+  // PostgreSQL's DETAIL, HINT and CONTEXT for the error, empty where it has
+  // none. Shared, so copying the error cannot throw.
+  [[nodiscard]] auto detail() const noexcept -> std::string_view { return notes_ ? std::string_view{notes_->detail} : ""; }
+  [[nodiscard]] auto hint() const noexcept -> std::string_view { return notes_ ? std::string_view{notes_->hint} : ""; }
+  [[nodiscard]] auto context() const noexcept -> std::string_view { return notes_ ? std::string_view{notes_->context} : ""; }
+  [[nodiscard]] auto with_notes(std::string detail, std::string hint, std::string context = {}) && -> SqlError&& {
+    notes_ = std::make_shared<const Notes>(Notes{std::move(detail), std::move(hint), std::move(context)});
     return std::move(*this);
   }
 
 private:
+  struct Notes {
+    std::string detail;
+    std::string hint;
+    std::string context;
+  };
   std::int32_t pos_;
   SqlState sqlstate_;
   bool at_analysis_{false};
-  std::shared_ptr<const std::pair<std::string, std::string>> notes_;
+  std::shared_ptr<const Notes> notes_;
 };
 
 // A statement the layer does not support where it was given, the API's
@@ -295,6 +301,9 @@ struct ColumnDefAst {
   // pg_catalog: the parser cannot tell a missing schema (3F000) from a
   // missing type (42704), so the binder raises QualifiedTypeName for it.
   std::string type_schema;
+  // A DEFAULT written as a string cast to a type ('{}'::jsonb): the type,
+  // "" for a plain constant. Only jsonb is taken so (docs/jsonb_design.md).
+  std::string default_cast;
 };
 
 // A type qualified by a user schema, raised where the type is read and

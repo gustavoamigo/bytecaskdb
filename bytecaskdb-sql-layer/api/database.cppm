@@ -62,6 +62,7 @@ export import bytecask.sql.codegen;
 export import bytecask.sql.tcc_loader;
 export import bytecask.sql.procedure;
 import bytecask.sql.parser;
+import bytecask.sql.jsonb;
 
 export namespace bytecask::sql {
 
@@ -256,7 +257,7 @@ public:
 // runtime error's note (ExecError::note).
 [[nodiscard]] auto error_detail(const std::exception& e) noexcept -> std::string_view;
 // PostgreSQL's CONTEXT for the error, empty for none: a runtime error's
-// (ExecError::context).
+// (ExecError::context), or a statement's (ast::SqlError::context: a jsonb literal's).
 [[nodiscard]] auto error_context(const std::exception& e) noexcept -> std::string_view;
 
 class Database;
@@ -1880,6 +1881,7 @@ auto error_detail(const std::exception& e) noexcept -> std::string_view {
 }
 
 auto error_context(const std::exception& e) noexcept -> std::string_view {
+  if (const auto* x = dynamic_cast<const ast::SqlError*>(&e)) return x->context();
   if (const auto* x = dynamic_cast<const ExecError*>(&e)) return x->context();
   return {};
 }
@@ -2625,6 +2627,7 @@ auto notice_type_name(SqlKind k) -> std::string_view {
     case SqlKind::TimeTz: return "timetz";
     case SqlKind::Timestamp: return "pg_catalog.timestamp";
     case SqlKind::TimestampTz: return "timestamptz";
+    case SqlKind::Jsonb: return "jsonb";
   }
   return "";
 }
@@ -2859,6 +2862,13 @@ auto ctas_row(const std::vector<ColumnSpec>& columns, std::vector<Value> values)
     }
     if (auto* b = std::get_if<Bytes>(&values[i]); b != nullptr && c.sql.kind == SqlKind::Char) {
       while (!b->empty() && b->back() == std::byte{' '}) b->pop_back();
+    }
+    // A result's jsonb is its text: the row stores the value it parses to.
+    if (auto* b = std::get_if<Bytes>(&values[i]); b != nullptr && c.sql.kind == SqlKind::Jsonb) {
+      Bytes value;
+      auto r = jsonb::parse_value(std::string_view{reinterpret_cast<const char*>(b->data()), b->size()}, value);
+      if (!r.ok()) throw ExecError("a jsonb result that does not parse back", BC_E_CORRUPT);
+      *b = std::move(value);
     }
     if (auto why = out_of_range(c.sql, values[i])) {
       throw ExecError(*why, BC_E_CONSTRAINT, ConstraintDetail{BC_C_RANGE, 0}.encode());
@@ -4849,6 +4859,15 @@ auto Database::table_rows(std::string_view table) const -> Rows {
     }
     auto values = decode_row(layout, row);
     if (!values) throw corrupt("column " + std::to_string(values.error()) + " does not decode");
+    // A jsonb is its text at every edge, here as in a result.
+    for (std::size_t i = 0; i < values->size(); ++i) {
+      auto* b = std::get_if<Bytes>(&(*values)[i]);
+      if (b == nullptr || out.types[i].kind != SqlKind::Jsonb) continue;
+      std::string text;
+      if (!jsonb::value_text(*b, text).ok()) throw corrupt("a jsonb value that does not decode");
+      auto tb = std::as_bytes(std::span{text.data(), text.size()});
+      *b = Bytes(tb.begin(), tb.end());
+    }
     out.rows.push_back(std::move(*values));
   });
   return out;

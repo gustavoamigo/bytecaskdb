@@ -31,7 +31,13 @@ A default is a constant of the column's physical type, or none (null).
 DDL accepts integer, decimal, string and boolean literals, folded at bind
 time to the stored value (a `DECIMAL(p, s)` default is stored scaled).
 `TIMESTAMP`, `DATE` and `TIME` literal defaults are refused, since literal
-parsing of those types isn't built for defaults.
+parsing of those types isn't built for defaults. A `jsonb` default is held
+in memory as the stored value its rows take (format byte and node), and
+written to the record as its canonical text, `bytes`-tagged; the load
+parses the text back, and text that does not parse, or is not the value's
+canonical text, is a damaged catalog (`jsonb_design.md`, *Catalog changes
+for jsonb*). A jsonb column is kind 19; an earlier build refuses the
+catalog that holds one as an invalid type.
 
 **A default of the clock** (`CURRENT_DATE`, `CURRENT_TIMESTAMP` and
 `now()`, `LOCALTIME`, `LOCALTIMESTAMP`, `CURRENT_TIME`, with a precision) is a

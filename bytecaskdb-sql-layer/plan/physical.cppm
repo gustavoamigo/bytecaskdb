@@ -786,6 +786,13 @@ private:
       case Expr::Kind::Not:
       case Expr::Kind::Neg:
       case Expr::Kind::Abs: operands(1, 1); break;
+      case Expr::Kind::JsonbCast:
+        operands(1, 1);
+        if (!((e.phys() == PhysType::Jsonb && e.args[0].phys() == PhysType::Bytes) ||
+              (e.phys() == PhysType::Bytes && e.args[0].phys() == PhysType::Jsonb))) {
+          broken("a jsonb cast of other than jsonb to text or text to jsonb");
+        }
+        break;
       case Expr::Kind::And:
       case Expr::Kind::Or: operands(2, e.args.size()); break;
       case Expr::Kind::Coalesce: operands(2, e.args.size()); break;
@@ -926,6 +933,7 @@ private:
       case Expr::Kind::Substr:
       case Expr::Kind::TextFn:
       case Expr::Kind::Extract:
+      case Expr::Kind::JsonbCast:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
       case Expr::Kind::Abs:

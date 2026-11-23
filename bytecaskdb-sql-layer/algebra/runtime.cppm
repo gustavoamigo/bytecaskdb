@@ -418,7 +418,8 @@ auto decode_row(const RowLayout& layout, BytesView row) -> std::expected<std::ve
       case PhysType::F64: out.emplace_back(v.f64()); break;
       case PhysType::Bool: out.emplace_back(v.boolean()); break;
       case PhysType::Bytes:
-      case PhysType::Num: out.emplace_back(Bytes(v.bytes.begin(), v.bytes.end())); break;
+      case PhysType::Num:
+      case PhysType::Jsonb: out.emplace_back(Bytes(v.bytes.begin(), v.bytes.end())); break;  // a result's jsonb is its text
     }
   }
   return out;
@@ -453,6 +454,7 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_param_f64", fn_addr(bc_param_f64)},
       {"bc_param_bool", fn_addr(bc_param_bool)},
       {"bc_param_bytes", fn_addr(bc_param_bytes)},
+      {"bc_param_jsonb", fn_addr(bc_param_jsonb)},
       {"bc_param_null", fn_addr(bc_param_null)},
       {"bc_emit_begin", fn_addr(bc_emit_begin)},
       {"bc_emit_i64", fn_addr(bc_emit_i64)},
@@ -460,6 +462,7 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_emit_bool", fn_addr(bc_emit_bool)},
       {"bc_emit_bytes", fn_addr(bc_emit_bytes)},
       {"bc_emit_num", fn_addr(bc_emit_num)},
+      {"bc_emit_jsonb", fn_addr(bc_emit_jsonb)},
       {"bc_emit_null", fn_addr(bc_emit_null)},
       {"bc_emit_col", fn_addr(bc_emit_col)},
       {"bc_emit_key_part", fn_addr(bc_emit_key_part)},
@@ -484,6 +487,8 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_bytes_cmp", fn_addr(bc_bytes_cmp)},
       {"bc_bytes_prefix", fn_addr(bc_bytes_prefix)},
       {"bc_concat", fn_addr(bc_concat)},
+      {"bc_jsonb_in", fn_addr(bc_jsonb_in)},
+      {"bc_jsonb_text", fn_addr(bc_jsonb_text)},
       {"bc_number_text", fn_addr(bc_number_text)},
       {"bc_num_quotient", fn_addr(bc_num_quotient)},
       {"bc_substr", fn_addr(bc_substr)},
@@ -552,6 +557,7 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_col_f64", fn_addr(bc_col_f64)},
       {"bc_col_bool", fn_addr(bc_col_bool)},
       {"bc_col_bytes", fn_addr(bc_col_bytes)},
+      {"bc_col_jsonb", fn_addr(bc_col_jsonb)},
       {"bc_col_key", fn_addr(bc_col_key)},
       {"bc_row_key", fn_addr(bc_row_key)},
       {"bc_row_begin", fn_addr(bc_row_begin)},
@@ -560,6 +566,7 @@ auto plan_api_symbols() -> std::span<const ApiSymbol> {
       {"bc_row_set_f64", fn_addr(bc_row_set_f64)},
       {"bc_row_set_bool", fn_addr(bc_row_set_bool)},
       {"bc_row_set_bytes", fn_addr(bc_row_set_bytes)},
+      {"bc_row_set_jsonb", fn_addr(bc_row_set_jsonb)},
       {"bc_row_set_null", fn_addr(bc_row_set_null)},
       {"bc_row_set_param", fn_addr(bc_row_set_param)},
       {"bc_row_end", fn_addr(bc_row_end)},

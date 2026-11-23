@@ -3357,3 +3357,60 @@ def test_a_set_first_in_an_extended_query_block_runs_in_that_block(server):
     assert show("default_transaction_read_only") == "on"
     q(c, "RESET ALL")
     assert data(q(c, "SELECT k FROM t ORDER BY k")) == [["2"]]
+
+
+def test_jsonb_columns_and_parameters_are_oid_3802_in_text_format(server):
+    # docs/jsonb_design.md, *Wire OIDs and formats for jsonb and json*: a
+    # jsonb column and a parameter typed jsonb are OID 3802; values travel
+    # as jsonb_out's text, a parameter read as jsonb_in reads it.
+    c = connect(server)
+    c.send(query("CREATE TABLE wj (k INTEGER PRIMARY KEY, j jsonb)"))
+    c.until_ready()
+    c.send(parse("INSERT INTO wj (k, j) VALUES ($1, $2)", "i"), describe("S", "i"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"1tnZ"
+    n, *oids = struct.unpack("!hii", out[1][1])
+    assert (n, oids) == (2, [23, 3802])
+    c.send(bind(["1", '{"b": 1,  "a": [1, 2.50]}'], statement="i"), execute(), SYNC)
+    assert kinds(c.until_ready()) == b"2CZ"
+    c.send(query("SELECT k, j, j::text FROM wj"))
+    out = c.until_ready()
+    assert row_description(out[0][1]) == [("k", 23), ("j", 3802), ("j", 25)]
+    assert data_row(out[1][1]) == [b"1", b'{"a": [1, 2.50], "b": 1}', b'{"a": [1, 2.50], "b": 1}']
+    c.send(parse("SELECT $1::jsonb", "s"), describe("S", "s"), SYNC)
+    out = c.until_ready()
+    assert struct.unpack("!hi", out[1][1]) == (1, 3802)
+    assert row_description(out[2][1]) == [("jsonb", 3802)]
+
+
+def test_a_jsonb_input_error_sends_its_detail_and_context(server):
+    # 22P02 with PostgreSQL 17's DETAIL and CONTEXT as D and W, from a
+    # literal read at prepare and from a parameter read at execution.
+    c = connect(server)
+    c.send(query("CREATE TABLE wj_err (k INTEGER PRIMARY KEY, j jsonb)"))
+    c.until_ready()
+    c.send(query("INSERT INTO wj_err VALUES (1, '{\"a\":1 \"b\":2}')"))
+    f = fields(c.until_ready()[0][1])
+    assert f["C"] == "22P02" and f["M"] == "invalid input syntax for type json", f
+    assert f["D"] == 'Expected "," or "}", but found ""b"".', f
+    assert f["W"] == 'JSON data, line 1: {"a":1 "b"...', f
+    c.send(parse("INSERT INTO wj_err VALUES ($1, $2)"), bind(["1", '"\\u0000"']), execute(), SYNC)
+    f = fields(next(b for k, b in c.until_ready() if k == b"E"))
+    assert f["C"] == "22P05" and f["M"] == "unsupported Unicode escape sequence", f
+    assert f["D"] == "\\u0000 cannot be converted to text.", f
+    assert f["W"] == 'JSON data, line 1: "\\u0000...', f
+
+
+def data_row(body: bytes) -> list[bytes | None]:
+    """A DataRow's values, None for NULL."""
+    (n,) = struct.unpack("!h", body[:2])
+    body, out = body[2:], []
+    for _ in range(n):
+        (length,) = struct.unpack("!i", body[:4])
+        body = body[4:]
+        if length < 0:
+            out.append(None)
+            continue
+        out.append(body[:length])
+        body = body[length:]
+    return out

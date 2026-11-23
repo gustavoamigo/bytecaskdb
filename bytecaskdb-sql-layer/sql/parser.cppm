@@ -77,6 +77,24 @@ namespace {
   throw SqlError{what, pos, state};
 }
 
+// jsonb's operators and the JSON functions (docs/jsonb_design.md, stages 3
+// and 4): PostgreSQL has them, the layer not yet, so they are refused as a
+// feature it lacks (0A000) wherever they are written, before any operand
+// is read.
+void refuse_jsonb_operator(const std::string& op, std::int32_t pos) {
+  static constexpr std::array<std::string_view, 12> kJsonbOperators{"->", "->>", "#>", "#>>", "@>", "<@",
+                                                                     "?",  "?|",  "?&", "#-",  "@?", "@@"};
+  if (std::ranges::find(kJsonbOperators, op) != kJsonbOperators.end()) {
+    reject("operator " + op + " is not supported yet", pos, kFeatureNotSupported);
+  }
+}
+
+void refuse_json_function(const std::string& name, std::int32_t pos) {
+  auto json = name.starts_with("jsonb_") || name.starts_with("json_") || name == "to_json" || name == "to_jsonb" ||
+              name == "row_to_json" || name == "array_to_json";
+  if (json) reject("function " + name + " is not supported yet", pos, kFeatureNotSupported);
+}
+
 // protobuf-c gives an absent string field as "", never as NULL.
 auto empty(const char* s) -> bool { return s == nullptr || s[0] == '\0'; }
 
@@ -291,6 +309,7 @@ auto expr(const PgQuery__Node* n) -> Expr {
   if (n->node_case == PG_QUERY__NODE__NODE_A_EXPR) {
     const auto* a = n->a_expr;
     auto op = a->kind == PG_QUERY__A__EXPR__KIND__AEXPR_OP && a->n_name == 1 ? str(a->name[0]) : "";
+    refuse_jsonb_operator(op, a->location);
     // A comparison as a value; PostgreSQL's grammar spells != as <>.
     if (a->lexpr != nullptr && (op == "=" || op == "<>" || op == "<" || op == "<=" || op == ">" || op == ">=")) {
       Expr e{Expr::Kind::Compare, {}, 0, nullptr, nullptr, a->location};
@@ -333,6 +352,7 @@ auto expr(const PgQuery__Node* n) -> Expr {
   if (n->node_case == PG_QUERY__NODE__NODE_FUNC_CALL) {
     const auto* f = n->func_call;
     auto name = str(f->funcname[f->n_funcname - 1]);
+    refuse_json_function(name, f->location);
     // PostgreSQL's grammar spells TRIM, POSITION, SUBSTRING, OVERLAY and
     // EXTRACT as calls of these, their operands in the function's order
     // (EXTRACT's unit a string constant first).
@@ -488,6 +508,7 @@ auto expr(const PgQuery__Node* n) -> Expr {
 }
 
 auto compare_op(const std::string& op, std::int32_t pos) -> Compare::Op {
+  refuse_jsonb_operator(op, pos);
   if (op == "=") return Compare::Op::Eq;
   if (op == "<") return Compare::Op::Lt;
   if (op == "<=") return Compare::Op::Le;
@@ -828,6 +849,13 @@ auto column_def(const PgQuery__ColumnDef* cd, int& primary_keys, std::string_vie
         if (e.kind != Expr::Kind::Clock) reject("DEFAULT takes a constant, the clock or a session function", e.pos);
         col.default_clock = e.func;
         col.default_clock_precision = e.constant;
+      } else if (d->node_case == PG_QUERY__NODE__NODE_TYPE_CAST && d->type_cast->arg != nullptr &&
+                 d->type_cast->arg->node_case == PG_QUERY__NODE__NODE_A_CONST) {
+        // '…'::T: the string, and the type the binder checks it against.
+        auto type = type_ast(d->type_cast->type_name, "", d->type_cast->location);
+        if (type.type != "jsonb" || !type.type_schema.empty() || !type.typmods.empty()) reject("DEFAULT must be a constant", -1);
+        col.default_value = literal(d->type_cast->arg);
+        col.default_cast = std::move(type.type);
       } else {
         col.default_value = literal(d);
       }

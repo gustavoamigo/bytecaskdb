@@ -1,6 +1,9 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 20 (revision 20 with `BC_E_DATA`, a SQLSTATE
+Status: **built**, revision 21 (revision 21 with `BC_T_JSONB`, the `bc_jsonb`
+handle and its calls `bc_col_jsonb`, `bc_row_set_jsonb`, `bc_param_jsonb`,
+`bc_jsonb_in`, `bc_jsonb_text` and `bc_emit_jsonb`, for the jsonb column
+type (`jsonb_design.md`, stage 1, *jsonb in the plan API* below); revision 20 with `BC_E_DATA`, a SQLSTATE
 packed in `bc_error_detail` for `BC_E_DATA` and `BC_E_ARITH` (`BC_SQLSTATE`),
 and `bc_error_hint` and `bc_error_context`, so a runtime error carries
 PostgreSQL's SQLSTATE, DETAIL, HINT and CONTEXT (`jsonb_design.md`, stage 0);
@@ -564,7 +567,7 @@ typedef struct {
   const uint8_t    *result_types;    uint32_t n_result;         /* bc_type codes */
 } bc_schema_ref;
 
-enum bc_type { BC_T_I64 = 1, BC_T_F64 = 2, BC_T_BOOL = 3, BC_T_BYTES = 4, BC_T_NUM = 5 };
+enum bc_type { BC_T_I64 = 1, BC_T_F64 = 2, BC_T_BOOL = 3, BC_T_BYTES = 4, BC_T_NUM = 5, BC_T_JSONB = 6 };
 ```
 
 `BC_T_NUM` is PostgreSQL's `numeric` as its text (`numeric_out`), held as a
@@ -577,6 +580,51 @@ store the text as PostgreSQL's `numeric_in` reads it, written back as
 `BC_C_RANGE` (22P02, or 22003 past numeric's format). The
 compiler refuses to key, compare or deduplicate one (`std::logic_error`),
 and the runtime's key builders refuse one the same way.
+
+`BC_T_JSONB` is a jsonb value: a column declared `jsonb` or a result, never
+a key's part (*jsonb in the plan API*).
+
+### jsonb in the plan API
+
+Revision 21 (`jsonb_design.md`, *Plan API for jsonb*). A jsonb value in a
+plan is a `bc_jsonb`, `typedef struct { uint32_t i; uint64_t g; }
+bc_jsonb;`, a view of one node of the binary layout without its format
+byte, in the same view table as a `bc_view`, its entry tagged as jsonb.
+Only the calls below take or return one, so a plan that hands one to
+`bc_emit_bytes`, `bc_concat`, `bc_like` or a `TEXT` column does not
+compile. C still lets a plan forge one handle from the other's fields, so
+the tag is checked both ways: every jsonb call refuses an untagged view,
+and every bytes call (the generic `resolve()`) a tagged one, each with
+`BC_E_HANDLE`. The empty handle is no jsonb value (`BC_E_HANDLE`); a NULL
+is the plan's to test first, as for every type.
+
+```c
+bc_jsonb bc_param_jsonb(bc_ctx *, uint32_t i);
+void     bc_emit_jsonb(bc_ctx *, bc_jsonb);
+bc_jsonb bc_col_jsonb(bc_ctx *, bc_view row, uint32_t col);
+void     bc_row_set_jsonb(bc_ctx *, bc_row, uint32_t col, bc_jsonb);
+bc_jsonb bc_jsonb_in(bc_ctx *, bc_view text);
+bc_view  bc_jsonb_text(bc_ctx *, bc_jsonb);
+```
+
+| Function | What it does |
+|---|---|
+| `bc_param_jsonb` | Parameter `i`'s text parsed as `jsonb_in` reads it, once per execution: the node is kept, pinned, until reset, and a second call returns the same handle. One a subquery or `bc_sub_arg_*` sets is parsed per call, the step's. Text that is no JSON is `BC_E_DATA` with jsonb_in's SQLSTATE, DETAIL and CONTEXT (22P02, 22P05, 22003, 22021, 54001). |
+| `bc_col_jsonb` | A jsonb column's node: its format byte checked (`BC_E_CORRUPT` for one this build does not write), the node a sub-view with the row's lifetime, as `bc_col_bytes`. NULL gives the empty handle. `bc_col_bytes` of a jsonb column, and `bc_row_set_bytes` into one, are `BC_E_HANDLE`. |
+| `bc_row_set_jsonb` | Sets a jsonb column from a node, after the full check of the layout (`BC_E_CORRUPT`), writing the format byte and the node; the bytes stay charged to the row until it is ended. |
+| `bc_row_set_param` of a jsonb column | Parses the parameter's text into the column, as `bc_param_jsonb` reads it. |
+| `bc_jsonb_in` | Text parsed as `bc_param_jsonb` parses it, into the step's storage: a cast of text to jsonb. |
+| `bc_jsonb_text` | The node's text (`jsonb_out`'s) in a new view, the step's: a cast to text. Its length is computed first and charged before a byte is written; past 1 GiB - 1 it is `BC_E_DATA` 54000. |
+| `bc_emit_jsonb`, `bc_emit_col` of a jsonb column | The value's text as the next result column; a `BC_T_JSONB` result column takes only these. |
+
+Every call charges what it allocates to the statement's budget before it
+allocates it (`BC_E_LIMIT` past it): the parser's node array, key index and
+key pool, the encoded value, the walks' stacks and every text. A stored
+value that breaks a decoding rule is `BC_E_CORRUPT` at the read that meets
+it. The calls parse and print through `sql/jsonb.cppm`; a set operation's
+sorter carries a jsonb through its text (`bc_jsonb_text`, read back with
+`bc_jsonb_in`), and no other key, sort key, group key or subquery takes one
+(`BC_E_HANDLE`, or `std::logic_error` in the compiler).
 
 A plan's constants are ids, emitted by the compiler from the catalog
 (`Catalog::constants`) and named from ids too, so that no SQL name has to be

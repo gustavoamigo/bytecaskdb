@@ -17,6 +17,7 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -31,6 +32,8 @@ module;
 export module bytecask.sql.text;
 
 export import bytecask.sql.catalog;
+import bytecask.sql.numeric;
+import bytecask.sql.jsonb;
 
 export namespace bytecask::sql {
 
@@ -39,13 +42,22 @@ export namespace bytecask::sql {
 class TextError : public std::runtime_error {
 public:
   TextError(const std::string& what, const char* sqlstate) : std::runtime_error{what}, sqlstate_{sqlstate} {}
+  // With PostgreSQL's DETAIL and CONTEXT: jsonb's input errors carry both.
+  TextError(const std::string& what, const char* sqlstate, std::string detail, std::string context)
+      : std::runtime_error{what},
+        sqlstate_{sqlstate},
+        notes_{std::make_shared<const std::pair<std::string, std::string>>(std::move(detail), std::move(context))} {}
   TextError(const TextError&) = default;
   TextError& operator=(const TextError&) = default;
   ~TextError() override;  // out of line: anchors the vtable (-Wweak-vtables)
   [[nodiscard]] auto sqlstate() const noexcept -> const char* { return sqlstate_; }
+  [[nodiscard]] auto detail() const noexcept -> std::string_view { return notes_ ? std::string_view{notes_->first} : ""; }
+  [[nodiscard]] auto context() const noexcept -> std::string_view { return notes_ ? std::string_view{notes_->second} : ""; }
 
 private:
   const char* sqlstate_;  // a literal
+  // Shared, so copying the error cannot throw.
+  std::shared_ptr<const std::pair<std::string, std::string>> notes_;
 };
 
 // A value, not NULL, as PostgreSQL's text output writes a value of type t:
@@ -75,6 +87,12 @@ private:
 // 22P02 for text that is not a number, 22003 past numeric's format (more
 // than 131072 digits before the point or 16383 after it).
 [[nodiscard]] auto numeric_in(std::string_view text) -> std::string;
+
+// Text as PostgreSQL 17's jsonb_in reads it, written back as jsonb_out
+// writes it: the canonical text a jsonb constant or parameter is folded to
+// (docs/jsonb_design.md, *One form for a jsonb value at each boundary*).
+// Throws TextError with jsonb_in's SQLSTATE, DETAIL and CONTEXT.
+[[nodiscard]] auto jsonb_in(std::string_view text) -> std::string;
 
 // Text functions of UTF-8 text, counted in characters as PostgreSQL's
 // are, shared by the binder's constant folds and the plan API's runtime
@@ -976,7 +994,8 @@ auto to_text(const Datum& v, SqlType t) -> std::string {
             case SqlKind::Varchar:
             case SqlKind::Char:
             case SqlKind::Name:
-            case SqlKind::Numeric: return std::to_string(x);
+            case SqlKind::Numeric:
+            case SqlKind::Jsonb: return std::to_string(x);
           }
           return std::to_string(x);
         }
@@ -1009,6 +1028,7 @@ auto from_text(std::string_view text, SqlType t, bool assigned_only) -> Datum {
     case SqlKind::Time: return time_from(text);
     case SqlKind::TimeTz: return timetz_from(text);
     case SqlKind::Numeric: return text_bytes(numeric_in(text));  // its numeric_out text
+    case SqlKind::Jsonb: return text_bytes(jsonb_in(text));       // its canonical text
   }
   return text_bytes(text);
 }
@@ -1070,13 +1090,6 @@ auto average_text(std::int64_t sum, std::int64_t count, std::uint8_t scale) -> s
 
 namespace {
 
-// numeric's format: base-10000 digits of weight at most 32767, so 131072
-// decimal digits before the point, and a display scale of at most 16383.
-constexpr std::int64_t kNumericMaxWholeDigits = 131072;
-constexpr std::int64_t kNumericMaxScale = 16383;
-// numeric_in refuses an exponent past this before it looks further.
-constexpr std::int64_t kNumericMaxExponent = std::numeric_limits<std::int32_t>::max() / 2;
-
 [[noreturn]] void numeric_overflow() { throw TextError("value overflows numeric format", "22003"); }
 
 auto is_digit_in(char c, int base) -> bool {
@@ -1124,6 +1137,18 @@ auto non_decimal_digits(std::string_view s, int base, std::string_view text, std
 
 }  // namespace
 
+auto jsonb_in(std::string_view text) -> std::string {
+  std::string out;
+  auto r = jsonb::canonical_text(text, out);
+  if (r.ok()) return out;
+  if (r.status == jsonb::Status::Data) {
+    const auto& e = *r.error;
+    // A literal: the SqlState's text lives as long as the program.
+    throw TextError(e.message, e.state.view().data(), e.detail, e.context);
+  }
+  throw TextError("jsonb value does not decode", "XX000");
+}
+
 auto numeric_in(std::string_view text) -> std::string {
   auto s = text;
   while (!s.empty() && is_space(s.front())) s.remove_prefix(1);
@@ -1161,77 +1186,16 @@ auto numeric_in(std::string_view text) -> std::string {
     }
   }
   // [digits][.digits][e[+-]digits], _ between digits, as set_var_from_str.
-  std::string digits;
-  std::int64_t whole = 0;  // digits before the point
-  std::int64_t scale = 0;  // digits after it
-  auto point = false;
-  if (s[at] == '.') {
-    point = true;
-    ++at;
+  std::string digits(s.size() - at, '\0');
+  NumericParts parts;
+  switch (numeric_parse(s.substr(at), digits, parts)) {
+    case NumericStatus::Ok: break;
+    case NumericStatus::Syntax: bad_text("numeric", text);
+    case NumericStatus::Overflow: numeric_overflow();
   }
-  if (at >= s.size() || std::isdigit(static_cast<unsigned char>(s[at])) == 0) bad_text("numeric", text);
-  while (at < s.size()) {
-    auto c = s[at];
-    if (std::isdigit(static_cast<unsigned char>(c)) != 0) {
-      digits.push_back(c);
-      ++(point ? scale : whole);
-      ++at;
-    } else if (c == '.') {
-      if (point) bad_text("numeric", text);
-      point = true;
-      ++at;
-      if (at < s.size() && s[at] == '_') bad_text("numeric", text);
-    } else if (c == '_') {
-      ++at;
-      if (at >= s.size() || std::isdigit(static_cast<unsigned char>(s[at])) == 0) bad_text("numeric", text);
-    } else {
-      break;
-    }
-  }
-  if (at < s.size() && (s[at] == 'e' || s[at] == 'E')) {
-    ++at;
-    auto neg_exp = false;
-    if (at < s.size() && (s[at] == '+' || s[at] == '-')) neg_exp = s[at++] == '-';
-    if (at >= s.size() || std::isdigit(static_cast<unsigned char>(s[at])) == 0) bad_text("numeric", text);
-    std::int64_t exp = 0;
-    while (at < s.size()) {
-      auto c = s[at];
-      if (std::isdigit(static_cast<unsigned char>(c)) != 0) {
-        exp = exp * 10 + (c - '0');
-        if (exp > kNumericMaxExponent) numeric_overflow();
-        ++at;
-      } else if (c == '_') {
-        ++at;
-        if (at >= s.size() || std::isdigit(static_cast<unsigned char>(s[at])) == 0) bad_text("numeric", text);
-      } else {
-        break;
-      }
-    }
-    if (neg_exp) exp = -exp;
-    whole += exp;
-    scale = std::max<std::int64_t>(0, scale - exp);
-  }
-  rest_is_space(at);
-  if (scale > kNumericMaxScale) numeric_overflow();
-  // The digits sit at places whole-1 down to whole-size; the text runs from
-  // the larger of whole-1 and 0 down to -scale, every place below the
-  // last digit a zero (scale never cuts a digit: see above).
-  auto first = digits.find_first_not_of('0');
-  auto zero = first == std::string::npos;
-  if (!zero && whole - static_cast<std::int64_t>(first) > kNumericMaxWholeDigits) numeric_overflow();
-  auto place_digit = [&](std::int64_t place) -> char {
-    auto i = whole - 1 - place;
-    return i >= 0 && i < std::ssize(digits) ? digits[static_cast<std::size_t>(i)] : '0';
-  };
-  std::string out;
-  if (negative && !zero) out.push_back('-');
-  auto top = zero ? 0 : std::max<std::int64_t>(0, whole - 1 - static_cast<std::int64_t>(first));
-  for (auto place = top; place >= 0; --place) out.push_back(place_digit(place));
-  if (scale > 0) {
-    out.push_back('.');
-    for (std::int64_t place = -1; place >= -scale; --place) out.push_back(place_digit(place));
-  }
-  return out;
+  rest_is_space(at + parts.end);
+  if (!numeric_in_range(parts)) numeric_overflow();
+  return numeric_text(negative, parts, std::string_view{digits}.substr(0, parts.ndigits));
 }
 
 }  // namespace bytecask::sql

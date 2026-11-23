@@ -53,10 +53,12 @@ class Oracle:
     def __init__(self, dsn: str):
         import psycopg
 
+        import oracle as o
+
         self.schema = "proof_" + uuid.uuid4().hex[:12]
         # No server-side prepared statements: a table dropped and re-created
         # with other types would fail a cached plan (0A000).
-        self.conn = psycopg.connect(dsn, autocommit=True, prepare_threshold=None)
+        self.conn = o.jsonb_as_text(psycopg.connect(dsn, autocommit=True, prepare_threshold=None))
         with self.conn.cursor() as cur:
             cur.execute(f"CREATE SCHEMA {self.schema}")
             cur.execute(f"SET search_path TO {self.schema}")

@@ -20,6 +20,7 @@
 #include <memory>
 #include <random>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -32,6 +33,7 @@
 #include "bytecaskdb-sql-layer/algebra/bc_plan.h"
 
 import bytecask.sql.catalog;
+import bytecask.sql.jsonb;
 import bytecask.sql.tests.util;
 
 using namespace bytecask::sql;
@@ -2392,4 +2394,39 @@ TEST_CASE("schemas: a schema DDL the engine refuses, or a crash at its commit ho
   CHECK(cat->table({cat->schema("s3")->id, "t"}) != nullptr);
   CHECK(count_prefix(db, Bytes{std::byte{kNsCatalog}, std::byte{0x0D}}) == 2);
   db.close();
+}
+
+TEST_CASE("catalog: a jsonb column's default is its canonical text in the record and its stored value in memory",
+          "[sql][catalog][jsonb]") {
+  auto t = rich_table();
+  t.checks.clear();
+  std::vector<std::byte> value;
+  REQUIRE(jsonb::parse_value("{\"b\": 1, \"a\": [true]}", value).ok());
+  Column c{t.next_col_id++, "j", SqlType{SqlKind::Jsonb}, PhysType::Jsonb, true, Bytes(value.begin(), value.end())};
+  t.columns.push_back(c);
+  REQUIRE(append_columns(t.layout, std::vector<ColumnDef>{{c.id, c.sql, c.nullable}}));
+  auto rec = serialize_table(t);
+  // The record holds the text, never the binary layout.
+  std::string_view text{"{\"a\": [true], \"b\": 1}"};
+  auto at = std::search(rec.begin(), rec.end(), std::as_bytes(std::span{text}).begin(), std::as_bytes(std::span{text}).end());
+  CHECK(at != rec.end());
+  CHECK(std::ranges::find(rec, std::byte{jsonb::kFormat}) == rec.end());
+  auto u = parse_table(rec);
+  CHECK(u.columns.back().sql.kind == SqlKind::Jsonb);
+  CHECK(u.columns.back().type == PhysType::Jsonb);
+  CHECK(u.columns.back().default_value == t.columns.back().default_value);
+  CHECK(serialize_table(u) == rec);
+  // Text that does not parse, or is not canonical, is a damaged catalog.
+  for (std::string_view bad : {"{\"a\": [true], \"b\": 1 ", "{\"a\": [true],\"b\": 1}", "{\"b\": 1, \"a\": [true]}"}) {
+    INFO(bad);
+    REQUIRE(bad.size() >= text.size() - 1);
+    auto damaged = rec;
+    auto pos = static_cast<std::size_t>(at - rec.begin());
+    // Same length, so the record's lengths still hold: a one-byte change.
+    std::string replaced{bad.substr(0, text.size())};
+    replaced.resize(text.size(), ' ');
+    for (std::size_t i = 0; i < text.size(); ++i) damaged[pos + i] = static_cast<std::byte>(replaced[i]);
+    if (replaced == text) continue;
+    CHECK_THROWS_AS(parse_table(damaged), std::runtime_error);
+  }
 }

@@ -1121,6 +1121,44 @@ PostgreSQL refuses it (42804). Refused (0A000) until it has an order and arithme
 to it, and it assigned to a column of another type; a subquery of it; a
 domain or procedure argument of it.
 
+**jsonb.** `jsonb` (also `pg_catalog.jsonb`) declares a column of any
+JSON value, stored in its binary layout and returned as `jsonb_out`'s text
+(`jsonb_design.md`, stage 1; `types_design.md`, *jsonb*): written by
+`INSERT` (a string literal, read by `jsonb_in` when the statement is
+prepared, so its 22P02 comes first with PostgreSQL's DETAIL and CONTEXT; a
+`$n`, typed jsonb, read when it runs; `$n::jsonb`; another jsonb by
+`INSERT … SELECT` and `CREATE TABLE AS`), `UPDATE`'s `SET` of those or of
+another jsonb column, `DEFAULT` (a string, or a string cast to jsonb:
+`DEFAULT '{}'::jsonb`, the one cast a `DEFAULT` takes) and `ADD COLUMN`;
+read, returned by `RETURNING`, a view and `UNION ALL`, tested by `IS [NOT]
+NULL` (JSON `null` is not SQL NULL), counted by `COUNT`, and carried by
+`CASE` and `COALESCE` of jsonb values. A string value (a column, a
+constant or a `$n` of a string type) cast to jsonb is read by `jsonb_in`
+when it runs (`bc_jsonb_in`), and a jsonb cast to `text` or `varchar` of
+no length is its text (`bc_jsonb_text`). PostgreSQL's errors come first: a
+text value assigned to it, or a number or boolean `DEFAULT`, 42804 with its
+HINT; a cast to it of another type, or of it to `bytea`, a date or a time,
+42846; arithmetic of it but `-` with text or an integer, and `MIN`,
+`MAX`, `SUM` and `AVG` of it, 42883; a comparison with another type,
+42883. A jsonb constant assigned to a string column is its text, and one
+with a typed text under `||` is text concatenation. Refused (0A000) until
+stage 2: a comparison of it, of constants too (a literal beside it read
+first, 22P02), `IN`,
+`ORDER BY`, `GROUP BY`, `DISTINCT`, `COUNT(DISTINCT …)`, `UNION`,
+`INTERSECT`, `EXCEPT`, and a subquery of it; until the next phase: a key,
+`UNIQUE`, index or `FOREIGN KEY` column of it; until stages 3 and 4: the
+operators PostgreSQL has for it (`->`, `->>`, `#>`, `#>>`, `@>`, `<@`,
+`?`, `?|`, `?&`, `#-`, `@?`, `@@`, refused by the parser whatever the
+operands; `||` and `-` of a jsonb, by the binder) and the JSON functions
+(named `jsonb_…` or `json_…`, `to_json`, `to_jsonb`, `row_to_json`,
+`array_to_json`), its casts to `boolean` and the numbers, and to
+`varchar(n)`, `char` and `name`, which cut or pad; a jsonb column's value
+assigned to a string column (`INSERT … SELECT v::text` works); `json`
+(stage 1c), a domain, a procedure argument and a PL/pgSQL variable of
+jsonb. A form the parser takes for no type keeps its 42601 with jsonb:
+`IN`, `BETWEEN`, `IS DISTINCT FROM` and `LIKE` in a select list, `COLLATE`
+(PostgreSQL's is 42804), a cast in `UPDATE`'s `SET`.
+
 **NAME.** `NAME` declares a column of PostgreSQL's identifier type
 (`types_design.md`, *NAME*): text of at most 63 bytes, a longer value cut
 at a character boundary wherever it is written or read as a `name` (a
@@ -1144,6 +1182,9 @@ That includes:
 - a `NUMERIC` column without a precision compared, ordered, grouped,
   computed, aggregated (but by `COUNT`) or cast, or as a key (0A000,
   *NUMERIC without a precision*);
+- a jsonb value compared, ordered, grouped, `DISTINCT`, or as a key, every
+  operator and function of jsonb, its casts but those with text, and the
+  `json` type (0A000, *jsonb*; `jsonb_design.md`, *Stages of jsonb*);
 - `IS DISTINCT FROM`, and a predicate or a constant in `HAVING`; a
   `NULL` constant under `NOT`, and a string constant as a `WHERE` or `ON`;
 - correlated subqueries but the slice above (#836), nested subqueries and the others above, a subquery in `FROM`, and a derived relation but a grouped view aggregated over;

@@ -39,6 +39,7 @@ export module bytecask.sql.binder;
 export import bytecask.sql.logical;
 import bytecask.sql.parser;
 import bytecask.sql.text;
+import bytecask.sql.jsonb;
 
 export namespace bytecask::sql::bound {
 
@@ -233,6 +234,7 @@ auto type_name(PhysType t) -> std::string {
     case PhysType::F64: return "double precision";
     case PhysType::Bool: return "boolean";
     case PhysType::Num: return "numeric";
+    case PhysType::Jsonb: return "jsonb";
   }
   return "?";
 }
@@ -256,6 +258,9 @@ auto sql_type(const ast::ColumnDefAst& c) -> SqlType {
   if (c.type == "bytea") return no_mods(SqlKind::Bytea);
   if (c.type == "text") return no_mods(SqlKind::Text);
   if (c.type == "name") return no_mods(SqlKind::Name);
+  if (c.type == "jsonb") return no_mods(SqlKind::Jsonb);
+  // json is stage 1c of docs/jsonb_design.md.
+  if (c.type == "json") throw SqlError{"type json is not supported yet", c.pos, kFeatureNotSupported};
   if (c.type == "timestamp") return no_mods(SqlKind::Timestamp);
   if (c.type == "timestamptz") {
     // Precision 6 is the microseconds the type holds; a smaller one rounds
@@ -435,6 +440,25 @@ auto fold_default(const ast::Literal& l, SqlType t, std::string_view column) -> 
       if (l.kind != K::Integer && l.kind != K::Number && l.kind != K::String) bad();
       return numeric_bytes(l.text, l.pos);
     }
+    case SqlKind::Jsonb: {
+      // Its text read as jsonb_in reads it, stored as the rows store it; a
+      // number or a boolean is PostgreSQL's 42804, as an INSERT of one is.
+      if (l.kind == K::Integer || l.kind == K::Number || l.kind == K::Bool) {
+        throw SqlError{"column \"" + std::string{column} + "\" is of type jsonb but default expression is of type " +
+                           (l.kind == K::Bool ? "boolean" : l.kind == K::Integer ? "integer" : "numeric"),
+                       l.pos, kDatatypeMismatch}
+            .with_notes("", "You will need to rewrite or cast the expression.");
+      }
+      if (l.kind != K::String) bad();
+      Bytes value;
+      auto r = jsonb::parse_value(l.text, value);
+      if (!r.ok()) {
+        if (r.status != jsonb::Status::Data) throw std::logic_error{"a jsonb DEFAULT that does not encode"};
+        const auto& err = *r.error;
+        throw SqlError{err.message, l.pos, err.state}.with_notes(err.detail, err.hint, err.context);
+      }
+      return value;
+    }
     case SqlKind::Timestamp:
     case SqlKind::TimestampTz:
     case SqlKind::Date:
@@ -448,7 +472,9 @@ auto fold_default(const ast::Literal& l, SqlType t, std::string_view column) -> 
 // The groups PostgreSQL's casts and operators sort the types into. Numbers
 // compare with and assign to each other; a string takes a value of any type
 // on assignment; no other pair meets.
-enum class TypeClass { Number, Temporal, Boolean, String, Bytea };
+// jsonb is a class of its own: PostgreSQL puts it in category U, and it
+// meets no other type but text in a cast and a string column on assignment.
+enum class TypeClass { Number, Temporal, Boolean, String, Bytea, Jsonb };
 
 constexpr auto type_class(SqlKind k) -> TypeClass {
   switch (k) {
@@ -470,6 +496,7 @@ constexpr auto type_class(SqlKind k) -> TypeClass {
     case SqlKind::Char:
     case SqlKind::Name: return TypeClass::String;
     case SqlKind::Bytea: return TypeClass::Bytea;
+    case SqlKind::Jsonb: return TypeClass::Jsonb;
   }
   std::unreachable();
 }
@@ -483,6 +510,25 @@ auto type_refusal(SqlKind from, SqlKind to, bool assignment) -> std::optional<Sq
   auto b = type_class(to);
   if (a == b || (assignment && b == TypeClass::String)) return std::nullopt;
   return assignment ? kDatatypeMismatch : kUndefinedFunction;
+}
+
+// PostgreSQL's 42804 for a value of type `from` assigned to a column of
+// type `to`, with its HINT.
+auto assignment_mismatch(const std::string& column, const std::string& to, const std::string& from, std::int32_t pos) -> SqlError {
+  return SqlError{"column \"" + column + "\" is of type " + to + " but expression is of type " + from, pos, kDatatypeMismatch}
+      .with_notes("", "You will need to rewrite or cast the expression.");
+}
+
+// A column's default as a parameter carries it: a jsonb's as its canonical
+// text, which bc_param_jsonb and bc_row_set_param read (the catalog holds the
+// stored value).
+auto param_default(const Column& c) -> Datum {
+  const auto* b = std::get_if<Bytes>(&c.default_value);
+  if (c.sql.kind != SqlKind::Jsonb || b == nullptr) return c.default_value;
+  std::string text;
+  if (!jsonb::value_text(*b, text).ok()) throw std::logic_error{"a jsonb default that does not decode"};
+  auto t = std::as_bytes(std::span{text.data(), text.size()});
+  return Bytes(t.begin(), t.end());
 }
 
 // An integer or DECIMAL column: one whose arithmetic is exact in int64_t.
@@ -505,7 +551,8 @@ auto exact_number(const Column& c) -> bool {
     case SqlKind::Date:
     case SqlKind::Time:
     case SqlKind::TimeTz:
-    case SqlKind::Numeric: return false;  // its text: no int64_t arithmetic
+    case SqlKind::Numeric:  // its text: no int64_t arithmetic
+    case SqlKind::Jsonb: return false;
   }
   return false;
 }
@@ -558,6 +605,7 @@ auto pg_type_name(SqlType t) -> std::string {
     case SqlKind::Text:
     case SqlKind::Name:
     case SqlKind::Bytea:
+    case SqlKind::Jsonb:
     case SqlKind::Date: return sql_type_name(t);
   }
   return sql_type_name(t);
@@ -659,6 +707,24 @@ void name_union(SqlType first, SqlType next, const std::string& what, std::int32
 [[noreturn]] void refuse_numeric(const std::string& what, std::int32_t pos) {
   throw SqlError{what + " (NUMERIC without a precision) is not supported yet", pos, kFeatureNotSupported};
 }
+
+// The types the layer stores and carries but does not compare, order,
+// group, compute or aggregate but by COUNT yet (0A000): a NUMERIC of no
+// precision (refuse_numeric), and jsonb, which compares by its sort key
+// (docs/jsonb_design.md, stage 2). One predicate, so no site checks one and
+// forgets the other.
+constexpr auto uncompared(SqlKind k) -> bool { return k == SqlKind::Numeric || k == SqlKind::Jsonb; }
+
+// The name a refusal gives an uncompared type.
+auto uncompared_name(SqlKind k) -> std::string { return k == SqlKind::Jsonb ? "jsonb" : "NUMERIC"; }
+
+[[noreturn]] void refuse_uncompared(SqlKind k, const std::string& what, std::int32_t pos) {
+  if (k != SqlKind::Jsonb) refuse_numeric(what, pos);
+  throw SqlError{what + " is not supported yet", pos, kFeatureNotSupported};
+}
+
+// The uncompared kind of a pair, for a refusal's message: a's, else b's.
+constexpr auto uncompared_of(SqlKind a, SqlKind b) -> SqlKind { return uncompared(a) ? a : b; }
 
 auto integer_constant(std::int64_t v, std::int32_t pos) -> Constant {
   return {v, SqlType{std::in_range<std::int32_t>(v) ? SqlKind::Integer : SqlKind::BigInt}, false, {}, pos};
@@ -928,6 +994,20 @@ auto numeric_quotient(Scaled x, Scaled y, int scale) -> std::optional<std::int64
 
 auto resolved(const Constant& k, SqlType t) -> Constant;
 
+// A typed jsonb constant (an unknown literal is not one until resolved).
+auto is_jsonb(const Constant& c) -> bool { return !c.unknown && c.type.kind == SqlKind::Jsonb; }
+
+// A constant's type as PostgreSQL names it in an operator error: an
+// untyped literal or NULL is unknown.
+auto operand_type_name(const Constant& c) -> std::string { return c.unknown ? "unknown" : pg_type_name(c.type); }
+
+// PostgreSQL's 42883 for x op y of constants, with its HINT.
+[[noreturn]] void no_operator(const Constant& x, std::string_view op, const Constant& y, std::int32_t pos) {
+  throw SqlError{"operator does not exist: " + operand_type_name(x) + " " + std::string{op} + " " + operand_type_name(y), pos,
+                 kUndefinedFunction}
+      .with_notes("", "No operator matches the given name and argument types. You might need to add explicit type casts.");
+}
+
 // x op y, of integer or numeric constants, as PostgreSQL's operators type
 // it (arith_type); the range checked as there (22003). Integer / truncates
 // toward zero; a numeric quotient has PostgreSQL's own scale (div_scale),
@@ -938,6 +1018,17 @@ auto resolved(const Constant& k, SqlType t) -> Constant;
 // as PostgreSQL resolves it.
 auto arithmetic(const Constant& x, const Constant& y, Arith op, std::int32_t pos) -> Constant {
   auto text = std::string{arith_text(op)};
+  // PostgreSQL's one arithmetic operator of jsonb is jsonb - text and jsonb
+  // - integer (an unknown literal resolved as text, a smallint widened):
+  // not built until stage 3. Every other pair has no operator (42883).
+  if (is_jsonb(x) || is_jsonb(y)) {
+    auto key = [](const Constant& c) {
+      return c.unknown || c.type.kind == SqlKind::Integer || c.type.kind == SqlKind::SmallInt ||
+             type_class(c.type.kind) == TypeClass::String;
+    };
+    if (op == Arith::Sub && is_jsonb(x) && key(y)) refuse_uncompared(SqlKind::Jsonb, "- of a jsonb", pos);
+    no_operator(x, text, y, pos);
+  }
   auto null_untyped = [](const Constant& c) { return c.unknown && std::holds_alternative<std::monostate>(c.value); };
   if (null_untyped(x) && null_untyped(y)) not_yet("NULL " + text + " NULL", pos);
   if ((!x.unknown && is_temporal(x.type)) || (!y.unknown && is_temporal(y.type))) {
@@ -1045,6 +1136,20 @@ auto bytes_of(std::string_view t) -> Bytes {
   throw err;
 }
 
+// An input function's error as the statement's, its DETAIL and CONTEXT
+// kept (jsonb_in has both).
+auto input_error(const TextError& e, std::int32_t pos) -> SqlError {
+  SqlError err{e.what(), pos, known_sqlstate(e.sqlstate()).value_or(kInvalidTextRepresentation)};
+  if (e.detail().empty() && e.context().empty()) return err;
+  return std::move(err).with_notes(std::string{e.detail()}, "", std::string{e.context()});
+}
+
+[[noreturn]] void literal_input_error(const Constant& k, const TextError& e) {
+  auto err = input_error(e, k.pos);
+  err.mark_at_analysis();
+  throw err;
+}
+
 // Text read as a value of type t, as t's input function reads it, the
 // range checked: what an unknown literal is where it meets t. `assigned`
 // rounds a DECIMAL finer than its scale, as a cast or an assignment does.
@@ -1055,9 +1160,8 @@ auto read_as(const Constant& k, SqlType t, bool assigned) -> Datum {
   try {
     d = from_text(k.text, t, assigned);
   } catch (const TextError& e) {
-    auto state = known_sqlstate(e.sqlstate()).value_or(kInvalidTextRepresentation);
-    if (k.unknown) literal_input_error(k, e.what(), state);
-    throw SqlError{e.what(), k.pos, state};
+    if (k.unknown) literal_input_error(k, e);
+    throw input_error(e, k.pos);
   }
   if (auto why = out_of_range(t, d)) {
     if (k.unknown) literal_input_error(k, *why, range_state(*why));
@@ -1209,6 +1313,10 @@ auto compare_constants(Constant x, Constant y, ast::ValueCompare op, std::int32_
   if (std::holds_alternative<std::monostate>(x.value) || std::holds_alternative<std::monostate>(y.value)) {
     return {std::monostate{}, SqlType{SqlKind::Boolean}, false, {}, pos};
   }
+  // jsonb with jsonb (an unknown literal beside it read by jsonb_in above,
+  // so its 22P02 comes first): PostgreSQL's operator, not built until
+  // stage 2.
+  if (is_jsonb(x) || is_jsonb(y)) refuse_uncompared(SqlKind::Jsonb, "a comparison of jsonb values", pos);
   auto o = order(x, y, op, pos);
   auto truth = [&] {
     switch (op) {
@@ -1312,6 +1420,10 @@ auto cast_typed(const Constant& arg, SqlType t, std::int32_t pos) -> Constant {
   auto exists = from == TypeClass::String || to == TypeClass::String || arg.type.kind == t.kind ||
                 (from == TypeClass::Number && to == TypeClass::Number) ||
                 (arg.type.kind == K::Boolean && t.kind == K::Integer) || (arg.type.kind == K::Integer && t.kind == K::Boolean);
+  // jsonb to a boolean or a number is stage 3's cast (docs/jsonb_design.md).
+  if (arg.type.kind == K::Jsonb && (to == TypeClass::Number || to == TypeClass::Boolean)) {
+    not_supported("a cast of jsonb to " + pg_type_name(t), pos);
+  }
   if (!exists) throw SqlError{"cannot cast type " + pg_type_name(arg.type) + " to " + pg_type_name(t), pos, kCannotCoerce};
   if (to == TypeClass::String && is_float(arg.type)) not_yet("a cast of a floating-point value to text", pos);
   auto result = [&](Datum v) -> Constant { return {std::move(v), t, false, {}, pos}; };
@@ -1640,6 +1752,14 @@ auto int_of(const Constant& c) -> std::int32_t { return static_cast<std::int32_t
 // 1 is 'a1'); bytea with bytea. Two values neither of which is a string
 // match no operator.
 auto fold_concat(const Constant& a, const Constant& b, std::int32_t pos) -> Constant {
+  // jsonb || jsonb, an unknown literal beside a jsonb read as one (its 22P02
+  // first, as PostgreSQL): jsonb's operator, not built until stage 3. A
+  // jsonb with a typed string is text concatenation, below.
+  if (is_jsonb(a) || is_jsonb(b)) {
+    const auto& other = is_jsonb(a) ? b : a;
+    if (other.unknown) (void)resolved(other, SqlType{SqlKind::Jsonb});
+    if (other.unknown || is_jsonb(other)) refuse_uncompared(SqlKind::Jsonb, "|| of a jsonb", pos);
+  }
   auto is_bytea = [](const Constant& c) { return !c.unknown && c.type.kind == SqlKind::Bytea; };
   if (is_bytea(a) && is_bytea(b)) {
     if (is_null(a) || is_null(b)) return null_constant(SqlKind::Bytea, pos);
@@ -1668,6 +1788,7 @@ auto fold_concat(const Constant& a, const Constant& b, std::int32_t pos) -> Cons
 // type, numerics at the finer scale. A zero divisor is 22012; a float has no
 // % (42883). An unknown literal takes the other side's type.
 auto fold_mod(Constant x, Constant y, std::int32_t pos) -> Constant {
+  if (is_jsonb(x) || is_jsonb(y)) no_operator(x, "%", y, pos);
   if (x.unknown && !y.unknown) x = resolved(x, y.type);
   if (y.unknown && !x.unknown) y = resolved(y, x.type);
   if (x.unknown && y.unknown) not_yet("% of two string literals or NULLs", pos);
@@ -1924,16 +2045,18 @@ auto coerce_value(const Constant& k, const Column& c, bool assigned, std::string
   // compared with a number yet. A string literal is read first, so text that
   // is no number is 22P02 as in PostgreSQL; a boolean, temporal or string
   // constant falls through to PostgreSQL's 42883 (no such operator).
-  if (c.sql.kind == SqlKind::Numeric && !assigned) {
+  // A jsonb likewise: the literal is read by jsonb_in first (22P02), as in
+  // PostgreSQL, and then a jsonb comparison is stage 2's.
+  if (uncompared(c.sql.kind) && !assigned) {
     if (k.unknown && !std::holds_alternative<std::monostate>(k.value)) {
       try {
         (void)from_text(k.text, c.sql, true);
       } catch (const TextError& e) {
-        literal_input_error(k, e.what(), known_sqlstate(e.sqlstate()).value_or(kInvalidTextRepresentation));
+        literal_input_error(k, e);
       }
     }
-    if (k.unknown || type_class(k.type.kind) == TypeClass::Number) {
-      refuse_numeric("a NUMERIC column compared or computed with a constant", k.pos);
+    if (k.unknown || type_class(k.type.kind) == type_class(c.sql.kind)) {
+      refuse_uncompared(c.sql.kind, "a " + uncompared_name(c.sql.kind) + " column compared or computed with a constant", k.pos);
     }
   }
   if (k.unknown) {
@@ -1948,11 +2071,11 @@ auto coerce_value(const Constant& k, const Column& c, bool assigned, std::string
         try {
           (void)from_text(k.text, c.sql, true);
         } catch (const TextError&) {
-          literal_input_error(k, e.what(), known_sqlstate(e.sqlstate()).value_or(kInvalidTextRepresentation));
+          literal_input_error(k, e);
         }
         inexact();
       }
-      literal_input_error(k, e.what(), known_sqlstate(e.sqlstate()).value_or(kInvalidTextRepresentation));
+      literal_input_error(k, e);
     }
     if (!assigned) {
       if (auto why = out_of_range(compared_type(c.sql).range, d)) literal_input_error(k, *why, range_state(*why));
@@ -1960,11 +2083,7 @@ auto coerce_value(const Constant& k, const Column& c, bool assigned, std::string
     return d;
   }
   if (auto refusal = type_refusal(k.type.kind, c.sql.kind, assigned)) {
-    if (assigned) {
-      throw SqlError{"column \"" + c.name + "\" is of type " + pg_type_name(c.sql) + " but expression is of type " +
-                         pg_type_name(k.type),
-                     k.pos, *refusal};
-    }
+    if (assigned) throw assignment_mismatch(c.name, pg_type_name(c.sql), pg_type_name(k.type), k.pos);
     throw SqlError{"operator does not exist: " + pg_type_name(c.sql) + " " + std::string{op} + " " + pg_type_name(k.type),
                    k.pos, *refusal};
   }
@@ -2070,7 +2189,8 @@ auto coerce_value(const Constant& k, const Column& c, bool assigned, std::string
     case SqlKind::Date:
     case SqlKind::Time:
     case SqlKind::TimeTz:
-    case SqlKind::Numeric: break;  // refused by type_refusal
+    case SqlKind::Numeric:
+    case SqlKind::Jsonb: break;  // refused by type_refusal
   }
   throw SqlError{"expression not supported", k.pos};
 }
@@ -2257,6 +2377,9 @@ auto clock_default(const std::string& name, std::int64_t precision, SqlType t, c
 
 auto column_spec(const ast::ColumnDefAst& c) -> ColumnSpec {
   auto t = column_type(c);
+  if (!c.default_cast.empty() && t.kind != SqlKind::Jsonb) {
+    not_supported("a DEFAULT cast to " + c.default_cast + " for a column of type " + pg_type_name(t), c.pos);
+  }
   ColumnSpec out{c.name, t, !c.not_null && !c.primary_key, c.default_value ? fold_default(*c.default_value, t, c.name) : Datum{}, {}};
   if (!c.default_clock.empty()) out.clock_default = clock_default(c.default_clock, c.default_clock_precision, t, c.name, c.pos, false);
   return out;
@@ -2355,6 +2478,9 @@ void check_foreign_key(const CreateTableDdl& t, const ast::ForeignKeyAst& f, con
     if (type_of(own, f.columns[i])->kind == SqlKind::Numeric) {
       throw SqlError{"NUMERIC column \"" + f.columns[i] + "\" without a precision in a foreign key is not supported yet", f.pos,
                      kFeatureNotSupported};
+    }
+    if (type_of(own, f.columns[i])->kind == SqlKind::Jsonb) {
+      throw SqlError{"jsonb column \"" + f.columns[i] + "\" in a foreign key is not supported yet", f.pos, kFeatureNotSupported};
     }
     if (!references_type(*type_of(own, f.columns[i]), *type_of(ref.columns, refs[i]))) {
       auto name = f.name;
@@ -2519,7 +2645,7 @@ public:
       type = outs[0].expr.type;
       // AVG's or a NUMERIC column's: compared or matched where a subquery
       // stands, which a NUMERIC is not yet.
-      if (type.kind == SqlKind::Numeric) refuse_numeric("a subquery of a NUMERIC value", pos);
+      if (uncompared(type.kind)) refuse_uncompared(type.kind, "a subquery of a " + uncompared_name(type.kind) + " value", pos);
       name = outs[0].name;
     }
     // Its parameters, NULL until it runs: its value or values, then its flags.
@@ -2886,6 +3012,7 @@ public:
         // taken yet.
         if (!param_cast(e)) {
           if (e.rhs->kind == K::Column && resolve(*e.rhs).second->sql.kind == SqlKind::Numeric) refuse_numeric("a cast of a NUMERIC", e.pos);
+          if (auto j = jsonb_cast(e, resolve)) return std::move(*j);
           // A NAME, TEXT or VARCHAR to TEXT (or VARCHAR of no length), or a
           // NAME to NAME, keeps its bytes: a relabelling, as PostgreSQL's
           // binary-coercible cast.
@@ -3041,7 +3168,7 @@ public:
       auto a = arg(e.args[0], SqlType{SqlKind::Text});
       auto b = arg(e.args[1], SqlType{SqlKind::Text});
       for (const auto* x : {&a, &b}) {
-        if (x->type.kind == SqlKind::Numeric) refuse_numeric("|| of a NUMERIC", e.pos);
+        if (uncompared(x->type.kind)) refuse_uncompared(x->type.kind, "|| of a " + uncompared_name(x->type.kind), e.pos);
         if (!texty(x->type) && !exact(x->type)) not_yet("|| of a " + pg_type_name(x->type) + " value", e.pos);
       }
       if (!texty(a.type) && !texty(b.type)) {
@@ -3283,7 +3410,8 @@ public:
       case SqlKind::Date:
       case SqlKind::Time:
       case SqlKind::TimeTz:
-      case SqlKind::Numeric: break;
+      case SqlKind::Numeric:
+      case SqlKind::Jsonb: break;
     }
     return 0;
   }
@@ -3297,6 +3425,46 @@ public:
     }
   }
 
+  // Whether x is a jsonb value: a column of jsonb, or a cast to jsonb.
+  auto jsonb_operand(const ast::Expr& x, const Resolve& resolve) -> bool {
+    if (x.kind == ast::Expr::Kind::Column) return resolve(x).second->sql.kind == SqlKind::Jsonb;
+    return x.kind == ast::Expr::Kind::Cast && x.cast_type == "jsonb" && x.cast_schema.empty();
+  }
+
+  // A cast at run time between jsonb and text (docs/jsonb_design.md, *Casts
+  // to and from jsonb and json*): a jsonb's text (jsonb_out's) as TEXT or
+  // VARCHAR, and a string read by jsonb_in. A jsonb to the types stage 3
+  // casts it to (boolean, the numbers) is not built yet (0A000); to any
+  // other type, and any other type to jsonb, PostgreSQL has no cast (42846).
+  // nullopt when neither side is a jsonb: the caller's cast.
+  auto jsonb_cast(const ast::Expr& e, const Resolve& resolve) -> std::optional<logical::Expr> {
+    auto to_jsonb = e.cast_type == "jsonb" && e.cast_schema.empty();
+    if (!to_jsonb && !jsonb_operand(*e.rhs, resolve)) return std::nullopt;
+    auto v = value(*e.rhs, resolve);
+    if (to_jsonb && v.type.kind == SqlKind::Jsonb) return v;
+    auto cast = [&](SqlType to) {
+      auto out = logical::expr(logical::Expr::Kind::JsonbCast, to);
+      out.args.push_back(std::move(v));
+      return out;
+    };
+    if (to_jsonb) {
+      if (type_class(v.type.kind) == TypeClass::String) return cast(SqlType{SqlKind::Jsonb});
+      throw SqlError{"cannot cast type " + pg_type_name(v.type) + " to jsonb", e.pos, kCannotCoerce};
+    }
+    if (v.type.kind != SqlKind::Jsonb) return std::nullopt;
+    auto to = cast_type(e);
+    if (to.kind == SqlKind::Text) return cast(to);  // TEXT, and VARCHAR of no length
+    switch (type_class(to.kind)) {
+      case TypeClass::String: not_supported("a cast of jsonb to " + pg_type_name(to) + ", which cuts or pads its text", e.pos);
+      case TypeClass::Number:
+      case TypeClass::Boolean: not_supported("a cast of jsonb to " + pg_type_name(to), e.pos);
+      case TypeClass::Temporal:
+      case TypeClass::Bytea:
+      case TypeClass::Jsonb: break;
+    }
+    throw SqlError{"cannot cast type jsonb to " + pg_type_name(to), e.pos, kCannotCoerce};
+  }
+
   auto arithmetic_value(const ast::Expr& e, const Resolve& resolve) -> logical::Expr {
     using K = ast::Expr::Kind;
     auto op = e.kind == K::Add ? Arith::Add : e.kind == K::Sub ? Arith::Sub : e.kind == K::Mul ? Arith::Mul : Arith::Div;
@@ -3307,6 +3475,16 @@ public:
     auto untyped_beside_temporal = [&](SqlType t, bool untyped_left) {
       if (is_temporal(t) && untyped(untyped_left ? *e.lhs : *e.rhs)) temporal_untyped_operator(op, t, untyped_left, e.pos);
     };
+    // jsonb has - (of a key, an index or a path: stage 4) and no other
+    // arithmetic operator; decided before an unknown literal beside it is
+    // read as jsonb, which PostgreSQL reads as text for -.
+    if (jsonb_operand(*e.lhs, resolve) || jsonb_operand(*e.rhs, resolve)) {
+      if (op == Arith::Sub) not_supported("the jsonb - operator", e.pos);
+      auto side = [&](const ast::Expr& x) { return untyped(x) ? std::string{"unknown"} : pg_type_name(value(x, resolve).type); };
+      throw SqlError{"operator does not exist: " + side(*e.lhs) + " " + std::string{arith_text(op)} + " " + side(*e.rhs), e.pos,
+                     kUndefinedFunction}
+          .with_notes("", "No operator matches the given name and argument types. You might need to add explicit type casts.");
+    }
     auto [l, r] = operands(*e.lhs, *e.rhs, resolve, Use::Operand, untyped_beside_temporal);
     if (is_temporal(l.type) || is_temporal(r.type)) {
       temporal_operator(op, l.type, r.type, e.pos);  // returns for DATE - DATE only
@@ -3641,7 +3819,11 @@ public:
     // A CHAR(n) compares without its trailing spaces: a parameter would need
     // them cut at run time, as a constant is cut here.
     if (col.sql.kind == SqlKind::Char && use != Use::Assigned) not_yet("a parameter compared with a CHAR(n) column", pos);
-    if (col.sql.kind == SqlKind::Numeric && use != Use::Assigned) refuse_numeric("a parameter compared or computed with a NUMERIC", pos);
+    // A jsonb operand ($1::jsonb, carried) is the comparison's to refuse, where
+    // there is one (numeric_compared).
+    if (uncompared(col.sql.kind) && use != Use::Assigned && !(col.sql.kind == SqlKind::Jsonb && use == Use::Operand)) {
+      refuse_uncompared(col.sql.kind, "a parameter compared or computed with a " + uncompared_name(col.sql.kind), pos);
+    }
     if (params_.size() <= n) params_.resize(n + 1);
     auto& p = params_[n];
     if (n < fixed_params_ && p.first) {
@@ -3711,11 +3893,7 @@ public:
     auto param = "parameter $" + std::to_string(n + 1) + " of type " + sql_type_name(fixed);
     auto assigned = use == Use::Assigned;
     auto refusal = type_refusal(fixed.kind, col.sql.kind, assigned);
-    if (refusal && assigned) {
-      throw SqlError{"column \"" + col.name + "\" is of type " + sql_type_name(col.sql) + " but expression is of type " +
-                         sql_type_name(fixed),
-                     pos, *refusal};
-    }
+    if (refusal && assigned) throw assignment_mismatch(col.name, sql_type_name(col.sql), sql_type_name(fixed), pos);
     auto with = (assigned ? " assigned to " : " used with ") + col.name + " (" + sql_type_name(col.sql) + ")";
     if (refusal) throw SqlError{param + " cannot be" + with, pos, *refusal};
     throw SqlError{param + with + " is not supported yet", pos};
@@ -3760,6 +3938,7 @@ public:
       case SqlKind::TimeTz: return {!sum, kUndefinedFunction};
       case SqlKind::Time: return {!sum, kSyntaxError};
       case SqlKind::Numeric: return {false, kFeatureNotSupported};  // a column's text: refuse_numeric
+      case SqlKind::Jsonb: return {false, kUndefinedFunction};       // PostgreSQL has no SUM, AVG, MIN or MAX of jsonb
     }
     std::unreachable();
   }
@@ -3846,6 +4025,13 @@ public:
     if (t.kind == SqlKind::Numeric && (e.fn != Fn::Count || agg.distinct)) {
       refuse_numeric(std::string{aggregate_name(e.fn)} + (agg.distinct ? " of DISTINCT values" : "") + " of a NUMERIC", e.pos);
     }
+    if (t.kind == SqlKind::Jsonb && e.fn == Fn::Count && agg.distinct) refuse_uncompared(t.kind, "COUNT of DISTINCT jsonb values", e.pos);
+    if (t.kind == SqlKind::Jsonb && e.fn != Fn::Count) {
+      auto name = std::string{aggregate_name(e.fn)};
+      std::ranges::transform(name, name.begin(), [](char ch) { return static_cast<char>(std::tolower(static_cast<unsigned char>(ch))); });
+      throw SqlError{"function " + name + "(jsonb) does not exist", e.pos, kUndefinedFunction}.with_notes(
+          "", "No function matches the given name and argument types. You might need to add explicit type casts.");
+    }
     if (auto s = aggregate_support(e.fn, t); !s.supported) {
       auto of = arg->kind == logical::Expr::Kind::Column ? " column" : " value";
       throw SqlError{std::string{aggregate_name(e.fn)} + " of a " + sql_type_name(t) + of + " is not supported", e.pos,
@@ -3924,6 +4110,7 @@ public:
             !type_refusal(c->sql.kind, target.sql.kind, true)) {
           refuse_numeric("assigning a column of type " + pg_type_name(c->sql) + " to one of type " + pg_type_name(target.sql), e.pos);
         }
+        jsonb_assigned(c->sql, target, e.pos);
         if (c->type != want) {
           throw SqlError{"column \"" + c->name + "\" is " + type_name(c->type), e.pos,
                          type_refusal(c->sql.kind, target.sql.kind, true).value_or(kSyntaxError)};
@@ -3976,7 +4163,7 @@ public:
       case ast::Expr::Kind::Subquery: not_yet("a subquery assigned to a column", e.pos);
       case ast::Expr::Kind::Default:
         if (target.clock_default) return clock_reading(*target.clock_default, target);
-        return fixed(target.default_value, target.sql);
+        return fixed(param_default(target), target.sql);
       case ast::Expr::Kind::Case:
       case ast::Expr::Kind::Coalesce:
       case ast::Expr::Kind::NullIf: not_yet("CASE, COALESCE and NULLIF of other than constants", e.pos);
@@ -4375,7 +4562,7 @@ public:
     auto number = [&](SqlType t) { return integral(t) || floating(t); };
     auto a = lc.sql;
     auto b = rc.sql;
-    if (a.kind == SqlKind::Numeric || b.kind == SqlKind::Numeric) {
+    if (uncompared(a.kind) || uncompared(b.kind)) {
       no_operator(a, written_op(w, op), b, w.pos);
       numeric_compared(a, b, w.pos);
     }
@@ -4406,10 +4593,26 @@ public:
     }
   }
 
-  // A NUMERIC compared: not yet (refuse_numeric), once PostgreSQL has the
-  // operator (no_operator before it).
+  // A NUMERIC or a jsonb compared: not yet (refuse_uncompared), once
+  // PostgreSQL has the operator (no_operator before it).
   static void numeric_compared(SqlType a, SqlType b, std::int32_t pos) {
-    if (a.kind == SqlKind::Numeric || b.kind == SqlKind::Numeric) refuse_numeric("a comparison of a NUMERIC column", pos);
+    if (uncompared(a.kind) || uncompared(b.kind)) {
+      auto k = uncompared_of(a.kind, b.kind);
+      refuse_uncompared(k, "a comparison of a " + uncompared_name(k) + " column", pos);
+    }
+  }
+
+  // A column's or an expression's value of type `from` assigned to column
+  // `target` where one is a jsonb: jsonb to jsonb is the value; any other
+  // type to a jsonb is PostgreSQL's 42804; a jsonb to a string column, its
+  // text, is not built yet (0A000). A jsonb constant to a string column is
+  // its text, folded before it reaches here.
+  static void jsonb_assigned(SqlType from, const Column& target, std::int32_t pos) {
+    if (from.kind == target.sql.kind || (from.kind != SqlKind::Jsonb && target.sql.kind != SqlKind::Jsonb)) return;
+    if (from.kind == SqlKind::Jsonb && type_class(target.sql.kind) == TypeClass::String) {
+      not_supported("assigning a jsonb value to a column of type " + pg_type_name(target.sql), pos);
+    }
+    throw assignment_mismatch(target.name, pg_type_name(target.sql), pg_type_name(from), pos);
   }
 
   // A CHAR(n) with a VARCHAR: PostgreSQL compares the two as bpchar, the
@@ -4840,7 +5043,9 @@ public:
     std::vector<logical::Expr> group_by;
     for (const auto& e : distinct_groups ? list : s.group_by) {
       auto [t, c] = resolve(e);
-      if (c->sql.kind == SqlKind::Numeric) refuse_numeric(std::string{distinct_groups ? "DISTINCT" : "GROUP BY"} + " of a NUMERIC column", e.pos);
+      if (uncompared(c->sql.kind)) {
+        refuse_uncompared(c->sql.kind, std::string{distinct_groups ? "DISTINCT" : "GROUP BY"} + " of a " + uncompared_name(c->sql.kind) + " column", e.pos);
+      }
       // A derived relation's groups are keyed by values the plan holds in
       // locals: integers and booleans (#833).
       if (Table::derived(t->id) && c->type != PhysType::I64 && c->type != PhysType::Bool) {
@@ -4912,7 +5117,7 @@ public:
     for (const auto& o : s.order_by) {
       if (o.expr.kind == ast::Expr::Kind::Column) {
         auto [t, c] = resolve(o.expr);
-        if (c->sql.kind == SqlKind::Numeric) refuse_numeric("ORDER BY a NUMERIC column", o.pos);
+        if (uncompared(c->sql.kind)) refuse_uncompared(c->sql.kind, "ORDER BY a " + uncompared_name(c->sql.kind) + " column", o.pos);
         auto key = aggregated ? grouped(*t, *c, o.pos) : logical::column_of(t->id, *c);
         keys.push_back({std::move(key), o.desc, o.nulls_first.value_or(o.desc)});
         continue;
@@ -5133,7 +5338,7 @@ public:
     }
     auto key = plain_output(e, resolve).expr;
     if (key.kind == logical::Expr::Kind::Param || key.kind == logical::Expr::Kind::Const) return std::nullopt;
-    if (key.type.kind == SqlKind::Numeric) refuse_numeric("ORDER BY a NUMERIC value", e.pos);
+    if (uncompared(key.type.kind)) refuse_uncompared(key.type.kind, "ORDER BY a " + uncompared_name(key.type.kind) + " value", e.pos);
     return key;
   }
 
@@ -5211,15 +5416,17 @@ public:
       for (std::size_t i = 0; i < lo.size(); ++i) {
         auto type = set_type(lo[i].expr.type, ro[i].expr.type, l.untyped[i], r.untyped[i], what, q.pos);
         // UNION ALL only carries a NUMERIC; the others compare its rows.
-        if (type.kind == SqlKind::Numeric && (op.kind != ast::SetOperation::Kind::Union || !op.all)) {
-          refuse_numeric(what + " of a NUMERIC column", q.pos);
+        if (uncompared(type.kind) && (op.kind != ast::SetOperation::Kind::Union || !op.all)) {
+          refuse_uncompared(type.kind, what + " of a " + uncompared_name(type.kind) + " column", q.pos);
         }
         out.outputs.push_back({logical::param(0, type), lo[i].name});
         arm.untyped.push_back(l.untyped[i] && r.untyped[i]);
       }
       for (const auto& o : q.order_by) {
         out.order.push_back(set_order(o, out.outputs));
-        if (out.outputs[out.order.back().column].expr.type.kind == SqlKind::Numeric) refuse_numeric("ORDER BY a NUMERIC column", o.pos);
+        if (auto k = out.outputs[out.order.back().column].expr.type.kind; uncompared(k)) {
+          refuse_uncompared(k, "ORDER BY a " + uncompared_name(k) + " column", o.pos);
+        }
       }
       out.left = std::move(l.node);
       out.right = std::move(r.node);
@@ -5360,13 +5567,11 @@ public:
   // it makes is not taken yet (0A000, #824).
   static void assigns_to(SqlType from, const Column& c, std::int32_t pos) {
     const auto to = c.sql;
-    if (from.kind == SqlKind::Numeric && to.kind == SqlKind::Numeric) return;  // its text, as it is stored
+    if (uncompared(from.kind) && from.kind == to.kind) return;  // its text or its jsonb value, as it is stored
+    if (from.kind == SqlKind::Jsonb || to.kind == SqlKind::Jsonb) jsonb_assigned(from, c, pos);
     if (from.kind != SqlKind::Numeric && assignable(from, to) && (to.kind != SqlKind::Char || from == to)) return;
     if (is_float(to) && (is_float(from) || is_integer(from))) return;
-    if (auto refusal = type_refusal(from.kind, to.kind, true)) {
-      throw SqlError{"column \"" + c.name + "\" is of type " + pg_type_name(to) + " but expression is of type " + pg_type_name(from),
-                     pos, *refusal};
-    }
+    if (type_refusal(from.kind, to.kind, true)) throw assignment_mismatch(c.name, pg_type_name(to), pg_type_name(from), pos);
     if (from.kind == SqlKind::Numeric || to.kind == SqlKind::Numeric) {
       refuse_numeric("INSERT … SELECT of a " + pg_type_name(from) + " value into column \"" + c.name + "\" of type " + pg_type_name(to), pos);
     }
@@ -7072,7 +7277,9 @@ auto declared_type(const std::string& text, const Catalog& cat) -> SqlType {
   c.typmods = q->targets[0].cast_typmods;
   c.type_schema = q->targets[0].cast_schema;
   try {
-    return sql_type(c);
+    auto t = sql_type(c);
+    if (t.kind == SqlKind::Jsonb) not_supported("a PL/pgSQL variable of type jsonb", -1);
+    return t;
   } catch (const ast::QualifiedTypeName& e) {
     throw qualified_type_error(e, cat);
   }
@@ -7230,7 +7437,7 @@ auto conflict_update(Binder& b, const Table& t, const std::vector<ast::Assignmen
         continue;
       }
       auto d = defaults.find(at);
-      if (d == defaults.end()) d = defaults.emplace(at, b.fixed(it.excluded->default_value, it.excluded->sql)).first;
+      if (d == defaults.end()) d = defaults.emplace(at, b.fixed(param_default(*it.excluded), it.excluded->sql)).first;
       list.emplace_back(it.target, d->second);
     }
   }
@@ -7392,7 +7599,10 @@ auto bind_statement(const ast::Statement& stmt, const Catalog& cat, std::span<co
             auto mode = a.mode == ast::ProcedureArgAst::Mode::In      ? ProcedureArg::Mode::In
                         : a.mode == ast::ProcedureArgAst::Mode::InOut ? ProcedureArg::Mode::InOut
                                                                       : ProcedureArg::Mode::Out;
-            out.args.push_back({mode, a.def.name, sql_type(a.def)});
+            auto t = sql_type(a.def);
+            // Only table records hold a jsonb (docs/jsonb_design.md, *Type names, columns and the type classes*).
+            if (t.kind == SqlKind::Jsonb) not_supported("a procedure argument of type jsonb", a.def.pos);
+            out.args.push_back({mode, a.def.name, t});
           }
           return {Ddl{std::move(out)}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::CreateRole>) {
@@ -7416,7 +7626,9 @@ auto bind_statement(const ast::Statement& stmt, const Catalog& cat, std::span<co
           return {Ddl{std::move(out)}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::CreateDomain>) {
           auto name = created_name(s.domain, false, cat, s.pos);
-          return {Ddl{CreateDomainDdl{std::move(name), sql_type(s.base)}}, s.pos};
+          auto base = sql_type(s.base);
+          if (base.kind == SqlKind::Jsonb) not_supported("a domain over jsonb", s.base.pos);
+          return {Ddl{CreateDomainDdl{std::move(name), base}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::CreateType>) {
           return {Ddl{CreateTypeDdl{created_name(s.type, false, cat, s.pos)}}, s.pos};
         } else if constexpr (std::is_same_v<T, ast::CreateSequence>) {

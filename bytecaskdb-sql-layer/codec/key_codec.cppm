@@ -37,11 +37,40 @@ inline constexpr std::size_t kMaxKeyBytes = 65535;
 
 // The physical types of docs/plan_api_design.md; the values are bc_type's.
 // Num is PostgreSQL's numeric as its text (numeric_out), held as bytes are:
-// a value a plan carries and emits, never a key's part nor compared.
-enum class PhysType : std::uint8_t { I64 = 1, F64 = 2, Bool = 3, Bytes = 4, Num = 5 };
+// a value a plan carries and emits, never a key's part nor compared. Jsonb
+// is a jsonb value in its binary layout (docs/jsonb_design.md), held in a
+// row's variable region: never a key's part, and in a plan a bc_jsonb, a
+// handle of its own.
+enum class PhysType : std::uint8_t { I64 = 1, F64 = 2, Bool = 3, Bytes = 4, Num = 5, Jsonb = 6 };
 
-// Whether a column of this type lives in a row's fixed region.
-[[nodiscard]] constexpr auto is_fixed(PhysType t) noexcept -> bool { return t != PhysType::Bytes && t != PhysType::Num; }
+// Whether a column of this type lives in a row's fixed region. Every
+// predicate on PhysType is an exhaustive switch, so a new type cannot fall
+// through one silently.
+[[nodiscard]] constexpr auto is_fixed(PhysType t) noexcept -> bool {
+  switch (t) {
+    case PhysType::I64:
+    case PhysType::F64:
+    case PhysType::Bool: return true;
+    case PhysType::Bytes:
+    case PhysType::Num:
+    case PhysType::Jsonb: return false;
+  }
+  return false;
+}
+
+// Whether a value of this type is ever a key's part (a table's, an index's,
+// a sort or a group key's): neither a NUMERIC's text nor a jsonb is yet.
+[[nodiscard]] constexpr auto keyable(PhysType t) noexcept -> bool {
+  switch (t) {
+    case PhysType::I64:
+    case PhysType::F64:
+    case PhysType::Bool:
+    case PhysType::Bytes: return true;
+    case PhysType::Num:
+    case PhysType::Jsonb: return false;
+  }
+  return false;
+}
 
 // One part of a key layout: its type, whether it carries a null marker, and
 // whether it is inverted (DESC).
@@ -65,7 +94,8 @@ struct KeyPart {
     case PhysType::F64: return width == 4 || width == 8;
     case PhysType::Bool: return width == 1;
     case PhysType::Bytes:
-    case PhysType::Num: return false;
+    case PhysType::Num:
+    case PhysType::Jsonb: return false;
   }
   return false;
 }
@@ -380,6 +410,7 @@ auto KeyReader::skip(KeyPart part) -> bool {
     case PhysType::Bool: (void)read_bool(part); break;
     case PhysType::Bytes: (void)read_bytes(part); break;
     case PhysType::Num: throw std::logic_error("a key part that is a NUMERIC");
+    case PhysType::Jsonb: throw std::logic_error("a key part that is a jsonb");
   }
   return ok_;
 }

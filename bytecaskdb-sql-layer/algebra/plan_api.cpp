@@ -65,6 +65,7 @@
 // catalog and codecs through it.
 import bytecask.sql.runtime;
 import bytecask.sql.text;
+import bytecask.sql.jsonb;
 
 using bytecask::sql::Bytes;
 using bytecask::sql::BytesView;
@@ -125,6 +126,7 @@ static_assert(static_cast<int>(PhysType::F64) == BC_T_F64);
 static_assert(static_cast<int>(PhysType::Bool) == BC_T_BOOL);
 static_assert(static_cast<int>(PhysType::Bytes) == BC_T_BYTES);
 static_assert(static_cast<int>(PhysType::Num) == BC_T_NUM);
+static_assert(static_cast<int>(PhysType::Jsonb) == BC_T_JSONB);
 // A handle's generation never repeats within a context: one is drawn per
 // handle, and at one a nanosecond 64 bits last five centuries. Step rollback
 // reuses slots, so a counter that wrapped would let a stale handle resolve
@@ -133,7 +135,8 @@ template <typename H>
 constexpr bool kWideGeneration = std::is_same_v<decltype(H::g), std::uint64_t>;
 static_assert(kWideGeneration<bc_view> && kWideGeneration<bc_cursor> && kWideGeneration<bc_sorter> &&
               kWideGeneration<bc_hash> && kWideGeneration<bc_hash_iter> && kWideGeneration<bc_agg> &&
-              kWideGeneration<bc_group> && kWideGeneration<bc_key> && kWideGeneration<bc_row>);
+              kWideGeneration<bc_group> && kWideGeneration<bc_key> && kWideGeneration<bc_row> &&
+              kWideGeneration<bc_jsonb>);
 
 namespace {
 
@@ -164,6 +167,9 @@ struct ViewEntry {
   std::uint32_t cursor;  // kNoCursor: lives as long as its entry
   std::uint32_t table;   // the row's table; 0 unless kind is a row
   RowKind kind;
+  // A jsonb node (a bc_jsonb's), never bytes: resolve() refuses it, and
+  // resolve_jsonb() refuses every view that is not one.
+  bool jsonb{false};
 };
 
 // The finished key's view reads buf, which a move of the builder keeps
@@ -216,20 +222,26 @@ public:
   // Throws std::bad_alloc, with nothing changed: a push_back that cannot
   // grow leaves the spare it was given where it was.
   [[nodiscard]] auto copy(BytesView b) -> const std::byte* {
-    if (chunks_.empty() || chunks_.back().size - used_ < b.size()) {
-      if (spare_.data != nullptr && b.size() <= spare_.size) {
+    auto* p = alloc(b.size());
+    if (!b.empty()) std::memcpy(p, b.data(), b.size());
+    return p;
+  }
+
+  // n bytes for the caller to fill, as copy() places them.
+  [[nodiscard]] auto alloc(std::size_t n) -> std::byte* {
+    if (chunks_.empty() || chunks_.back().size - used_ < n) {
+      if (spare_.data != nullptr && n <= spare_.size) {
         chunks_.push_back(std::move(spare_));
         spare_ = {};
       } else {
-        auto size = std::max(kArenaChunk, b.size());
+        auto size = std::max(kArenaChunk, n);
         chunks_.push_back({std::make_unique_for_overwrite<std::byte[]>(size), size});
       }
       used_ = 0;
     }
     auto* p = chunks_.back().data.get() + used_;
-    if (!b.empty()) std::memcpy(p, b.data(), b.size());
-    used_ += b.size();
-    bytes_ += b.size();
+    used_ += n;
+    bytes_ += n;
     return p;
   }
 
@@ -878,6 +890,7 @@ auto phys_type(std::uint8_t code) -> std::optional<PhysType> {
     case BC_T_BOOL: return PhysType::Bool;
     case BC_T_BYTES: return PhysType::Bytes;
     case BC_T_NUM: return PhysType::Num;
+    case BC_T_JSONB: return PhysType::Jsonb;
     default: return std::nullopt;
   }
 }
@@ -889,6 +902,7 @@ auto type_name(PhysType t) -> const char* {
     case PhysType::Bool: return "a boolean";
     case PhysType::Bytes: return "bytes";
     case PhysType::Num: return "a numeric";
+    case PhysType::Jsonb: return "a jsonb";
   }
   return "a value";
 }
@@ -1298,6 +1312,9 @@ struct bc_ctx {
     std::uint64_t held{0};
   };
   std::vector<SubParam> sub_params;  // sized once, to the caller's parameters
+  // bc_param_jsonb's: each parameter's text parsed once per execution, a
+  // pinned view of its node; the empty handle for one not parsed yet.
+  std::vector<bc_jsonb> jsonb_params;
   struct SubSet {
     std::set<Bytes, BytesLess> values;
     std::uint64_t held{0};  // what its values are charged, released when its id runs again
@@ -1489,7 +1506,18 @@ struct bc_ctx {
   auto make_view(const std::byte* p, std::size_t len, std::uint32_t cursor = kNoCursor, std::uint64_t step = 0,
                  std::uint32_t table = 0, RowKind kind = RowKind::None) -> bc_view {
     auto gen = next_gen();
-    if (push_charged(views, ViewEntry{p, step, gen, static_cast<std::uint32_t>(len), cursor, table, kind},
+    if (push_charged(views, ViewEntry{p, step, gen, static_cast<std::uint32_t>(len), cursor, table, kind, false},
+                     kViewEntryBytes) == nullptr) {
+      return {};
+    }
+    return {static_cast<std::uint32_t>(views.size() - 1), gen};
+  }
+
+  // A view of a jsonb node, tagged so that only bc_*jsonb* calls read it.
+  auto make_jsonb(const std::byte* p, std::size_t len, std::uint32_t cursor = kNoCursor, std::uint64_t step = 0)
+      -> bc_jsonb {
+    auto gen = next_gen();
+    if (push_charged(views, ViewEntry{p, step, gen, static_cast<std::uint32_t>(len), cursor, 0, RowKind::None, true},
                      kViewEntryBytes) == nullptr) {
       return {};
     }
@@ -1504,7 +1532,7 @@ struct bc_ctx {
     if (key_parts.view.i == v.i && key_parts.view.g == v.g) key_parts.view = {};
     if (sort_parts.view.i == v.i && sort_parts.view.g == v.g) sort_parts.view = {};
     auto gen = next_gen();
-    views[v.i] = ViewEntry{b.data(), 0, gen, static_cast<std::uint32_t>(b.size()), kNoCursor, table, kind};
+    views[v.i] = ViewEntry{b.data(), 0, gen, static_cast<std::uint32_t>(b.size()), kNoCursor, table, kind, false};
     v.g = gen;
     return v;
   }
@@ -1546,11 +1574,33 @@ struct bc_ctx {
     return &e;
   }
 
-  // The bytes of a view; nullopt (and BC_E_HANDLE) if it is stale or foreign.
+  // The bytes of a view; nullopt (and BC_E_HANDLE) if it is stale or
+  // foreign, or a jsonb node: a bc_jsonb forged into a bc_view.
   auto resolve(bc_view v) -> std::optional<BytesView> {
     if (v.g == 0 && v.i == 0) return BytesView{};
     const auto* e = entry(v);
     if (e == nullptr) return std::nullopt;
+    if (e->jsonb) {
+      fail(BC_E_HANDLE, "a jsonb value where bytes are read: only bc_*jsonb* calls take one");
+      return std::nullopt;
+    }
+    return BytesView{e->data, e->len};
+  }
+
+  // A jsonb node; nullopt (and BC_E_HANDLE) for a stale or foreign handle,
+  // the empty one, or a view that is not a jsonb's: a bc_view forged into a
+  // bc_jsonb.
+  auto resolve_jsonb(bc_jsonb j) -> std::optional<BytesView> {
+    if (j.g == 0 && j.i == 0) {
+      fail(BC_E_HANDLE, "the empty handle is no jsonb value");
+      return std::nullopt;
+    }
+    const auto* e = entry(bc_view{j.i, j.g});
+    if (e == nullptr) return std::nullopt;
+    if (!e->jsonb) {
+      fail(BC_E_HANDLE, "bytes where a jsonb value is read: a bc_jsonb comes from a bc_*jsonb* call");
+      return std::nullopt;
+    }
     return BytesView{e->data, e->len};
   }
 
@@ -1801,6 +1851,7 @@ struct bc_ctx {
     affected = -1;
     sub.reset();
     sub_params.clear();
+    jsonb_params.clear();
     sub_sets.clear();
     arena.clear(true);  // one chunk kept for the next statement
     pins.clear(false);
@@ -2566,6 +2617,7 @@ auto resolve_range(bc_ctx* cx, std::uint32_t table_or_index, bc_view lo, bc_view
     case PhysType::Bool: bytecask::sql::key_put_bool(buf, std::get<bool>(*d), part); break;
     case PhysType::Bytes: bytecask::sql::key_put_bytes(buf, std::get<Bytes>(*d), part); break;
     case PhysType::Num: throw std::logic_error("a key part that is a NUMERIC");
+    case PhysType::Jsonb: throw std::logic_error("a key part that is a jsonb");
   }
   return true;
 }
@@ -2640,6 +2692,7 @@ auto sort_value_max_bytes(PhysType type, std::size_t len) -> std::uint64_t {
     case PhysType::Bool: return 1;
     case PhysType::Bytes: return 2 * std::uint64_t{len} + 2;
     case PhysType::Num: throw std::logic_error("a sort key part that is a NUMERIC");
+    case PhysType::Jsonb: throw std::logic_error("a sort key part that is a jsonb");
   }
   return 0;
 }
@@ -2699,6 +2752,7 @@ void key_put_column(Bytes& out, const bytecask::sql::ColumnRead& v, KeyPart part
     case PhysType::Bool: bytecask::sql::key_put_bool(out, v.boolean(), part); break;
     case PhysType::Bytes: bytecask::sql::key_put_bytes(out, v.bytes, part); break;
     case PhysType::Num: throw std::logic_error("a sort or group key part that is a NUMERIC");
+    case PhysType::Jsonb: throw std::logic_error("a sort or group key part that is a jsonb");
   }
 }
 
@@ -4631,6 +4685,138 @@ int bc_execute(bc_ctx* cx, bc_plan_fn plan, const bc_schema_ref* ref, const bc_p
 
 // ------------------------------------------------- parameters and results
 
+// ------------------------------------------------------------------ jsonb
+//
+// docs/jsonb_design.md, *Plan API for jsonb*: a value is parsed and printed
+// by sql/jsonb.cppm, every buffer charged to the statement's budget, every
+// user error BC_E_DATA with its SQLSTATE, DETAIL and CONTEXT, and a stored
+// value that breaks a decoding rule BC_E_CORRUPT.
+
+extern "C++" {
+namespace {
+
+namespace jsonb = bytecask::sql::jsonb;
+
+auto text_of(BytesView b) -> std::string_view { return {reinterpret_cast<const char*>(b.data()), b.size()}; }
+
+auto jsonb_memory(bc_ctx* cx) -> jsonb::Memory {
+  return {cx, [](void* self, std::uint64_t n, jsonb::Site) { return static_cast<bc_ctx*>(self)->take(n); },
+          [](void* self, std::uint64_t n) noexcept { static_cast<bc_ctx*>(self)->release(n); }};
+}
+
+// Charged bytes from one of the context's arenas.
+struct ArenaOut {
+  bc_ctx* cx;
+  Arena* arena;
+  static auto alloc(void* self, std::size_t n) -> std::byte* {
+    auto& o = *static_cast<ArenaOut*>(self);
+    if (!o.cx->take(n)) return nullptr;
+    return o.arena->alloc(n);
+  }
+};
+
+// Charged bytes in a buffer the caller frees and releases (`held`).
+struct BufferOut {
+  bc_ctx* cx;
+  Bytes buf;
+  std::uint64_t held{0};
+  static auto alloc(void* self, std::size_t n) -> std::byte* {
+    auto& o = *static_cast<BufferOut*>(self);
+    if (!o.cx->take(n)) return nullptr;
+    o.held += n;
+    o.buf.resize(n);
+    return o.buf.data();
+  }
+};
+
+// A failed jsonb call's error. A refused charge has set it (BC_E_LIMIT).
+void fail_jsonb(bc_ctx* cx, const jsonb::Outcome& r) {
+  switch (r.status) {
+    case jsonb::Status::Ok: return;
+    case jsonb::Status::Data: {
+      const auto& e = *r.error;
+      cx->fail(BC_E_DATA, e.state, e.message, {e.detail, e.hint, e.context});
+      return;
+    }
+    case jsonb::Status::Refused:
+      if (cx->ok()) cx->fail(BC_E_LIMIT, "the statement would hold more than its memory budget");
+      return;
+    case jsonb::Status::Corrupt: cx->fail(BC_E_CORRUPT, std::string{"a stored jsonb value does not decode: "} + r.corrupt); return;
+  }
+}
+
+// Text parsed into the arena: the node's handle, the step's (or the pins'
+// for `pinned`, until reset).
+auto parse_into(bc_ctx* cx, BytesView text, bool pinned) -> bc_jsonb {
+  ArenaOut out{cx, pinned ? &cx->pins : &cx->arena};
+  std::span<std::byte> value;
+  auto r = jsonb::parse(text_of(text), jsonb_memory(cx), {&out, ArenaOut::alloc}, value);
+  if (!r.ok()) {
+    fail_jsonb(cx, r);
+    return {};
+  }
+  auto node = jsonb::node_of(value);
+  if (!pinned) return cx->make_jsonb(node->data(), node->size());
+  auto gen = cx->next_gen();
+  if (cx->push_charged(cx->pinned_views,
+                       ViewEntry{node->data(), 0, gen, static_cast<std::uint32_t>(node->size()), kNoCursor, 0,
+                                 RowKind::None, true},
+                       kViewEntryBytes) == nullptr) {
+    return {};
+  }
+  return {static_cast<std::uint32_t>(cx->pinned_views.size() - 1) | kPinnedView, gen};
+}
+
+// A node's text, charged, in a buffer the caller releases.
+auto node_text(bc_ctx* cx, BytesView node, BufferOut& out) -> std::optional<std::span<char>> {
+  std::span<char> text;
+  auto r = jsonb::to_text(node, jsonb_memory(cx), {&out, BufferOut::alloc}, text);
+  if (!r.ok()) {
+    fail_jsonb(cx, r);
+    return std::nullopt;
+  }
+  return text;
+}
+
+// The stored value of `node` (its format byte, then the node) set into a
+// row's column, after the full check; its bytes stay charged to the
+// builder until the row is ended.
+void set_jsonb(bc_ctx* cx, const SetTarget& at, std::uint32_t col, BytesView node) {
+  if (auto r = jsonb::check_node(node, jsonb_memory(cx)); !r.ok()) {
+    fail_jsonb(cx, r);
+    return;
+  }
+  if (node.size() >= jsonb::kMaxBytes) {
+    cx->fail(BC_E_DATA, bytecask::sql::kProgramLimitExceeded, "a jsonb value exceeds the maximum of 268435455 bytes");
+    return;
+  }
+  if (!cx->take(node.size() + 1)) return;
+  at.builder->held += node.size() + 1;
+  Bytes value;
+  value.reserve(node.size() + 1);
+  value.push_back(std::byte{jsonb::kFormat});
+  value.insert(value.end(), node.begin(), node.end());
+  if (!at.builder->writer.set_bytes(col, value)) cx->fail(BC_L_ROW, "column is not in the row's layout");
+}
+
+// A parameter's text parsed into a row's jsonb column.
+void set_jsonb_text(bc_ctx* cx, const SetTarget& at, std::uint32_t col, BytesView text) {
+  BufferOut out{cx, {}};
+  std::span<std::byte> value;
+  auto r = jsonb::parse(text_of(text), jsonb_memory(cx), {&out, BufferOut::alloc}, value);
+  if (!r.ok()) {
+    cx->release(out.held);
+    fail_jsonb(cx, r);
+    return;
+  }
+  // The parser's value passes the full check by construction: set as it is.
+  at.builder->held += out.held;
+  if (!at.builder->writer.set_bytes(col, value)) cx->fail(BC_L_ROW, "column is not in the row's layout");
+}
+
+}  // namespace
+}  // extern "C++"
+
 int64_t bc_param_i64(bc_ctx* cx, uint32_t i) {
   BC_GUARD_BEGIN
   const auto* v = cx->param_as<std::int64_t>(i, "an integer");
@@ -4665,6 +4851,21 @@ bc_view bc_param_bytes(bc_ctx* cx, uint32_t i) {
     return cx->make_view(v->data(), v->size(), kParamOwner | i, cx->sub_params[i].gen);
   }
   return cx->make_view(v->data(), v->size());
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_jsonb bc_param_jsonb(bc_ctx* cx, uint32_t i) {
+  BC_GUARD_BEGIN
+  const auto* v = cx->param_as<Bytes>(i, "text");
+  if (v == nullptr) return {};
+  // One a subquery or bc_sub_arg_* set can be set again: parsed per call,
+  // the step's. The caller's: once per execution, kept until reset.
+  if (i < cx->sub_params.size() && cx->sub_params[i].value) return parse_into(cx, *v, false);
+  if (cx->jsonb_params.size() <= i) cx->jsonb_params.resize(cx->params->values.size());
+  auto& cached = cx->jsonb_params[i];
+  if (cached.g == 0) cached = parse_into(cx, *v, true);
+  return cached;
   BC_GUARD_END(cx)
   return {};
 }
@@ -4727,6 +4928,15 @@ void emit_value(bc_ctx* cx, std::int64_t v) { (void)cx->emit->set_i64(cx->emit_c
 void emit_value(bc_ctx* cx, double v) { (void)cx->emit->set_f64(cx->emit_col++, v); }
 void emit_value(bc_ctx* cx, bool v) { (void)cx->emit->set_bool(cx->emit_col++, v); }
 void emit_value(bc_ctx* cx, BytesView v) { emit_bytes(cx, v); }
+
+// A jsonb node as the next result column: its text, charged while it is
+// written and released once the row holds it.
+void emit_jsonb_text(bc_ctx* cx, BytesView node) {
+  BufferOut out{cx, {}};
+  auto text = node_text(cx, node, out);
+  if (text) emit_bytes(cx, std::as_bytes(*text));
+  cx->release(out.held);
+}
 
 // The next result column from a decoded key part: BC_E_CORRUPT when the key
 // did not parse, the value when there is one, NULL otherwise, whatever the
@@ -4811,6 +5021,7 @@ void end_sub_row(bc_ctx* cx) {
       case PhysType::Bool: v = r.boolean(); break;
       case PhysType::Bytes:
       case PhysType::Num: v = Bytes(r.bytes.begin(), r.bytes.end()); break;
+      case PhysType::Jsonb: throw std::logic_error("a subquery of jsonb");  // refused at bc_sub_begin
     }
   }
   ++s.rows;
@@ -4923,7 +5134,8 @@ void bc_sub_begin(bc_ctx* cx, uint32_t sub, int32_t kind, int32_t type, uint32_t
   BC_GUARD_BEGIN
   if (!cx->ok()) return;
   auto t = type > 0 && type < 256 ? phys_type(static_cast<std::uint8_t>(type)) : std::nullopt;
-  if (cx->sub || cx->emit || !t || kind < BC_SUB_VALUE || kind > BC_SUB_SET ||
+  // A subquery of jsonb folds its sort key (stage 2): not built.
+  if (cx->sub || cx->emit || !t || *t == PhysType::Jsonb || kind < BC_SUB_VALUE || kind > BC_SUB_SET ||
       !caller_null(cx, param, sub_params_of(kind))) {
     cx->fail(BC_E_HANDLE, "bc_sub_begin: a subquery running, a row begun, an unknown kind or type, or its "
                           "parameters past the given ones or ones the caller gave");
@@ -5109,6 +5321,15 @@ void bc_emit_num(bc_ctx* cx, bc_view v) {
   BC_GUARD_END(cx)
 }
 
+void bc_emit_jsonb(bc_ctx* cx, bc_jsonb j) {
+  BC_GUARD_BEGIN
+  if (!emit_slot(cx, PhysType::Jsonb)) return;
+  auto node = cx->resolve_jsonb(j);
+  if (!node) return;
+  emit_jsonb_text(cx, *node);
+  BC_GUARD_END(cx)
+}
+
 void bc_emit_null(bc_ctx* cx) {
   BC_GUARD_BEGIN
   if (!emit_slot(cx, std::nullopt)) return;
@@ -5132,6 +5353,14 @@ void bc_emit_col(bc_ctx* cx, bc_view row, uint32_t col) {
     case PhysType::Bool: return emit_value(cx, v->boolean());
     case PhysType::Bytes:
     case PhysType::Num: return emit_value(cx, v->bytes);
+    case PhysType::Jsonb: {
+      auto node = jsonb::node_of(v->bytes);
+      if (!node) {
+        cx->fail(BC_E_CORRUPT, "a stored jsonb value of no known format");
+        return;
+      }
+      return emit_jsonb_text(cx, *node);
+    }
   }
   BC_GUARD_END(cx)
 }
@@ -5154,6 +5383,7 @@ void bc_emit_key_part(bc_ctx* cx, uint32_t table_or_index, bc_view key, uint32_t
     case PhysType::Bool: return emit(r.read_bool(at->part));
     case PhysType::Bytes: return emit(r.read_bytes(at->part));
     case PhysType::Num: throw std::logic_error("a key part that is a NUMERIC");
+    case PhysType::Jsonb: throw std::logic_error("a key part that is a jsonb");
   }
   BC_GUARD_END(cx)
 }
@@ -5333,6 +5563,32 @@ bc_view bc_concat(bc_ctx* cx, bc_view a, bc_view b) {
   out.insert(out.end(), v->first.begin(), v->first.end());
   out.insert(out.end(), v->second.begin(), v->second.end());
   return cx->arena_view(out);
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_jsonb bc_jsonb_in(bc_ctx* cx, bc_view text) {
+  BC_GUARD_BEGIN
+  auto t = cx->resolve(text);
+  if (!t || !cx->ok()) return {};
+  return parse_into(cx, *t, false);
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_view bc_jsonb_text(bc_ctx* cx, bc_jsonb j) {
+  BC_GUARD_BEGIN
+  auto node = cx->resolve_jsonb(j);
+  if (!node) return {};
+  // Written straight into the step's arena, charged before it is allocated.
+  ArenaOut out{cx, &cx->arena};
+  std::span<char> text;
+  auto r = jsonb::to_text(*node, jsonb_memory(cx), {&out, ArenaOut::alloc}, text);
+  if (!r.ok()) {
+    fail_jsonb(cx, r);
+    return {};
+  }
+  return cx->make_view(reinterpret_cast<const std::byte*>(text.data()), text.size());
   BC_GUARD_END(cx)
   return {};
 }
@@ -6173,6 +6429,24 @@ bc_view bc_col_bytes(bc_ctx* cx, bc_view row, uint32_t col) {
   return {};
 }
 
+bc_jsonb bc_col_jsonb(bc_ctx* cx, bc_view row, uint32_t col) {
+  BC_GUARD_BEGIN
+  auto rc = row_col(cx, row, col, PhysType::Jsonb);
+  if (!rc) return {};
+  auto v = read_column(cx, *rc);
+  if (!v || v->state == bytecask::sql::ColumnState::Absent) return {};
+  // The format byte is checked once, here; the node shares the row's owner.
+  auto node = jsonb::node_of(v->bytes);
+  if (!node) {
+    cx->fail(BC_E_CORRUPT, "a stored jsonb value of no known format in column " + std::to_string(col));
+    return {};
+  }
+  auto [cursor, step] = cx->owner(row);
+  return cx->make_jsonb(node->data(), node->size(), cursor, step);
+  BC_GUARD_END(cx)
+  return {};
+}
+
 bc_view bc_col_key(bc_ctx* cx, bc_view row, uint32_t col) {
   BC_GUARD_BEGIN
   auto rc = row_col(cx, row, col, std::nullopt);
@@ -6373,6 +6647,16 @@ void bc_row_set_bytes(bc_ctx* cx, bc_row r, uint32_t col, bc_view v) {
   BC_GUARD_END(cx)
 }
 
+void bc_row_set_jsonb(bc_ctx* cx, bc_row r, uint32_t col, bc_jsonb j) {
+  BC_GUARD_BEGIN
+  auto node = cx->resolve_jsonb(j);
+  if (!node) return;
+  auto at = set_target(cx, r, col, PhysType::Jsonb);
+  if (!at) return;
+  set_jsonb(cx, *at, col, *node);
+  BC_GUARD_END(cx)
+}
+
 void bc_row_set_null(bc_ctx* cx, bc_row r, uint32_t col) {
   BC_GUARD_BEGIN
   // A NOT NULL column is refused at bc_row_end, after every value of the
@@ -6395,6 +6679,10 @@ void bc_row_set_param(bc_ctx* cx, bc_row r, uint32_t col, uint32_t i) {
   }
   if (const auto* text = std::get_if<Bytes>(d); text != nullptr && at->slot->type == PhysType::Num) {
     set_num(cx, *at, col, *text);
+    return;
+  }
+  if (const auto* text = std::get_if<Bytes>(d); text != nullptr && at->slot->type == PhysType::Jsonb) {
+    set_jsonb_text(cx, *at, col, *text);
     return;
   }
   if (!in_range(cx, *at, col, *d)) return;
@@ -6455,7 +6743,7 @@ bc_view bc_pin(bc_ctx* cx, bc_view v) {
   if (p == nullptr) return {};
   auto gen = cx->next_gen();
   if (cx->push_charged(cx->pinned_views,
-                       ViewEntry{p, 0, gen, static_cast<std::uint32_t>(b->size()), kNoCursor, table, kind},
+                       ViewEntry{p, 0, gen, static_cast<std::uint32_t>(b->size()), kNoCursor, table, kind, false},
                        kViewEntryBytes) == nullptr) {
     return {};
   }
@@ -7411,6 +7699,13 @@ auto failing_row(const Table& t, BytesView row) -> std::optional<std::string> {
       case PhysType::Bool: d = v.boolean(); break;
       case PhysType::Bytes:
       case PhysType::Num: d = Bytes(v.bytes.begin(), v.bytes.end()); break;
+      case PhysType::Jsonb: {
+        // Its text, as a result writes it; a value that does not decode is shown as such.
+        std::string text;
+        if (!bytecask::sql::jsonb::value_text(v.bytes, text).ok()) text = "?";
+        out += clipped(text);
+        continue;
+      }
     }
     out += clipped(bytecask::sql::to_text(d, c.sql));
   }

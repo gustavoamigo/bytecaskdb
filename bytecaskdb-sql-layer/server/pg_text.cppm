@@ -65,6 +65,7 @@ auto type_info(SqlType t) -> TypeInfo {
     case SqlKind::Time: return {1083, 8, -1};
     case SqlKind::TimeTz: return {1266, 12, -1};
     case SqlKind::Numeric: return {1700, -1, -1};
+    case SqlKind::Jsonb: return {3802, -1, -1};
   }
   return {25, -1, -1};
 }
