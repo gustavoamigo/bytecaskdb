@@ -2019,10 +2019,20 @@ auto path_element_kind(bool unknown, SqlType t) -> bool { return unknown || hold
       .with_notes("", "Explicitly cast to the desired type, for example ARRAY[]::integer[].");
 }
 
+// ARRAY[ARRAY[…]] (and ARRAY[[…]]) as a path: PostgreSQL 17 reads it flat,
+// the layer refuses it (docs/frontend_design.md, *ARRAY[ARRAY[…]] and casts
+// to text[]*).
+void refuse_nested_array(const ast::Expr& a) {
+  for (const auto& x : a.args) {
+    if (x.kind == ast::Expr::Kind::Func && x.func == "array") not_yet("a multidimensional ARRAY", x.pos);
+  }
+}
+
 // ARRAY[…] of constants as a path; nullopt when an element is no text (its
 // type named in `bad`).
 auto path_of_array(const ast::Expr& a, std::string& bad) -> std::optional<Bytes> {
   if (a.args.empty()) empty_array(a.pos);
+  refuse_nested_array(a);
   Bytes path;
   for (const auto& x : a.args) {
     auto c = fold(x);
@@ -3846,6 +3856,7 @@ public:
     };
     if (path && r.kind == K::Func && r.func == "array") {
       if (r.args.empty()) empty_array(r.pos);
+      refuse_nested_array(r);
       std::string bad;
       if (is_constant(r)) {
         auto p = path_of_array(r, bad);

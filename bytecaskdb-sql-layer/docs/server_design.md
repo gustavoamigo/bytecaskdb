@@ -846,10 +846,13 @@ above:
 
 **Input** reads each parameter as its inferred type. The forms accepted
 are:
-- integers: an optional sign and decimal digits, with white space around.
-  PostgreSQL 16's `0x`, `0o` and `0b` forms and `_` separators are `22P02`
-  here (*Known differences*). Out of range is `22003`, from the layer's
-  range check, as for any parameter.
+- integers: PostgreSQL 17's `int2in`, `int4in` and `int8in`: an optional
+  sign, then decimal digits or a `0x`, `0o` or `0b` prefix and its digits,
+  `_` between digits, white space around (`sql/text.cppm`, `integer_from`,
+  shared with constants: #904 stage C0). Out of range is `22003` `value
+  "3000000000" is out of range for type integer`, naming the text as
+  given, and found as the digits are read, so `'3000000000x'` is `22003`
+  too, as in PostgreSQL.
 - `DECIMAL`: decimal with an optional exponent.
   - An assigned parameter with more fraction digits than s is rounded
     half away from zero, as PostgreSQL rounds on assignment.
@@ -863,9 +866,19 @@ are:
 
     The server refuses rather than give either value. `ParamInfo` says
     which use a parameter has (*What it uses from the embedded API*, 1).
-  - `NaN` is `22P02`.
+  - `NaN`, `Infinity` and `-Infinity` (`inf` too), which `numeric_in`
+    reads, are `22003` `numeric field overflow`: an infinity with
+    PostgreSQL's DETAIL `A field with precision 3, scale 0 cannot hold an
+    infinite value.`, NaN (which PostgreSQL stores) with `… cannot hold
+    NaN.` (#904 stage C0; before it, all three were `22P02`).
 - floats: what `strtod` reads, plus `NaN`, `Infinity`, `-Infinity`
-  (`inf` too), any case. Rounding a `REAL` is the layer's.
+  (`inf` too), any case. A `REAL` is read as `float4in` reads it, rounded
+  once from its text (`strtof`): past real's range, or nonzero text
+  rounding to zero, is `22003` `"1e39" is out of range for type real`, and
+  its `22P02` names `real`. As in `float4in` and `float8in`, out of range
+  wins over text after the number and quotes only the number read
+  (`' 1e39 '` and `'1e39x'` both name `"1e39"`). Hexadecimal floats, which `strtod` reads, are
+  `22P02`.
 - `BOOLEAN`: PostgreSQL's `boolin`: `t`, `true`, `y`, `yes`, `on`, `1` and
   their negatives, any case, any unique prefix (`on` and `off` need two
   letters), white space around.
@@ -1332,9 +1345,12 @@ No microbenchmarks: the gate's numbers are HammerDB's.
 
 - Parameter OIDs from the client are not used.
 - Binary format, for parameters and results, is `0A000`.
-- A compared or added `DECIMAL` parameter finer than its column's scale, and `NaN`,
-  are `22P02`.
-- The integer and datetime input forms listed above only.
+- A compared or added `DECIMAL` parameter finer than its column's scale is
+  `22P02`; `NaN` is `22003` (stored by PostgreSQL), and so is a compared
+  NaN or infinity, parameter or constant (PostgreSQL compares it and
+  matches no row; #911).
+- The datetime input forms listed above only; hexadecimal floats; a
+  `DECIMAL`'s `0x` and `_` forms (`22P02`, #911).
 - A form the layer does not support is `42601`, not PostgreSQL's code for running it.
 - `pg_stat_bytecask` is not a relation: only `select * from pg_stat_bytecask` reads it, and PostgreSQL has no such view.
 - `Execute` with a row limit, several statements in one `Query`, SQL

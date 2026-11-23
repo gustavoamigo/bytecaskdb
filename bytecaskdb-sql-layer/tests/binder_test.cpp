@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -17,6 +18,7 @@
 import bytecask.sql.binder;
 import bytecask.sql.parser;
 import bytecask.sql.rewrite;
+import bytecask.sql.text;
 import bytecask.sql.tests.fixture;
 
 using namespace bytecask::sql;
@@ -2273,4 +2275,159 @@ TEST_CASE("binder: an expression in a WHERE or ON is the select list's, a BOOLEA
   CHECK(state("SELECT k FROM ex WHERE d > $1::numeric(5,1)") ==
         "42601 a cast of a parameter to DECIMAL, VARCHAR(n) or CHAR(n) is not supported yet");
   CHECK(rejected(cat, "SELECT k FROM ex WHERE greatest(a, 1) > 1") == std::pair<std::string, std::int32_t>{"expression not supported", 23});
+}
+
+// #904 stage C0. Expected values are PostgreSQL 17's (int2in, int4in,
+// int8in, float4in, float8in, numeric_in into a NUMERIC(p, s)).
+TEST_CASE("binder: text is read as a value by PostgreSQL 17's input functions, for constants and parameters alike",
+          "[sql][binder][text]") {
+  using bytecask::sql::from_text;
+  using bytecask::sql::TextError;
+  const SqlType i2{SqlKind::SmallInt};
+  const SqlType i4{SqlKind::Integer};
+  const SqlType i8{SqlKind::BigInt};
+  auto value = [](std::string_view text, SqlType t) { return std::get<std::int64_t>(from_text(text, t, false)); };
+  // What from_text raises: SQLSTATE, message and DETAIL.
+  auto raised = [](std::string_view text, SqlType t) -> std::string {
+    try {
+      (void)from_text(text, t, true);
+    } catch (const TextError& e) {
+      auto out = std::string{e.sqlstate()} + " " + e.what();
+      if (!e.detail().empty()) out += " | " + std::string{e.detail()};
+      return out;
+    }
+    return "read";
+  };
+
+  SECTION("integers: spaces, a sign, 0x, 0o, 0b and _ between digits") {
+    CHECK(value(" 12 ", i4) == 12);
+    CHECK(value("\t12\n", i4) == 12);
+    CHECK(value("00012", i4) == 12);
+    CHECK(value("0x1F", i4) == 31);
+    CHECK(value("0X1f", i4) == 31);
+    CHECK(value("-0x1F", i4) == -31);
+    CHECK(value("+0x1F", i4) == 31);
+    CHECK(value("0o17", i4) == 15);
+    CHECK(value("0b101", i4) == 5);
+    CHECK(value("1_000", i4) == 1000);
+    CHECK(value("1_000_000", i8) == 1'000'000);
+    CHECK(value("0x_1F", i4) == 31);
+    CHECK(value("0x1_F", i4) == 31);
+    CHECK(value("-0", i4) == 0);
+    CHECK(value("-2147483648", i4) == std::numeric_limits<std::int32_t>::min());
+    CHECK(value("-0x80000000", i4) == std::numeric_limits<std::int32_t>::min());
+    CHECK(value("0b111111111111111", i2) == 32767);
+    CHECK(value("-0b1000000000000000", i2) == std::numeric_limits<std::int16_t>::min());
+    CHECK(value("0x7FFFFFFFFFFFFFFF", i8) == std::numeric_limits<std::int64_t>::max());
+    CHECK(value("-0x8000000000000000", i8) == std::numeric_limits<std::int64_t>::min());
+    CHECK(value("-9223372036854775808", i8) == std::numeric_limits<std::int64_t>::min());
+  }
+
+  SECTION("integers: 22P02 for what int4in does not read") {
+    for (const auto* bad : {"", "1.5", "1e3", "1 2", "- 1", "--1", "1__0", "_1", "1_", "0x", "0b", "0b_", "0b1_", "0o8",
+                            "00x1", "0x 1", "0x1__F", "2147483649x"}) {
+      CAPTURE(bad);
+      CHECK(raised(bad, i4) == std::string{"22P02 invalid input syntax for type integer: \""} + bad + "\"");
+    }
+    CHECK(raised("0b", i2) == "22P02 invalid input syntax for type smallint: \"0b\"");
+  }
+
+  SECTION("integers: 22003 names the text, found before trailing junk") {
+    CHECK(raised("3000000000", i4) == "22003 value \"3000000000\" is out of range for type integer");
+    CHECK(raised(" 3000000000 ", i4) == "22003 value \" 3000000000 \" is out of range for type integer");
+    CHECK(raised("3000000000x", i4) == "22003 value \"3000000000x\" is out of range for type integer");
+    CHECK(raised("21474836490x", i4) == "22003 value \"21474836490x\" is out of range for type integer");
+    CHECK(raised("0x80000000", i4) == "22003 value \"0x80000000\" is out of range for type integer");
+    CHECK(raised("70000", i2) == "22003 value \"70000\" is out of range for type smallint");
+    CHECK(raised("0b1111111111111111", i2) == "22003 value \"0b1111111111111111\" is out of range for type smallint");
+    CHECK(raised("0x8000", i2) == "22003 value \"0x8000\" is out of range for type smallint");
+    CHECK(raised("0x8000000000000000", i8) == "22003 value \"0x8000000000000000\" is out of range for type bigint");
+    CHECK(raised("99999999999999999999", i8) ==
+          "22003 value \"99999999999999999999\" is out of range for type bigint");
+  }
+
+  SECTION("a REAL is read as float4in reads it, rounded once") {
+    const SqlType real{SqlKind::Real};
+    // Bit for bit: 0.1 rounded to a float once, not the double 0.1.
+    CHECK(std::bit_cast<std::uint64_t>(std::get<double>(from_text("0.1", real, false))) ==
+          std::bit_cast<std::uint64_t>(static_cast<double>(0.1f)));
+    CHECK(std::get<double>(from_text("1e-45", real, false)) > 0);  // a subnormal float is in range
+    CHECK(std::get<double>(from_text("8e-46", real, false)) > 0);
+    for (const auto* big : {"1e39", "3.4028236e38", "3.40282357e38", "1e-50", "1e-46", "7e-46"}) {
+      CAPTURE(big);
+      CHECK(raised(big, real) == std::string{"22003 \""} + big + "\" is out of range for type real");
+    }
+    CHECK(raised("x", real) == "22P02 invalid input syntax for type real: \"x\"");
+    CHECK(raised("", real) == "22P02 invalid input syntax for type real: \"\"");
+    CHECK(raised("1.5 x", real) == "22P02 invalid input syntax for type real: \"1.5 x\"");
+    CHECK(raised("x", SqlType{SqlKind::Double}) == "22P02 invalid input syntax for type double precision: \"x\"");
+    CHECK(raised("1e400", SqlType{SqlKind::Double}) == "22003 \"1e400\" is out of range for type double precision");
+    // As float4in and float8in: out of range names only the number read,
+    // sign kept and spaces dropped, and wins over text after it.
+    CHECK(raised(" 1e39 ", real) == "22003 \"1e39\" is out of range for type real");
+    CHECK(raised(" +1e39 ", real) == "22003 \"+1e39\" is out of range for type real");
+    CHECK(raised("-1e39x", real) == "22003 \"-1e39\" is out of range for type real");
+    CHECK(raised("1e-50x", real) == "22003 \"1e-50\" is out of range for type real");
+    CHECK(raised("1e3x", real) == "22P02 invalid input syntax for type real: \"1e3x\"");
+    CHECK(raised(" 1e999 ", SqlType{SqlKind::Double}) == "22003 \"1e999\" is out of range for type double precision");
+    CHECK(raised("+1e999 x", SqlType{SqlKind::Double}) ==
+          "22003 \"+1e999\" is out of range for type double precision");
+  }
+
+  SECTION("a DECIMAL(p, s) holds no infinity and no NaN: 22003 with the DETAIL") {
+    const SqlType d30{SqlKind::Decimal, 0, 3, 0};
+    const SqlType d52{SqlKind::Decimal, 0, 5, 2};
+    auto inf30 = std::string{"22003 numeric field overflow | A field with precision 3, scale 0 cannot hold an infinite value."};
+    for (const auto* inf : {"Infinity", "-Infinity", "+Infinity", "inf", " infinity ", "-INF"}) {
+      CAPTURE(inf);
+      CHECK(raised(inf, d30) == inf30);
+    }
+    CHECK(raised("-inf", d52) ==
+          "22003 numeric field overflow | A field with precision 5, scale 2 cannot hold an infinite value.");
+    CHECK(raised("NaN", d30) == "22003 numeric field overflow | A field with precision 3, scale 0 cannot hold NaN.");
+    CHECK(raised(" nan ", d30) == "22003 numeric field overflow | A field with precision 3, scale 0 cannot hold NaN.");
+    for (const auto* bad : {"-NaN", "+nan", "infinit", "Infinityx"}) {
+      CAPTURE(bad);
+      CHECK(raised(bad, d30) == std::string{"22P02 invalid input syntax for type numeric: \""} + bad + "\"");
+    }
+  }
+
+  SECTION("a constant reads alike, its error the analysis's") {
+    sql_test::Fixture f;
+    f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE c0 (k INTEGER PRIMARY KEY, s SMALLINT, d NUMERIC(3,0))").stmt));
+    auto state = [&](std::string_view sql) -> std::string {
+      try {
+        (void)bind_sql(f.cat(), sql);
+      } catch (const ast::SqlError& e) {
+        auto out = std::string{e.sqlstate()} + " " + e.what();
+        if (!e.detail().empty()) out += " | " + std::string{e.detail()};
+        return out;
+      }
+      return "bound";
+    };
+    CHECK(state("SELECT '0x1F'::int + 1") == "bound");
+    CHECK(state("INSERT INTO c0 VALUES ('0b11', '1_000', 1)") == "bound");
+    CHECK(state("SELECT k FROM c0 WHERE k = '0o17'") == "bound");
+    CHECK(state("SELECT '3000000000'::int") == "22003 value \"3000000000\" is out of range for type integer");
+    CHECK(state("INSERT INTO c0 VALUES (1, '40000', 1)") == "22003 value \"40000\" is out of range for type smallint");
+    CHECK(state("INSERT INTO c0 VALUES (1, 1, 'Infinity')") ==
+          "22003 numeric field overflow | A field with precision 3, scale 0 cannot hold an infinite value.");
+    CHECK(state("SELECT '1e39'::real") == "22003 \"1e39\" is out of range for type real");
+  }
+}
+
+TEST_CASE("binder: ARRAY[ARRAY[...]] as a jsonb path is refused as a multidimensional ARRAY", "[sql][binder]") {
+  sql_test::Fixture f;
+  f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE ja (k INTEGER PRIMARY KEY, j JSONB)").stmt));
+  for (const auto* sql : {"SELECT j #> ARRAY[ARRAY['a'], ARRAY['b']] FROM ja", "SELECT j #>> ARRAY[['a'], ['b']] FROM ja",
+                          "SELECT '{\"a\": 1}'::jsonb #> ARRAY[ARRAY['a']]", "SELECT j #> ARRAY[k::text, ARRAY['b']] FROM ja"}) {
+    CAPTURE(sql);
+    try {
+      (void)bind_sql(f.cat(), sql);
+      FAIL("bound");
+    } catch (const ast::SqlError& e) {
+      CHECK(std::string{e.sqlstate()} == "42601");
+      CHECK(std::string{e.what()} == "a multidimensional ARRAY is not supported yet");
+    }
+  }
 }

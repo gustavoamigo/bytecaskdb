@@ -1399,7 +1399,8 @@ def test_a_compared_decimal_finer_than_its_scale_and_nan_are_refused(server):
             assert e.value.sqlstate == "22P02", e.value
         with pytest.raises(psycopg.Error) as e:
             c.execute("INSERT INTO m VALUES (%t, %t)", ("2.00", "NaN"))
-        assert e.value.sqlstate == "22P02"
+        assert e.value.sqlstate == "22003"  # #904 C0: numeric_in reads NaN, which a DECIMAL cannot hold
+        assert e.value.diag.message_detail == "A field with precision 6, scale 2 cannot hold NaN."
 
 
 STATS = "select * from pg_stat_bytecask"
@@ -3470,3 +3471,29 @@ def data_row(body: bytes) -> list[bytes | None]:
         out.append(body[:length])
         body = body[length:]
     return out
+
+
+def test_a_text_parameter_is_read_by_postgresql_17s_input_functions(server):
+    """#904 stage C0: int2in/int4in/int8in's prefixes, underscores and
+    range message, float4in's, and a DECIMAL's infinity, each as PG 17."""
+    c = connect(server)
+    c.send(query("CREATE TABLE c0_wire (k INTEGER PRIMARY KEY, s SMALLINT, b BIGINT, r REAL, d NUMERIC(3,0))"))
+    assert states(c.until_ready()) == []
+    insert = "INSERT INTO c0_wire VALUES ($1, $2, $3, $4, $5)"
+    assert states(run(c, insert, ["0x1F", " 1_000 ", "-0b11", "0.1", "1"])) == []
+    assert data(run(c, "SELECT k, s, b FROM c0_wire WHERE k = $1", ["0o37"])) == [["31", "1000", "-3"]]
+
+    def error(params):
+        f = fields(next(b for k, b in run(c, insert, params) if k == b"E"))
+        return f["C"], f["M"], f.get("D")
+
+    assert error(["2", "0x8000", "1", "1", "1"]) == ("22003", 'value "0x8000" is out of range for type smallint', None)
+    assert error(["3000000000", "1", "1", "1", "1"]) == (
+        "22003", 'value "3000000000" is out of range for type integer', None)
+    assert error(["1_", "1", "1", "1", "1"]) == ("22P02", 'invalid input syntax for type integer: "1_"', None)
+    assert error(["2", "1", "1", "1e39", "1"]) == ("22003", '"1e39" is out of range for type real', None)
+    assert error(["2", "1", "1", " 1e39 ", "1"]) == ("22003", '"1e39" is out of range for type real', None)
+    assert error(["2", "1", "1", "1e39x", "1"]) == ("22003", '"1e39" is out of range for type real', None)
+    assert error(["2", "1", "1", "x", "1"]) == ("22P02", 'invalid input syntax for type real: "x"', None)
+    assert error(["2", "1", "1", "1", "-Infinity"]) == (
+        "22003", "numeric field overflow", "A field with precision 3, scale 0 cannot hold an infinite value.")

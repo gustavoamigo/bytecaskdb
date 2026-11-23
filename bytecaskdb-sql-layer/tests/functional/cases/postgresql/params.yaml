@@ -56,3 +56,29 @@
   query: SELECT $1::integer + 1
   params: ["41"]
   expected: [[42]]
+
+- name: a text parameter is read by its type's input function
+  features: [pg:parameters]
+  setup:
+    - CREATE TABLE p_input (id INTEGER PRIMARY KEY, s SMALLINT, b BIGINT, r REAL, d NUMERIC(3,0))
+  steps:
+    - sql: INSERT INTO p_input VALUES ($1, $2, $3, $4, $5)
+      params: ["0x1F", " 1_000 ", "-0b11", "1.5", "7"]
+      rowcount: 1
+    - sql: SELECT id, s, b, r, d FROM p_input WHERE id = $1
+      params: ["0o37"]
+      expected: [[31, 1000, -3, "1.5", 7]]
+    - sql: INSERT INTO p_input VALUES ($1, $2, 1, 1, 1)
+      params: [2, "0x8000"]
+      error: "22003"
+    - sql: INSERT INTO p_input VALUES ($1, 1, 1, 1, 1)
+      params: ["3000000000"]
+      error: "22003"
+    - sql: INSERT INTO p_input VALUES (2, 1, 1, $1, 1)
+      params: ["1e39"]
+      error: "22003"
+    - sql: INSERT INTO p_input VALUES (2, 1, 1, 1, $1)
+      params: ["Infinity"]
+      error: "22003"
+  teardown:
+    - DROP TABLE p_input
