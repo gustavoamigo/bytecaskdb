@@ -32,6 +32,7 @@ module;
 #include <filesystem>
 #include <iterator>
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <limits>
 #include <map>
@@ -46,6 +47,7 @@ module;
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -127,19 +129,38 @@ class ExecError : public std::runtime_error {
 public:
   // A failure: a bc_error_code, so a bc_commit_result such as BC_CONFLICT
   // does not compile here. A conflict is made only by conflicted().
-  ExecError(const std::string& what, bc_error_code code, std::uint32_t detail = 0, std::string note = {})
-      : std::runtime_error{what}, code_{code}, detail_{detail}, note_{std::move(note)} {}
+  ExecError(const std::string& what, bc_error_code code, std::uint32_t detail = 0, std::string note = {},
+            std::string hint = {}, std::string context = {})
+      : std::runtime_error{what},
+        code_{code},
+        detail_{detail},
+        note_{std::move(note)},
+        hint_{std::move(hint)},
+        context_{std::move(context)} {
+    if (code == BC_E_DATA || code == BC_E_ARITH) state_ = unpack_sqlstate(detail);
+  }
   // Every attempt conflicted; code() is BC_CONFLICT.
   [[nodiscard]] static auto conflicted(const std::string& what) -> ExecError { return {what, Conflict{}}; }
   ExecError(const ExecError&) = default;
   ExecError& operator=(const ExecError&) = default;
+  // A move allocates nothing, so an error is thrown even when memory is out
+  // (throw_keeping_outcome); a copy would copy its lines.
+  ExecError(ExecError&&) noexcept = default;
+  ExecError& operator=(ExecError&&) noexcept = default;
   ~ExecError() override;  // out of line: anchors the vtable (-Wweak-vtables)
   // A bc_error_code; BC_CONFLICT when conflict().
   [[nodiscard]] auto code() const noexcept -> int { return code_; }
   [[nodiscard]] auto conflict() const noexcept -> bool { return conflict_; }
   // bc_error_detail: for BC_E_CONSTRAINT, the bc_constraint in the high byte
-  // and the object id in the low 24 bits.
+  // and the object id in the low 24 bits; for BC_E_DATA and BC_E_ARITH, the
+  // SQLSTATE packed (BC_SQLSTATE).
   [[nodiscard]] auto detail() const noexcept -> std::uint32_t { return detail_; }
+  // The SQLSTATE the detail packs, for BC_E_DATA and BC_E_ARITH; empty for
+  // any other code, and for a detail that packs none (0 for BC_E_ARITH's
+  // 22003).
+  [[nodiscard]] auto state() const noexcept -> std::string_view {
+    return state_ ? std::string_view{state_->data(), state_->size()} : std::string_view{};
+  }
   // The detail decoded, for BC_E_CONSTRAINT; nullopt for any other code.
   [[nodiscard]] auto constraint() const noexcept -> std::optional<ConstraintDetail> {
     if (code_ != BC_E_CONSTRAINT) return std::nullopt;
@@ -149,6 +170,10 @@ public:
   // through a view that its check option refuses, "Failing row contains (…)".
   // Empty for most errors.
   [[nodiscard]] auto note() const noexcept -> std::string_view { return note_; }
+  // The error's HINT and CONTEXT lines (bc_error_hint, bc_error_context), as
+  // PostgreSQL's; empty for none.
+  [[nodiscard]] auto hint() const noexcept -> std::string_view { return hint_; }
+  [[nodiscard]] auto context() const noexcept -> std::string_view { return context_; }
 
 private:
   ExecError(const std::string& what, Conflict)
@@ -157,6 +182,9 @@ private:
   int code_;
   std::uint32_t detail_;
   std::string note_;
+  std::string hint_;
+  std::string context_;
+  std::optional<std::array<char, 5>> state_;
   bool conflict_{false};
 };
 
@@ -167,6 +195,8 @@ public:
   explicit SerializationFailure(const std::string& what) : ExecError{conflicted(what)} {}
   SerializationFailure(const SerializationFailure&) = default;
   SerializationFailure& operator=(const SerializationFailure&) = default;
+  SerializationFailure(SerializationFailure&&) noexcept = default;
+  SerializationFailure& operator=(SerializationFailure&&) noexcept = default;
   ~SerializationFailure() override;  // out of line: anchors the vtable (-Wweak-vtables)
 };
 
@@ -218,12 +248,16 @@ public:
 // PostgreSQL's.
 [[nodiscard]] auto sqlstate(const std::exception& e) noexcept -> std::string_view;
 // The HINT PostgreSQL reports with the error, empty for none: an
-// ast::SqlError's own, and the one PostgreSQL gives a runtime error.
+// ast::SqlError's own, a runtime error's (ExecError::hint), and the one
+// PostgreSQL gives a runtime error that carries none.
 [[nodiscard]] auto error_hint(const std::exception& e) noexcept -> std::string_view;
 // PostgreSQL's DETAIL for the error, empty where it has none or the layer
 // gives none: a DDL's refusal (DdlRefused::detail), ast::SqlError's, or a
 // runtime error's note (ExecError::note).
 [[nodiscard]] auto error_detail(const std::exception& e) noexcept -> std::string_view;
+// PostgreSQL's CONTEXT for the error, empty for none: a runtime error's
+// (ExecError::context).
+[[nodiscard]] auto error_context(const std::exception& e) noexcept -> std::string_view;
 
 class Database;
 
@@ -1411,6 +1445,13 @@ public:
   // record is written back unchanged, which such a plan guards, so execute
   // exhausts its retries. A plan that only reads commits nothing to conflict.
   void conflict_on_every_commit_for_testing(bool on);
+  // Test only: while set, every autocommit plan that writes a table calls
+  // `hook` with its context before its commit reaches the engine; a hook
+  // that fails the context (bc_ctx_fail_for_testing) ends the statement in
+  // that error, the way a test makes one carry a HINT and a CONTEXT. An
+  // empty function removes it. It wins over
+  // conflict_on_every_commit_for_testing.
+  void before_commit_for_testing(std::function<void(bc_ctx*)> hook);
   // Test only: called in each transaction statement right after the
   // transaction's catalog is pinned, before the statement is bound at it.
   // Set it while no transaction runs.
@@ -1640,6 +1681,7 @@ private:
   }};
 #ifdef BYTECASK_SQL_TESTING
   std::atomic<bool> conflict_every_commit_{false};
+  std::shared_ptr<const std::function<void(bc_ctx*)>> before_commit_;  // guarded by contexts_mu_
   std::function<void()> after_txn_pin_;
   std::function<void(const VacuumOptions&)> before_vacuum_;
 #endif
@@ -1677,29 +1719,41 @@ namespace {
 
 // Throws make(what), or make("") if the message cannot be allocated: the
 // outcome an exception reports never turns into std::bad_alloc. (An empty
-// message allocates nothing, and the copy thrown shares the message.)
+// message allocates nothing, and the exception thrown is moved from the one
+// built, which allocates nothing either.)
 template <class Make>
 [[noreturn]] void throw_keeping_outcome(std::string_view what, Make make) {
   using E = decltype(make(std::string{}));
+  static_assert(std::is_nothrow_move_constructible_v<E>, "the throw below must not allocate");
   std::optional<E> e;
   try {
     e.emplace(make(std::string{what}));
   } catch (const std::bad_alloc&) {
     e.emplace(make(std::string{}));
   }
-  throw E{*e};
+  throw std::move(*e);
 }
 
 [[noreturn]] void throw_serialization_failure(std::string_view what) {
   throw_keeping_outcome(what, [](const std::string& m) { return SerializationFailure{m}; });
 }
 
-// A failure the runtime reported, as the API's exception for it.
-// Its note is dropped with its message when they cannot be allocated.
-[[noreturn]] void throw_error(bc_error_code code, std::uint32_t detail, std::string_view message, std::string_view note = {}) {
+// The lines a runtime error carries beside its message: DETAIL, HINT and
+// CONTEXT (bc_error_note, bc_error_hint, bc_error_context).
+struct RuntimeNotes {
+  std::string_view note;
+  std::string_view hint;
+  std::string_view context;
+};
+
+// A failure the runtime reported, as the API's exception for it. Its code
+// and detail (so its SQLSTATE) always; its notes are dropped with its
+// message when they cannot be allocated.
+[[noreturn]] void throw_error(bc_error_code code, std::uint32_t detail, std::string_view message, RuntimeNotes notes = {}) {
   if (code == BC_E_UNKNOWN) throw TransactionResolutionUnknown{};
   throw_keeping_outcome(message, [&](const std::string& m) {
-    return ExecError{m, code, detail, m.empty() ? std::string{} : std::string{note}};
+    if (m.empty()) return ExecError{m, code, detail};
+    return ExecError{m, code, detail, std::string{notes.note}, std::string{notes.hint}, std::string{notes.context}};
   });
 }
 
@@ -1709,15 +1763,20 @@ template <class Make>
   auto detail = bc_error_detail(cx);
   std::string message;
   std::string note;
+  std::string hint;
+  std::string context;
   if (code != BC_E_UNKNOWN) {  // its exception's message is static
     try {
       message = bc_error_message(cx);
       note = bc_error_note(cx);
-    } catch (const std::bad_alloc&) {  // NOLINT(bugprone-empty-catch): the message is dropped, not the outcome
+      hint = bc_error_hint(cx);
+      context = bc_error_context(cx);
+    } catch (const std::bad_alloc&) {  // the text is dropped, all of it, not the outcome
+      message.clear();
     }
   }
   bc_ctx_reset(cx);  // the context keeps no snapshot or catalog version while idle
-  throw_error(code, detail, message, note);
+  throw_error(code, detail, message, {note, hint, context});
 }
 
 constexpr std::string_view kConflict = "could not serialize access due to concurrent update";
@@ -1777,11 +1836,9 @@ auto exec_sqlstate(const ExecError& e) noexcept -> std::string_view {
   switch (e.code()) {
     case BC_E_CONSTRAINT: return constraint_sqlstate(e);
     case BC_E_LIMIT: return "54000";      // program_limit_exceeded
-    case BC_E_ARITH:                      // bc_div and bc_mod name their zero divisor; every other failure is a range
-      if (std::string_view{e.what()} == "division by zero") return "22012";  // division_by_zero
-      if (std::string_view{e.what()} == "negative substring length not allowed") return "22011";  // substring_error
-      if (std::string_view{e.what()} == "lower bound must be less than or equal to upper bound") return "22023";
-      return "22003";  // numeric_value_out_of_range
+    case BC_E_ARITH:                      // the SQLSTATE its detail packs; none is a range
+      return e.state().empty() ? "22003" : e.state();  // numeric_value_out_of_range
+    case BC_E_DATA: return e.state().empty() ? "22000" : e.state();  // data_exception: none the runtime raises
     case BC_E_BUDGET: return "57014";     // query_canceled
     case BC_E_MEMORY: return "53200";     // out_of_memory
     case BC_E_CLOSED: return "57P01";     // admin_shutdown
@@ -1822,10 +1879,16 @@ auto error_detail(const std::exception& e) noexcept -> std::string_view {
   return {};
 }
 
+auto error_context(const std::exception& e) noexcept -> std::string_view {
+  if (const auto* x = dynamic_cast<const ExecError*>(&e)) return x->context();
+  return {};
+}
+
 auto error_hint(const std::exception& e) noexcept -> std::string_view {
   if (const auto* x = dynamic_cast<const ast::SqlError*>(&e)) return x->hint();
   if (const auto* x = dynamic_cast<const DdlRefused*>(&e)) return x->hint();
   const auto* x = dynamic_cast<const ExecError*>(&e);
+  if (x != nullptr && !x->hint().empty()) return x->hint();
   if (x != nullptr && x->conflict() && std::string_view{x->what()} == kReadWrite) return kRetryHint;
   if (x != nullptr && !x->conflict() && x->code() == BC_E_CARDINALITY &&
       std::string_view{x->what()} == "ON CONFLICT DO UPDATE command cannot affect row a second time") {
@@ -2114,17 +2177,25 @@ auto Database::vacuum(VacuumOptions opts) -> bool {
 
 auto Database::acquire_context() -> bc_ctx* {
   bc_ctx* cx = nullptr;
+#ifdef BYTECASK_SQL_TESTING
+  std::shared_ptr<const std::function<void(bc_ctx*)>> hook;
+#endif
   {
     std::lock_guard<std::mutex> lock{contexts_mu_};
     if (!idle_.empty()) {
       cx = idle_.back();
       idle_.pop_back();
     }
+#ifdef BYTECASK_SQL_TESTING
+    hook = before_commit_;
+#endif
   }
   if (cx == nullptr) cx = bc_ctx_new(&bdb_, &bcat_);
   if (cx == nullptr) throw std::bad_alloc();
 #ifdef BYTECASK_SQL_TESTING
-  if (!conflict_every_commit_.load()) {
+  if (hook) {
+    bc_ctx_before_commit_for_testing(cx, [cx, hook] { (*hook)(cx); });
+  } else if (!conflict_every_commit_.load()) {
     bc_ctx_before_commit_for_testing(cx, {});
   } else {
     bc_ctx_before_commit_for_testing(cx, [this] {
@@ -4695,6 +4766,13 @@ auto Transaction::commit() -> CommitOutcome {
 void Database::conflict_on_every_commit_for_testing(bool on) {
   auto lock = enter();
   conflict_every_commit_.store(on);  // each autocommit context takes it up when it is next taken
+}
+
+void Database::before_commit_for_testing(std::function<void(bc_ctx*)> hook) {
+  auto lock = enter();
+  auto held = hook ? std::make_shared<const std::function<void(bc_ctx*)>>(std::move(hook)) : nullptr;
+  std::lock_guard<std::mutex> guard{contexts_mu_};
+  before_commit_ = std::move(held);  // each autocommit context takes it up when it is next taken
 }
 
 auto Database::alternatives_for_testing(std::string_view sql, const std::vector<Value>& params) -> std::vector<Rows> {

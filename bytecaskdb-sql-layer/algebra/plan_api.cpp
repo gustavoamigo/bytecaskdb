@@ -901,9 +901,10 @@ auto key_object(BytesView key) -> std::optional<std::pair<std::uint8_t, std::uin
   return std::pair{std::to_integer<std::uint8_t>(key[0]), id};
 }
 
-// An error code other than BC_E_LAYOUT, checked at compile time: a layout
-// error is set with its bc_layout_detail, through the other fail overload,
-// so none goes without one.
+// An error code other than BC_E_LAYOUT, BC_E_DATA and BC_E_ARITH, checked
+// at compile time: a layout error is set with its bc_layout_detail, and a
+// data or arithmetic error with its SQLSTATE, through the other fail
+// overloads, so none goes without one.
 // -Wc++20-compat: the project is C++23; consteval is what makes it a
 // compile-time check.
 #pragma clang diagnostic push
@@ -911,10 +912,30 @@ auto key_object(BytesView key) -> std::optional<std::pair<std::uint8_t, std::uin
 struct ErrorCode {
   consteval ErrorCode(bc_error_code c) : code{c} {  // implicit: fail(BC_E_IO, ...)
     if (c == BC_E_LAYOUT) throw "BC_E_LAYOUT is set with its bc_layout_detail";
+    if (c == BC_E_DATA || c == BC_E_ARITH) throw "BC_E_DATA and BC_E_ARITH are set with their SQLSTATE";
+  }
+  bc_error_code code;
+};
+// BC_E_DATA or BC_E_ARITH, the codes whose detail is a SQLSTATE.
+struct StateCode {
+  consteval StateCode(bc_error_code c) : code{c} {  // implicit: fail(BC_E_ARITH, kDivisionByZero, ...)
+    if (c != BC_E_DATA && c != BC_E_ARITH) throw "only BC_E_DATA and BC_E_ARITH carry a SQLSTATE";
   }
   bc_error_code code;
 };
 #pragma clang diagnostic pop
+
+static_assert(bytecask::sql::kDivisionByZero.packed() == BC_SQLSTATE('2', '2', '0', '1', '2'));
+static_assert(bytecask::sql::unpack_sqlstate(BC_SQLSTATE('2', '2', 'P', '0', '2')) ==
+              std::array<char, 5>{'2', '2', 'P', '0', '2'});
+
+// The lines an error carries beside its message, each "" for none: its
+// DETAIL, HINT and CONTEXT (bc_error_note, bc_error_hint, bc_error_context).
+struct ErrorNotes {
+  std::string_view detail;
+  std::string_view hint;
+  std::string_view context;
+};
 
 // Where an error is recorded: a context's for its runs, a transaction's for
 // its commit. fail() keeps the first error set; unknown() overrides.
@@ -922,13 +943,21 @@ struct ErrorSink {
   bc_error_code& error;
   std::uint32_t& detail;
   std::string& message;
-  std::string& note;  // the error's DETAIL line (bc_error_note): only a constraint with a row sets it
+  std::string& note;  // the error's DETAIL line (bc_error_note): a constraint with a row, or a data error
+  std::string& hint;     // its HINT line (bc_error_hint)
+  std::string& context;  // its CONTEXT line (bc_error_context)
 
   void clear() noexcept {
     error = BC_OK;
     detail = 0;
+    clear_text();
+  }
+
+  void clear_text() noexcept {
     message.clear();
     note.clear();
+    hint.clear();
+    context.clear();
   }
 
   void fail(ErrorCode code, std::string msg, std::uint32_t with_detail = 0) {
@@ -943,6 +972,23 @@ struct ErrorSink {
     error = BC_E_LAYOUT;
     detail = why;
     message = std::move(msg);
+  }
+
+  // A data or arithmetic error with its SQLSTATE in the detail. The code and
+  // the SQLSTATE first, so text that cannot be allocated is dropped, all of
+  // it, never the error or its SQLSTATE.
+  void fail(StateCode code, bytecask::sql::SqlState state, std::string_view msg, ErrorNotes notes = {}) noexcept {
+    if (error != BC_OK) return;
+    error = code.code;
+    detail = state.packed();
+    try {
+      message = msg;
+      note = notes.detail;
+      hint = notes.hint;
+      context = notes.context;
+    } catch (...) {
+      clear_text();
+    }
   }
 
   // A constraint the runtime found, not a plan: the code first, so a message
@@ -965,7 +1011,7 @@ struct ErrorSink {
   void unknown(const char* what) noexcept {
     error = BC_E_UNKNOWN;
     detail = 0;
-    note.clear();
+    clear_text();
     try {
       message = what;
     } catch (...) {
@@ -1106,6 +1152,8 @@ struct bc_ctx {
   std::uint32_t detail{0};
   std::string message;
   std::string note;
+  std::string hint;
+  std::string context;
 
   // The handle tables a step's storage is marked in: each grows as the plan
   // makes handles and is cut back to its mark when the step ends.
@@ -1287,9 +1335,13 @@ struct bc_ctx {
   // call after the stop returns a neutral value. It is not an error.
   auto ok() const -> bool { return error == BC_OK && !unwinding; }
 
-  [[nodiscard]] auto sink() -> ErrorSink { return {error, detail, message, note}; }
+  [[nodiscard]] auto sink() -> ErrorSink { return {error, detail, message, note, hint, context}; }
 
   void fail(ErrorCode code, std::string msg) { sink().fail(code, std::move(msg)); }
+
+  void fail(StateCode code, bytecask::sql::SqlState state, std::string_view msg, ErrorNotes notes = {}) noexcept {
+    sink().fail(code, state, msg, notes);
+  }
 
   void fail(bc_layout_detail why, std::string msg) { sink().fail(why, std::move(msg)); }
 
@@ -1870,7 +1922,9 @@ struct bc_txn {
   std::uint32_t detail{0};
   std::string message;
   std::string note;
-  [[nodiscard]] auto sink() -> ErrorSink { return {error, detail, message, note}; }
+  std::string hint;
+  std::string context;
+  [[nodiscard]] auto sink() -> ErrorSink { return {error, detail, message, note, hint, context}; }
   void fail_current_exception() noexcept { sink().fail_current_exception(); }
   // The one context begun on it and not yet reset, which points into its
   // snapshot and overlay; null when none is. A second is refused, and so
@@ -3737,6 +3791,7 @@ enum bc_commit_result bc_ctx_commit(bc_ctx* cx, bool sync) {
   }
 #ifdef BYTECASK_SQL_TESTING
   if (cx->before_commit) cx->before_commit();
+  if (!cx->ok()) return BC_FAILED;  // the hook failed the statement (bc_ctx_fail_for_testing)
 #endif
   auto r = submit(cx->sink(), *cx->db, std::move(plan), sync);
   if (r == BC_CONFLICT && before) {
@@ -3788,6 +3843,10 @@ enum bc_error_code bc_error(const bc_ctx* cx) { return cx->error; }
 const char* bc_error_message(const bc_ctx* cx) { return cx->message.c_str(); }
 
 const char* bc_error_note(const bc_ctx* cx) { return cx->note.c_str(); }
+
+const char* bc_error_hint(const bc_ctx* cx) { return cx->hint.c_str(); }
+
+const char* bc_error_context(const bc_ctx* cx) { return cx->context.c_str(); }
 
 uint32_t bc_error_detail(const bc_ctx* cx) { return cx->detail; }
 
@@ -3847,6 +3906,32 @@ ReadSetContents read_set_apply_for_testing(std::span<const ReadSetOp> ops) {
 
 #ifdef BYTECASK_SQL_TESTING
 void bc_ctx_before_commit_for_testing(bc_ctx* cx, std::function<void()> hook) { cx->before_commit = std::move(hook); }
+void bc_ctx_fail_for_testing(bc_ctx* cx, bc_error_code code, bytecask::sql::SqlState state, const char* message,
+                             const char* note, const char* hint, const char* context) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return;
+  switch (code) {
+    case BC_E_DATA: cx->fail(BC_E_DATA, state, message, {note, hint, context}); return;
+    case BC_E_ARITH: cx->fail(BC_E_ARITH, state, message, {note, hint, context}); return;
+    case BC_OK:
+    case BC_E_IO:
+    case BC_E_CORRUPT:
+    case BC_E_MEMORY:
+    case BC_E_BUDGET:
+    case BC_E_LIMIT:
+    case BC_E_HANDLE:
+    case BC_E_CONSTRAINT:
+    case BC_E_LAYOUT:
+    case BC_E_DEGRADED:
+    case BC_E_CLOSED:
+    case BC_E_UNKNOWN:
+    case BC_E_PATTERN:
+    case BC_E_CARDINALITY:
+    case BC_E_READ_ONLY: break;
+  }
+  cx->fail(BC_E_HANDLE, "bc_ctx_fail_for_testing takes BC_E_DATA or BC_E_ARITH");
+  BC_GUARD_END(cx)
+}
 std::uint64_t bc_ctx_held_for_testing(const bc_ctx* cx) { return cx->mem_used; }
 std::size_t bc_ctx_write_set_slots_for_testing(const bc_ctx* cx) {
   return cx->effects.capacity() + cx->claims.capacity() + cx->locks.capacity() + cx->written_tables.capacity();
@@ -5127,8 +5212,9 @@ void bc_emit_count(bc_ctx* cx, int64_t affected) {
 // ---------------------------------------------------------------- arithmetic
 
 namespace {
-auto arith_fail(bc_ctx* cx, const char* what) -> std::int64_t {
-  cx->fail(BC_E_ARITH, what);
+auto arith_fail(bc_ctx* cx, const char* what, bytecask::sql::SqlState state = bytecask::sql::kNumericValueOutOfRange)
+    -> std::int64_t {
+  cx->fail(BC_E_ARITH, state, what);
   return 0;
 }
 
@@ -5172,7 +5258,7 @@ int64_t bc_mul(bc_ctx* cx, int64_t a, int64_t b) {
 int64_t bc_div(bc_ctx* cx, int64_t a, int64_t b) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return 0;
-  if (b == 0) return arith_fail(cx, "division by zero");
+  if (b == 0) return arith_fail(cx, "division by zero", bytecask::sql::kDivisionByZero);
   if (b == -1 && a == std::numeric_limits<std::int64_t>::min()) return arith_fail(cx, "integer out of range");
   return a / b;
   BC_GUARD_END(cx)
@@ -5182,7 +5268,7 @@ int64_t bc_div(bc_ctx* cx, int64_t a, int64_t b) {
 int64_t bc_mod(bc_ctx* cx, int64_t a, int64_t b) {
   BC_GUARD_BEGIN
   if (!cx->ok()) return 0;
-  if (b == 0) return arith_fail(cx, "division by zero");
+  if (b == 0) return arith_fail(cx, "division by zero", bytecask::sql::kDivisionByZero);
   if (b == -1) return 0;  // INT64_MIN % -1 is undefined in C; the remainder is 0
   return a % b;
   BC_GUARD_END(cx)
@@ -5876,7 +5962,7 @@ bc_view bc_substr(bc_ctx* cx, bc_view s, int64_t from, int64_t count) {
   auto text = cx->resolve(s);
   if (!text) return {};
   if (count < 0) {
-    cx->fail(BC_E_ARITH, "negative substring length not allowed");
+    cx->fail(BC_E_ARITH, bytecask::sql::kSubstringError, "negative substring length not allowed");
     return {};
   }
   // Characters [from, from + count), 1-based, cut to the text.
@@ -5961,7 +6047,7 @@ int64_t bc_position(bc_ctx* cx, bc_view s, bc_view needle) {
 int64_t bc_random(bc_ctx* cx, int64_t lo, int64_t hi) {
   BC_GUARD_BEGIN
   if (lo > hi) {
-    cx->fail(BC_E_ARITH, "lower bound must be less than or equal to upper bound");
+    cx->fail(BC_E_ARITH, bytecask::sql::kInvalidParameterValue, "lower bound must be less than or equal to upper bound");
     return 0;
   }
   // TLS: process — a generator per thread, holding no DB's state: draws are
@@ -6734,7 +6820,7 @@ void bc_agg_add_i64(bc_ctx* cx, bc_group g, uint32_t slot, int64_t v) {
   if (s == nullptr) return;
   std::int64_t r = 0;
   if (__builtin_add_overflow(s->i, v, &r)) {
-    cx->fail(BC_E_ARITH, "bigint out of range");
+    cx->fail(BC_E_ARITH, bytecask::sql::kNumericValueOutOfRange, "bigint out of range");
     return;
   }
   s->i = r;
@@ -6745,7 +6831,7 @@ void bc_agg_add_i64(bc_ctx* cx, bc_group g, uint32_t slot, int64_t v) {
 // infinite or NaN input carries through.
 static auto sum_f64(bc_ctx* cx, double a, double b) -> double {
   auto r = a + b;
-  if (std::isinf(r) && !std::isinf(a) && !std::isinf(b)) cx->fail(BC_E_ARITH, "value out of range: overflow");
+  if (std::isinf(r) && !std::isinf(a) && !std::isinf(b)) cx->fail(BC_E_ARITH, bytecask::sql::kNumericValueOutOfRange, "value out of range: overflow");
   return r;
 }
 // PostgreSQL's float8 order: NaN above every number, -0.0 equal to 0.0.
@@ -6809,7 +6895,7 @@ void bc_agg_count(bc_ctx* cx, bc_group g, uint32_t slot) {
   auto* s = fold_slot(cx, g, slot, SlotKind::Count);
   if (s == nullptr) return;
   if (__builtin_add_overflow(s->i, 1, &s->i)) {
-    cx->fail(BC_E_ARITH, "bigint out of range");
+    cx->fail(BC_E_ARITH, bytecask::sql::kNumericValueOutOfRange, "bigint out of range");
     return;
   }
   s->set = true;

@@ -385,6 +385,38 @@ def test_an_error_carries_postgresqls_detail_and_hint(server):
     assert "D" not in f and "H" not in f, f
 
 
+def test_a_runtime_error_sends_its_sqlstate_and_its_hint_and_context_only_where_present(server):
+    # The SQLSTATE comes from the error the runtime raised, the same as
+    # PostgreSQL 17's; a runtime error without a HINT or CONTEXT sends no H
+    # or W field, and one with a HINT sends it as H.
+    c = connect(server)
+    for sql in (
+        "CREATE TABLE rt_err (k BIGINT PRIMARY KEY, z INTEGER, s TEXT)",
+        "INSERT INTO rt_err VALUES (1, 0, 'abc')",
+    ):
+        c.send(query(sql))
+        c.until_ready()
+    for sql, state, message in (
+        ("SELECT k / z FROM rt_err", "22012", "division by zero"),
+        ("SELECT substring(s FROM 1 FOR z - 1) FROM rt_err", "22011", "negative substring length not allowed"),
+        ("SELECT random(k + 1, k) FROM rt_err", "22023", "lower bound must be less than or equal to upper bound"),
+    ):
+        c.send(query(sql))
+        f = fields(c.until_ready()[0][1])
+        assert f["C"] == state and f["M"] == message, (sql, f)
+        assert "D" not in f and "H" not in f and "W" not in f, (sql, f)
+    c.send(
+        query(
+            "INSERT INTO rt_err VALUES (2, 0, 'a'), (2, 0, 'b') "
+            "ON CONFLICT (k) DO UPDATE SET s = excluded.s"
+        )
+    )
+    f = fields(c.until_ready()[0][1])
+    assert f["C"] == "21000", f
+    assert f["H"].startswith("Ensure that no rows proposed for insertion"), f
+    assert "W" not in f, f
+
+
 # ---------------------------------------------------------------- extended query
 
 

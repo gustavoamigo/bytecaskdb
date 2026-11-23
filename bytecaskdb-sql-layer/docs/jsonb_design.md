@@ -2,7 +2,9 @@
 
 Status: **design, approved by the owner on 2026-11-21 with these
 answers: Q1 binary, Q2–Q3, Q5, Q7–Q11 as recommended; Q4 and Q6 deferred
-to the next phase.** Nothing below is built.
+to the next phase.** Stage 0 is built (runtime errors carry their
+SQLSTATE, DETAIL, HINT and CONTEXT: `BC_E_DATA`, plan API revision 20);
+nothing of jsonb itself is.
 Proposed home: `bytecaskdb-sql-layer/docs/jsonb_design.md`, with
 `types_design.md` :48 losing `JSON` from its rejected list.
 

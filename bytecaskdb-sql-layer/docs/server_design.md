@@ -881,12 +881,29 @@ difference: the driver writes ISO.
 - `S` and `V`: `ERROR`, or `FATAL` before the connection closes;
 - `C`: the SQLSTATE;
 - `M`: the exception's message;
-- `D` and `H`: for an `ast::SqlError` that has them, PostgreSQL's DETAIL
-  and HINT (`ast::SqlError::detail`, `hint`; an `INSERT` through a view
-  PostgreSQL does not write through is the first to carry them). Other
-  errors send neither, where PostgreSQL may;
+- `D` and `H`: PostgreSQL's DETAIL and HINT, where the error has them
+  (`error_detail`, `error_hint`): an `ast::SqlError`'s or a `DdlRefused`'s
+  own (an `INSERT` through a view PostgreSQL does not write through is the
+  first to carry them), and a runtime error's (`ExecError::note`, `hint`,
+  from `bc_error_note` and `bc_error_hint`). Other errors send neither,
+  where PostgreSQL may;
 - `P`: for an `ast::SqlError`, its position, one-based and in characters,
-  converted from the layer's byte offset.
+  converted from the layer's byte offset;
+- `W`: PostgreSQL's CONTEXT, where a runtime error has one
+  (`error_context`, `ExecError::context`, from `bc_error_context`). No
+  runtime call sets one before jsonb (`jsonb_design.md`, *jsonb runtime
+  errors and their SQLSTATEs*).
+
+The embedded API builds a runtime error's `ExecError` with its message and
+lines under a `std::bad_alloc` guard, dropping all the text if it cannot be
+allocated, and throws it by move, which allocates nothing: memory that runs
+out once the runtime raised the error never turns its SQLSTATE into 53200.
+Until jsonb, the tests reach `H` and `W` end to end through
+`Database::before_commit_for_testing`, a hook that fails an autocommit
+write's context with `bc_ctx_fail_for_testing` before its commit.
+
+Each field is sent only where it is not empty, in PostgreSQL's order: `S`,
+`V`, `C`, `M`, `D`, `H`, `P`, `W` (`pg::put_error_fields`).
 
 Warnings are `NoticeResponse` with `S` `WARNING`. A statement's notices
 (`Rows::notices`: a DDL that `IF EXISTS` or `IF NOT EXISTS` skipped, and
@@ -906,7 +923,8 @@ PostgreSQL also checks the server's mapping. The mapping:
 | `BC_C_NOT_NULL` | `23502` |
 | `BC_C_RANGE`, by the check that failed | `22003` (`smallint`/`integer`/`numeric field overflow`/`REAL`), `22001` (`VARCHAR` too long), `22021` (encoding), `22008` (datetime) |
 | `BC_E_LIMIT` | `54000` |
-| `BC_E_ARITH` | `22012` for a zero divisor (`bc_div`, `bc_mod`: the message `division by zero`), `22003` for any other: an overflow, or a range the helpers check |
+| `BC_E_ARITH` | the SQLSTATE `bc_error_detail` packs (`ExecError::state`): `22012` for a zero divisor (`bc_div`, `bc_mod`), `22011` for a negative substring length (`bc_substr`), `22023` for random's bounds (`bc_random`), `22003` for an overflow or a range the helpers check; a detail of 0 is `22003`. No message is matched |
+| `BC_E_DATA` | the SQLSTATE `bc_error_detail` packs; `22000` for one that packs none, which the runtime never raises |
 | `SerializationFailure`, a conflict on every retry, `DdlInProgress` | `40001` |
 | `TransactionResolutionUnknown` | `08007` |
 | `TransactionAborted` | `25P02` |

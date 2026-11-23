@@ -84,6 +84,23 @@ private:
   std::size_t start_{0};  // where the open message's length goes
 };
 
+// The fields of an ErrorResponse ('E') or NoticeResponse ('N'). An empty
+// detail, hint or context, and a position of 0, are not sent.
+struct ErrorFields {
+  std::string_view severity;
+  std::string_view state;
+  std::string_view message;
+  std::int32_t position{0};  // 1-based, in characters of the statement
+  std::string_view detail{};
+  std::string_view hint{};
+  std::string_view context{};
+};
+
+// Appends a whole ErrorResponse or NoticeResponse of type `type`: S and V
+// (the severity), C, M, then D, H, P and W where present, as PostgreSQL
+// orders them.
+void put_error_fields(Out& out, char type, const ErrorFields& f);
+
 // One complete unit cut from a connection's byte stream, or EndOfStream when
 // the read side closes.
 struct Input {
@@ -126,6 +143,29 @@ namespace {
 }  // namespace
 
 ProtocolError::~ProtocolError() = default;
+
+void put_error_fields(Out& out, char type, const ErrorFields& f) {
+  auto field = [&](char code, std::string_view value) {
+    if (value.empty()) return;
+    out.raw(code);
+    out.cstr(value);
+  };
+  out.begin(type);
+  out.raw('S');
+  out.cstr(f.severity);
+  out.raw('V');
+  out.cstr(f.severity);
+  out.raw('C');
+  out.cstr(f.state);
+  out.raw('M');
+  out.cstr(f.message);
+  field('D', f.detail);
+  field('H', f.hint);
+  if (f.position > 0) field('P', std::to_string(f.position));
+  field('W', f.context);
+  out.raw('\0');
+  out.end();
+}
 
 void Body::need(std::size_t n) const {
   if (s_.size() < n) throw ProtocolError("message too short for its fields");

@@ -168,6 +168,13 @@ std::uint64_t bc_txn_cap_holds_for_testing(const bc_txn* txn) noexcept;
 // context, after the plan ran and before its batch reaches the engine, so a
 // test can make the commit conflict. An empty function removes it.
 void bc_ctx_before_commit_for_testing(bc_ctx* cx, std::function<void()> hook);
+// Test only: a runtime call that fails the statement with BC_E_DATA or
+// BC_E_ARITH (another code is BC_E_HANDLE), `state` in its detail and the
+// four lines as given, as a call that builds its error text does: what a
+// plan uses to reach bc_error_hint and bc_error_context, which no runtime
+// call sets before jsonb.
+void bc_ctx_fail_for_testing(bc_ctx* cx, bc_error_code code, bytecask::sql::SqlState state, const char* message,
+                             const char* note, const char* hint, const char* context);
 // Test only: the bytes the context's statement is charged now.
 std::uint64_t bc_ctx_held_for_testing(const bc_ctx* cx);
 // Test only: a SERIALIZABLE read set's entries, in key order, what they are
@@ -226,6 +233,7 @@ export using ::bc_ctx_conflict_read_write;
 export using ::bc_txn_plan_bytes_for_testing;
 export using ::bc_txn_cap_holds_for_testing;
 export using ::bc_ctx_before_commit_for_testing;
+export using ::bc_ctx_fail_for_testing;
 export using ::bc_ctx_held_for_testing;
 export using ::ReadSetContents;
 export using ::ReadSetOp;

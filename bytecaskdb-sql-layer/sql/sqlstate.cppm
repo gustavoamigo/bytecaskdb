@@ -7,6 +7,9 @@
 // here, and the code outlives the error: every constant points at a literal.
 
 module;
+#include <array>
+#include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string_view>
 
@@ -19,6 +22,15 @@ public:
   // consteval: only a literal of five characters, so only the constants below.
   consteval explicit SqlState(const char (&code)[6]) noexcept : code_{code} {}
   [[nodiscard]] constexpr auto view() const noexcept -> std::string_view { return code_; }
+  // As bc_error_detail carries it for BC_E_DATA and BC_E_ARITH: BC_SQLSTATE,
+  // PostgreSQL's MAKE_SQLSTATE, six bits a character, the first lowest.
+  [[nodiscard]] constexpr auto packed() const noexcept -> std::uint32_t {
+    std::uint32_t v = 0;
+    for (std::size_t i = 0; i < 5; ++i) {
+      v |= (static_cast<std::uint32_t>(static_cast<unsigned char>(code_[i]) - unsigned{'0'}) & 0x3Fu) << (6 * i);
+    }
+    return v;
+  }
 
 private:
   const char* code_;
@@ -81,6 +93,20 @@ inline constexpr SqlState kInsufficientPrivilege{"42501"};
 inline constexpr SqlState kInvalidSchemaDefinition{"42P15"};
 inline constexpr SqlState kWithCheckOptionViolation{"44000"};
 inline constexpr SqlState kInternalError{"XX000"};
+
+// The five characters `packed` holds (SqlState::packed), or nullopt for 0,
+// for bits past the 30 it uses, and for a character outside 0-9 and A-Z,
+// none of which a SqlState packs to.
+[[nodiscard]] constexpr auto unpack_sqlstate(std::uint32_t packed) noexcept -> std::optional<std::array<char, 5>> {
+  if (packed == 0 || (packed >> 30) != 0) return std::nullopt;
+  std::array<char, 5> code{};
+  for (std::size_t i = 0; i < 5; ++i) {
+    auto c = static_cast<char>('0' + ((packed >> (6 * i)) & 0x3Fu));
+    if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z'))) return std::nullopt;
+    code[i] = c;
+  }
+  return code;
+}
 
 // The constant above whose code is `code`, or nullopt.
 [[nodiscard]] constexpr auto known_sqlstate(std::string_view code) noexcept -> std::optional<SqlState> {
