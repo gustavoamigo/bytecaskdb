@@ -61,6 +61,18 @@ export namespace bytecask::sql::ast {
 // statement. Throws SqlError as parse() does.
 [[nodiscard]] auto parse_variable(std::string_view sql) -> std::optional<VariableStatement>;
 
+// GROUP BY's bare names that `input` says name no input column, each the
+// select item whose output name it is (PostgreSQL 17's
+// findTargetlistEntrySQL92: an input column first, then an output name, an
+// item's AS name or the one `implicit` gives an unaliased item);
+// nullopt where none is. Only the binder knows the input columns, so it
+// calls this, before views are merged (docs/frontend_design.md, *GROUP BY of
+// an expression*). Throws SqlError as group_key does, and 42702 for an
+// ambiguous name.
+[[nodiscard]] auto group_output_names(const Select& s, const std::function<bool(const std::string&)>& input,
+                                      const std::function<std::string(const Expr&)>& implicit)
+    -> std::optional<std::vector<Expr>>;
+
 // Throws SqlError for what PostgreSQL's raw parser refuses, a syntax error,
 // and nothing else: what an aborted transaction reports before 25P02, where
 // PostgreSQL's parse analysis (42P16 for two primary keys, say) and the
@@ -1490,6 +1502,80 @@ void requalify(Compare& c, const Names& n) {
   for (auto& a : c.args) requalify(a, n);
 }
 
+// A select item's output name: its AS name, or an unaliased column's name.
+auto output_name(const Expr& t) -> std::string { return t.alias.empty() && t.kind == Expr::Kind::Column ? t.column : t.alias; }
+
+// Whether unqualified column `name` of sel is the column `qualified` names,
+// as PostgreSQL 17 compares them. Where a USING or NATURAL join merges the
+// name, the unqualified column is the merged one: the left side's of an
+// inner or LEFT join, the right table's of a RIGHT join, neither's of a
+// FULL join (a COALESCE). Throws 42601 where only the binder could tell: a
+// NATURAL join's columns are the catalog's.
+auto unqualified_is(const Select& sel, const std::string& name, const Expr& qualified, std::int32_t pos) -> bool {
+  // The items the merged column may be: none merged yet (nullopt), or
+  // [first, last) of the FROM items, the one of them that has the name.
+  std::optional<std::pair<std::size_t, std::size_t>> merged;
+  auto natural = false;
+  for (std::size_t k = 1; k < sel.from.size(); ++k) {
+    const auto& item = sel.from[k];
+    natural = natural || item.natural;
+    if (!std::ranges::contains(item.using_columns, name)) continue;
+    if (item.kind == JoinKind::Full) return false;
+    if (item.kind == JoinKind::Right) {
+      merged = {k, k + 1};
+    } else if (!merged) {
+      merged = {0, k};
+    }
+  }
+  auto at = std::ranges::find_if(sel.from, [&](const FromItem& f) { return f.name() == qualified.table; });
+  if (at == sel.from.end()) return true;  // the binder's 42P01
+  if (natural) {
+    // The first item's column, with no RIGHT or FULL join, is the left
+    // side's at every join, merged or not.
+    auto keeps_left = std::ranges::none_of(sel.from, [](const FromItem& f) {
+      return f.kind == JoinKind::Right || f.kind == JoinKind::Full;
+    });
+    if (at == sel.from.begin() && keeps_left) return true;
+    reject("an output name of both a qualified column and an unqualified one in a query of a NATURAL join is not supported yet",
+           pos);
+  }
+  auto index = static_cast<std::size_t>(at - sel.from.begin());
+  if (!merged) return true;
+  return index >= merged->first && index < merged->second;
+}
+
+// The select item whose output name `name` is, null for none; `named`
+// gives an item's output name. Two items of the name are 42702 (`clause`
+// "name" is ambiguous, at `pos`) unless they are one: two column items
+// naming one column, an unqualified reference and a qualified one included
+// where they are one column (unqualified_is; the binder rejects the
+// unqualified one if ambiguous), or expressions written alike. Of a
+// qualified and an unqualified item, the qualified one.
+auto output_item(const Select& sel, const std::string& name, const char* clause, std::int32_t pos,
+                 const std::function<std::string(const Expr&)>& named = output_name) -> const Expr* {
+  auto same_item = [&](const Expr& x, const Expr& y) {
+    if (x.kind == Expr::Kind::Column && y.kind == Expr::Kind::Column) {
+      if (x.column != y.column) return false;
+      if (x.table == y.table) return true;
+      if (x.table.empty()) return unqualified_is(sel, x.column, y, pos);
+      if (y.table.empty()) return unqualified_is(sel, y.column, x, pos);
+      return false;
+    }
+    return same_expr(x, y);
+  };
+  std::vector<const Expr*> hits;
+  for (const auto& t : sel.targets) {
+    if (t.kind != Expr::Kind::Star && named(t) == name) hits.push_back(&t);
+  }
+  if (hits.empty()) return nullptr;
+  for (std::size_t i = 0; i < hits.size(); ++i) {
+    for (std::size_t j = 0; j < i; ++j) {
+      if (!same_item(*hits[i], *hits[j])) reject(std::string{clause} + " \"" + name + "\" is ambiguous", pos, kAmbiguousColumn);
+    }
+  }
+  return *std::ranges::max_element(hits, {}, [](const Expr* t) { return !t->table.empty(); });
+}
+
 // An unqualified ORDER BY name of a plain SELECT is an output name first, as
 // PostgreSQL reads it: an item's AS name, or an unaliased column's name. It
 // orders by that item's expression, which hides any input column of the
@@ -1498,34 +1584,31 @@ void requalify(Compare& c, const Names& n) {
 // alike. Runs before resolve_positions, whose positions already name their
 // item.
 void resolve_output_names(Select& sel) {
-  auto output_name = [](const Expr& t) -> const std::string& {
-    return t.alias.empty() && t.kind == Expr::Kind::Column ? t.column : t.alias;
-  };
-  // Two column items are one where they name one column, a qualified and an
-  // unqualified reference included (the binder rejects the latter if ambiguous).
-  auto same_item = [](const Expr& x, const Expr& y) {
-    if (x.kind == Expr::Kind::Column && y.kind == Expr::Kind::Column) {
-      return x.column == y.column && (x.table == y.table || x.table.empty() || y.table.empty());
-    }
-    return same_expr(x, y);
-  };
   for (auto& o : sel.order_by) {
     if (o.position != 0 || o.expr.kind != Expr::Kind::Column || !o.expr.table.empty()) continue;
-    std::vector<const Expr*> hits;
-    for (const auto& t : sel.targets) {
-      if (t.kind != Expr::Kind::Star && output_name(t) == o.expr.column) hits.push_back(&t);
-    }
-    if (hits.empty()) continue;
-    for (std::size_t i = 0; i < hits.size(); ++i) {
-      for (std::size_t j = 0; j < i; ++j) {
-        if (!same_item(*hits[i], *hits[j])) {
-          reject("ORDER BY \"" + o.expr.column + "\" is ambiguous", o.pos, kAmbiguousColumn);
-        }
-      }
-    }
-    const auto* hit = *std::ranges::max_element(hits, {}, [](const Expr* t) { return !t->table.empty(); });
-    o.expr = clone(*hit);
+    if (const auto* hit = output_item(sel, o.expr.column, "ORDER BY", o.pos)) o.expr = clone(*hit);
   }
+}
+
+// The select item a GROUP BY position or output name names, as a key: a
+// column item is that column. An item holding an aggregate is 42803 at the
+// aggregate, as PostgreSQL's; an expression item is not a key yet (#904
+// stage G1), refused at `at`, the position or name.
+auto group_key(const Expr& item, std::int32_t at) -> Expr {
+  std::function<const Expr*(const Expr&)> aggregate = [&](const Expr& e) -> const Expr* {
+    if (e.kind == Expr::Kind::Aggregate) return &e;
+    for (const auto* x : {e.lhs.get(), e.rhs.get()}) {
+      if (x == nullptr) continue;
+      if (const auto* a = aggregate(*x)) return a;
+    }
+    for (const auto& a : e.args) {
+      if (const auto* found = aggregate(a)) return found;
+    }
+    return nullptr;
+  };
+  if (const auto* a = aggregate(item)) reject("aggregate functions are not allowed in GROUP BY", a->pos, kGroupingError);
+  if (item.kind != Expr::Kind::Column) reject("GROUP BY of an expression is not supported yet", at);
+  return clone(item);
 }
 
 // ORDER BY 2 of a plain SELECT orders by the second select-list item's
@@ -1720,6 +1803,34 @@ void resolve_aliases(Select& sel, bool nested) {
   for (auto& o : sel.order_by) requalify(o.expr, names);
   if (names.keep) return;
   for (auto& item : sel.from) item.alias.clear();
+}
+
+// GROUP BY's keys, as PostgreSQL 17's findTargetlistEntrySQL92 reads them:
+// a column, or an integer constant, the select-list item at that position
+// (group_key). Any other constant is 42601, as PostgreSQL's; an expression,
+// grouping sets, ROLLUP and CUBE are refused. A bare name that is no input
+// column is an output name, which only the binder can tell
+// (group_output_names). Runs before resolve_aliases, so a position's item is
+// requalified as the item is.
+void group_items(const PgQuery__SelectStmt* s, Select& sel, std::int32_t pos) {
+  for (std::size_t i = 0; i < s->n_group_clause; ++i) {
+    const auto* g = s->group_clause[i];
+    if (g->node_case == PG_QUERY__NODE__NODE_A_CONST) {
+      const auto* c = g->a_const;
+      if (c->isnull || c->val_case != PG_QUERY__A__CONST__VAL_IVAL) reject("non-integer constant in GROUP BY", c->location);
+      auto position = c->ival->ival;
+      if (position < 1 || std::cmp_greater(position, sel.targets.size())) {
+        reject("GROUP BY position " + std::to_string(position) + " is not in select list", c->location, kInvalidColumnReference);
+      }
+      if (std::ranges::any_of(sel.targets, [](const Expr& e) { return e.kind == Expr::Kind::Star; })) {
+        reject("GROUP BY position with * in the select list is not supported yet", c->location);
+      }
+      sel.group_by.push_back(group_key(sel.targets[static_cast<std::size_t>(position - 1)], c->location));
+      continue;
+    }
+    if (g->node_case != PG_QUERY__NODE__NODE_COLUMN_REF) reject("GROUP BY takes columns", pos);
+    sel.group_by.push_back(expr(g));
+  }
 }
 
 // ORDER BY's keys, in order: expressions, or select-list positions.
@@ -1952,12 +2063,7 @@ auto select(const PgQuery__SelectStmt* s, std::int32_t pos, bool into_taken, boo
   }
   sel.where = std::move(on);
   where(s->where_clause, sel.where);
-  // GROUP BY of columns: no expressions, grouping sets, ROLLUP or CUBE.
-  for (std::size_t i = 0; i < s->n_group_clause; ++i) {
-    const auto* g = s->group_clause[i];
-    if (g->node_case != PG_QUERY__NODE__NODE_COLUMN_REF) reject("GROUP BY takes columns", pos);
-    sel.group_by.push_back(expr(g));
-  }
+  group_items(s, sel, pos);
   where(s->having_clause, sel.having, "HAVING", pos);
   resolve_output_names(sel);
   resolve_positions(sel);
@@ -2521,6 +2627,29 @@ void check_syntax(std::string_view sql) {
   if (res.raw.error != nullptr) {
     reject(res.raw.error->message, res.raw.error->cursorpos > 0 ? res.raw.error->cursorpos - 1 : -1);
   }
+}
+
+auto group_output_names(const Select& s, const std::function<bool(const std::string&)>& input,
+                        const std::function<std::string(const Expr&)>& implicit) -> std::optional<std::vector<Expr>> {
+  auto named = [&](const Expr& t) { return t.alias.empty() ? implicit(t) : t.alias; };
+  std::optional<std::vector<Expr>> out;
+  for (std::size_t i = 0; i < s.group_by.size(); ++i) {
+    const auto& g = s.group_by[i];
+    if (g.kind != Expr::Kind::Column || !g.table.empty() || input(g.column)) continue;
+    const auto* hit = output_item(s, g.column, "GROUP BY", g.pos, named);
+    if (hit == nullptr) continue;  // no column of the name: the binder's 42703
+    // An item that is itself no input column: PostgreSQL reports it first,
+    // binding its select list before its GROUP BY.
+    if (hit->kind == Expr::Kind::Column && hit->table.empty() && !input(hit->column)) {
+      reject("column \"" + hit->column + "\" does not exist", hit->pos, kUndefinedColumn);
+    }
+    if (!out) {
+      out.emplace();
+      for (const auto& e : s.group_by) out->push_back(clone(e));
+    }
+    (*out)[i] = group_key(*hit, g.pos);
+  }
+  return out;
 }
 
 auto parse(std::string_view sql) -> Statement {

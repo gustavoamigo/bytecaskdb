@@ -1726,6 +1726,90 @@ TEST_CASE("binder: GROUP BY, HAVING and the aggregates, as PostgreSQL binds them
   CHECK(rejected(cat, "SELECT a FROM g GROUP BY a + 1").first == "GROUP BY takes columns");
 }
 
+TEST_CASE("binder: a GROUP BY name is an input column first, else an output name (#904 G0)", "[sql][binder][group]") {
+  sql_test::Fixture f;
+  auto ddl = [&](std::string_view sql) { f.ddl(std::get<Ddl>(bind_sql(f.cat(), sql).stmt)); };
+  ddl("CREATE TABLE g0 (id BIGINT PRIMARY KEY, a INTEGER, b TEXT, c INTEGER)");
+  ddl("CREATE TABLE g1 (id BIGINT PRIMARY KEY, d INTEGER)");
+  ddl("CREATE VIEW gv AS SELECT a AS x, b FROM g0");
+  ddl("CREATE VIEW gk AS SELECT a AS k, count(*) AS n FROM g0 GROUP BY k");
+  const auto& cat = f.cat();
+  bound::Bound held;
+  auto keys = [&](std::string_view sql) -> std::vector<std::string> {
+    held = bind_sql(cat, sql);
+    const auto* agg = find<logical::Aggregate>(root(held));
+    REQUIRE(agg != nullptr);
+    std::vector<std::string> out;
+    for (const auto& g : agg->group_by) {
+      const auto* t = cat.table(g.col.table);
+      out.push_back(t == nullptr ? "?" : t->column(g.col.col)->name);
+    }
+    return out;
+  };
+  auto error_of = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what() + " @" + std::to_string(e.pos());
+    }
+    return "bound";
+  };
+  // An output name no input column has is its item; an input column wins
+  // (PostgreSQL 17 groups SELECT a AS id … GROUP BY id by the table's id).
+  CHECK(keys("SELECT a AS k, count(*) FROM g0 GROUP BY k") == std::vector<std::string>{"a"});
+  CHECK(keys("SELECT a AS id, count(*) FROM g0 GROUP BY id") == std::vector<std::string>{"id"});
+  CHECK(keys("SELECT a AS k, count(*) FROM g0 GROUP BY \"k\", 1") == std::vector<std::string>{"a"});
+  CHECK(keys("SELECT a AS k, g0.a AS k FROM g0 GROUP BY k") == std::vector<std::string>{"a"});
+  CHECK(keys("SELECT g0.a AS k, count(*) FROM g0 JOIN g1 ON g0.id = g1.id GROUP BY k") == std::vector<std::string>{"a"});
+  // An output name over a join's other column is still the input column.
+  CHECK(error_of("SELECT a AS d, count(*) FROM g0 JOIN g1 ON g0.id = g1.id GROUP BY d") ==
+        "42803 column \"g0.a\" must appear in the GROUP BY clause or be used in an aggregate function @7");
+  // In a subquery, and with ORDER BY and HAVING of the item.
+  (void)bind_sql(cat, "SELECT id FROM g1 WHERE d IN (SELECT a AS k FROM g0 GROUP BY k)");
+  (void)bind_sql(cat, "SELECT a AS k, count(*) FROM g0 GROUP BY k HAVING a > $1 ORDER BY k");
+  // Through a view: its columns are the input columns, before it is merged.
+  CHECK(keys("SELECT x AS k, count(*) FROM gv GROUP BY k") == std::vector<std::string>{"a"});
+  CHECK(keys("SELECT x, count(*) FROM gv GROUP BY 1") == std::vector<std::string>{"a"});
+  CHECK(error_of("SELECT x AS b, count(*) FROM gv GROUP BY b").starts_with("42803 "));
+  // A view's own GROUP BY of an output name.
+  CHECK(keys("SELECT k, n FROM gk") == std::vector<std::string>{"a"});
+  // PostgreSQL 17's errors, at its positions.
+  CHECK(error_of("SELECT a AS k, c AS k FROM g0 GROUP BY k") == "42702 GROUP BY \"k\" is ambiguous @39");
+  CHECK(error_of("SELECT count(*) AS k FROM g0 GROUP BY k") == "42803 aggregate functions are not allowed in GROUP BY @7");
+  CHECK(error_of("SELECT zz AS k FROM g0 GROUP BY k") == "42703 column \"zz\" does not exist @7");
+  CHECK(error_of("SELECT a AS \"K\" FROM g0 GROUP BY k") == "42703 column \"k\" does not exist @33");
+  CHECK(error_of("SELECT b AS k, a AS zz FROM g0 GROUP BY zz") ==
+        "42803 column \"g0.b\" must appear in the GROUP BY clause or be used in an aggregate function @7");
+  CHECK(error_of("SELECT a AS k FROM g0 GROUP BY k HAVING k > 1").starts_with("42703 "));
+  // An expression item is not a key yet (G1).
+  CHECK(error_of("SELECT a + 1 AS k FROM g0 GROUP BY k") == "42601 GROUP BY of an expression is not supported yet @35");
+  // A table's system columns are input columns PostgreSQL groups by: the
+  // layer has none, so the name is refused, never an output name.
+  CHECK(error_of("SELECT a AS ctid, count(*) FROM g0 GROUP BY ctid") == "42703 column \"ctid\" does not exist @44");
+  CHECK(error_of("SELECT a AS xmin, count(*) FROM g0 GROUP BY xmin").starts_with("42703 "));
+  CHECK(keys("SELECT x AS ctid, count(*) FROM gv GROUP BY ctid") == std::vector<std::string>{"a"});
+  // An unaliased item's name is PostgreSQL's FigureColname's.
+  CHECK(error_of("SELECT count(*) FROM g0 GROUP BY count") == "42803 aggregate functions are not allowed in GROUP BY @7");
+  CHECK(error_of("SELECT max(c) FROM g0 GROUP BY max") == "42803 aggregate functions are not allowed in GROUP BY @7");
+  CHECK(error_of("SELECT upper(b) FROM g0 GROUP BY upper") == "42601 GROUP BY of an expression is not supported yet @33");
+  CHECK(error_of("SELECT count(*) AS n FROM g0 GROUP BY count") == "42703 column \"count\" does not exist @38");
+  // A USING column is the merged one: the left side's of an inner or LEFT
+  // join, the right table's of a RIGHT join.
+  CHECK(keys("SELECT g0.id AS z, id AS z FROM g0 JOIN g1 USING (id) GROUP BY z") == std::vector<std::string>{"id"});
+  CHECK(error_of("SELECT g1.id AS z, id AS z FROM g0 JOIN g1 USING (id) GROUP BY z") == "42702 GROUP BY \"z\" is ambiguous @63");
+  CHECK(error_of("SELECT g1.id AS z, id AS z FROM g0 LEFT JOIN g1 USING (id) GROUP BY z").starts_with("42702 "));
+  CHECK(error_of("SELECT g0.id AS z, id AS z FROM g0 RIGHT JOIN g1 USING (id) GROUP BY z").starts_with("42702 "));
+  CHECK(error_of("SELECT g0.id AS z, id AS z FROM g0 RIGHT JOIN g1 USING (id) ORDER BY z").starts_with("42702 "));
+  CHECK(error_of("SELECT g1.id AS z, id AS z FROM g0 NATURAL JOIN g1 ORDER BY z").starts_with("42601 "));
+  (void)bind_sql(cat, "SELECT g1.id AS z, id AS z FROM g0 RIGHT JOIN g1 USING (id) ORDER BY z");
+  (void)bind_sql(cat, "SELECT g0.id AS z, id AS z FROM g0 NATURAL JOIN g1 ORDER BY z");
+  // A subquery's output name the query around it has as a column is still
+  // the subquery's item, not a correlation.
+  (void)bind_sql(cat, "SELECT id FROM g1 WHERE id IN (SELECT a AS d FROM g0 GROUP BY d)");
+  (void)bind_sql(cat, "SELECT id FROM g1 WHERE EXISTS (SELECT a AS d FROM g0 GROUP BY d)");
+  (void)bind_sql(cat, "SELECT id FROM g1 WHERE id IN (SELECT x AS d FROM gv GROUP BY d)");
+}
+
 TEST_CASE("binder: a chain of joins is a left-deep tree, each ON bound against the tables before it", "[sql][binder][join]") {
   sql_test::Fixture f;
   f.ddl(std::get<Ddl>(bind_sql(f.cat(), "CREATE TABLE u (k BIGINT PRIMARY KEY, qty BIGINT)").stmt));

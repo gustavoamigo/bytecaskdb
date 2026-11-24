@@ -7,8 +7,10 @@ differences from PostgreSQL in what SQL means. The planner is
 `planner_design.md`. The TPROC-C statements the layer runs are in
 `testing_design.md`, *The TPROC-C statements*. *Expressions in casts,
 GROUP BY, DISTINCT, SET and MIN/MAX of text (#904)* is approved (2026-11-22);
-its stages M1, `MIN` and `MAX` of text, and C0, the text input fixes, are
-built, the other stages not yet.
+its stages M1, `MIN` and `MAX` of text, C0, the text input fixes, C1,
+casts of expressions, S1, expressions in `SET`, and G0, `GROUP BY`
+positions and output names of column items, are built, the other stages
+not yet.
 
 ## Standing rules
 
@@ -274,7 +276,7 @@ kind the transformer doesn't take is refused with its position.
   which names its output column, as an unaliased column item's name names
   its own; an unqualified `ORDER BY name` that is such a name orders by that
   item (PostgreSQL looks at output names first there, at input columns first
-  in `GROUP BY`, which takes no output name here). The parser resolves the
+  in `GROUP BY`: *GROUP BY and HAVING*, below). The parser resolves the
   name to a copy of the item's expression, a column or any other
   (`resolve_output_names`, before positions are resolved, so `ORDER BY 1`
   names item 1 whatever another item is called): the output name hides any
@@ -701,8 +703,12 @@ and with a constant selected or `DISTINCT ON`, it is not taken yet.
 - `GROUP BY` takes a list of columns of the statement's tables, of any type.
   NULLs form one group, and a DOUBLE's `-0.0` and `0.0` one (its row shows
   the value of the group's first row, as PostgreSQL's hashed aggregate
-  does). No expressions, `GROUPING SETS`, `ROLLUP`, `CUBE` or `GROUP BY
-  DISTINCT`.
+  does). A key may be written as a select-list position (`GROUP BY 1`,
+  `(1)`) or an output name (`SELECT a AS k … GROUP BY k`) of an item that
+  is a column, by PostgreSQL 17's rule: a bare name is an input column
+  first, an output name only where no `FROM` relation has a column of it
+  (*GROUP BY of an expression*, #904 stage G0, **As built (G0)**). No
+  expressions, `GROUPING SETS`, `ROLLUP`, `CUBE` or `GROUP BY DISTINCT`.
 - A column the select list, `ORDER BY` or `HAVING` names must be grouped,
   or of a table whose whole primary key is grouped: PostgreSQL's
   functional dependency. Every row of a group holds the same value of such
@@ -1262,7 +1268,12 @@ That includes:
   more than 32 tables (0A000, *Known differences*), a `RIGHT JOIN` of a join that has an outer join,
   an outer join in parentheses or of a join in parentheses, `USING` or `NATURAL` in
   parentheses or after a comma,
-  `FOR UPDATE` of a join (#697), an alias of a join, an output name in `GROUP BY`;
+  `FOR UPDATE` of a join (#697), an alias of a join, a `GROUP BY` position
+  or output name of an expression item (#904 stage G1), a `GROUP BY`
+  position with `*` in the select list, and an output name (`GROUP BY` or
+  `ORDER BY`) of both a qualified column and an unqualified one under a
+  `NATURAL` join, but where the qualifier is the first `FROM` item and no
+  join is `RIGHT` or `FULL`;
 - `RETURNING` in a procedure; `VALUES` outside `INSERT`; `OFFSET` on a set operation, in one of
   its arms or in a view;
 - `ON CONFLICT ON CONSTRAINT`, a `WHERE`, an
@@ -2289,7 +2300,9 @@ stage C0, the text input fixes (*Casts of an expression*, **Integer input,
 constants included**, its as-built notes), and stage C1, casts of any
 expression (*Casts of an expression*, **As built (C1)**), and stage S1,
 expressions in `UPDATE … SET` (*Expressions in UPDATE … SET (#896)*,
-**As built (S1)**); the other stages are not yet. It covers the six gaps #904 lists,
+**As built (S1)**), and stage G0, `GROUP BY` positions and output names
+of column items (*GROUP BY of an expression*, **As built (G0)**); the
+other stages are not yet. It covers the six gaps #904 lists,
 found while building jsonb stage 3: a cast of an expression, `GROUP BY`
 of an expression, `SELECT DISTINCT` and `COUNT(DISTINCT …)` of an
 expression, an expression in `UPDATE … SET` (#896), `MIN`/`MAX` of text,
@@ -2567,6 +2580,63 @@ case run):
   in GROUP BY`, at it.
 - Duplicate keys (`GROUP BY a, a+1, (a)` keeps `a` and `a+1`) are kept once
   each, as PG's `addTargetToGroupList` keeps them.
+
+**As built (G0).** Positions and output names of **column** items; the
+keys stay columns, so nothing below the binder changed.
+- The parser reads a position (`group_items`, `sql/parser.cppm`): only an
+  integer constant of 32 bits is one (libpg_query's `Integer`, as PG's
+  `IsA(Integer)`); NULL, a boolean, a string, a numeric and an integer past
+  32 bits are 42601 `non-integer constant in GROUP BY`. It copies the item
+  before `resolve_aliases`, so the copy is requalified as the item is.
+- The binder resolves a bare name that names no input column
+  (`ast::group_output_names`, the input columns from the catalog by
+  `input_column`, `sql/binder.cppm`): in `ViewExpander::expand`, against a
+  view's columns before the view is merged away, and at the start of
+  `Binder::select` for a query that reads no view. A view's own `GROUP BY`
+  is resolved when its body is expanded, before a query merges it.
+  `ORDER BY`'s `resolve_output_names` and this share `output_item` (its
+  42702 and its preference for a qualified item).
+- A table's input columns include PG's system columns (`ctid`, `xmin`,
+  `xmax`, `cmin`, `cmax`, `tableoid`), as PG's `colNameToVar` finds them:
+  `SELECT a AS ctid … GROUP BY ctid` names the system column, which the
+  layer has none of, so it stays 42703 `column "ctid" does not exist`
+  (PG 17 groups by it and reports 42803 for `a`), never the item `a`. A
+  view or derived relation has none.
+- An unaliased item's output name is PG 17's FigureColname
+  (`Binder::figure_colname`): `SELECT count(*) … GROUP BY count` is 42803,
+  `SELECT upper(b) … GROUP BY upper` 42601 until G1, as PG names them; a
+  scalar subquery item is named by its column. `ORDER BY` still matches
+  only an `AS` name or an unaliased column (unchanged here).
+- Two items of a name, an unqualified column and a qualified one, are one
+  item only where PG 17's two references are one column
+  (`unqualified_is`, `sql/parser.cppm`): a `USING` column is the merged
+  one, the left side's of an inner or `LEFT` join and the right table's of
+  a `RIGHT` join, neither's of a `FULL` join, so `SELECT s.id AS z, id AS
+  z FROM r JOIN s USING (id) GROUP BY z` is 42702 as PG's. This also fixes
+  `ORDER BY` of such a name, which returned rows where PG 17 reports 42702.
+  Under a `NATURAL` join the parser cannot tell which columns merge: an
+  unqualified and a qualified item of one name are one where the qualifier
+  is the first `FROM` item and no join is `RIGHT` or `FULL`, and otherwise
+  refused, 42601 `an output name of both a qualified column and an
+  unqualified one in a query of a NATURAL join is not supported yet`.
+- A subquery's `GROUP BY` output names are resolved before the binder looks
+  for correlation (`Binder::subquery`, `refuse_correlated`): PG 17 reads
+  only the subquery's own `FROM` for input columns, so `… WHERE id IN
+  (SELECT a AS c FROM t GROUP BY c)` groups by `a` even where the outer
+  query has a column `c`.
+- A position or name naming an item that holds an aggregate is 42803
+  `aggregate functions are not allowed in GROUP BY`, at the aggregate, as
+  PG 17; one naming any other expression item (`SELECT a + 1 … GROUP BY
+  1`, a constant item `SELECT 1, count(*) … GROUP BY 1`) is 42601 `GROUP BY
+  of an expression is not supported yet`, at the position or name, until
+  G1. An expression written in `GROUP BY` keeps its message, `GROUP BY
+  takes columns`.
+- Departures from the design: a position with `*` in the select list is
+  42601 `GROUP BY position with * in the select list is not supported yet`,
+  as `ORDER BY`'s (PG 17 runs `SELECT * … GROUP BY 1`). An output name
+  whose item is an unqualified column no relation has is 42703 `column
+  "zz" does not exist` at the item, where PG 17 reports it while binding
+  the select list, before `GROUP BY`: same SQLSTATE, message and position.
 
 **Matching the select list, ORDER BY and HAVING to the keys.** PG 17
 walks each select item, `HAVING` conjunct and `ORDER BY` key top-down: a
@@ -3132,7 +3202,7 @@ tests.
 | C0 (built) | input fixes shared by constants, parameters and (later) casts: `integer_from` (`0x`, `0o`, `0b`, `_`, the value in its 22003), `float_from`'s `real` (`strtof`, its message), `decimal_from`'s `'Infinity'`; the `ARRAY[ARRAY]` message | `'0x1F'::int`, a hex integer parameter | ~300 lines: text 90, binder 10, tests 170, docs 30 |
 | C1 (built) | casts of expressions: `cast_kind`, the `Cast` kind replacing `JsonbCast`, the plan API's cast helpers, cast naming; casts in procedure expressions | `WHERE (Props->>'x')::bigint > $1`, `ORDER BY (Props->>'n')::int`, `sum((Props->>'n')::int)`, `$1::text::int` | ~1,150 lines: binder 190, physical 50, codegen 150, plan API 330, tests 370, docs 60 |
 | S1 (built) | expressions in `SET` with the assignment table, the store shared with `INSERT … SELECT` (closes #824), column-order evaluation, `$n::T` of another type; needs C1's output and rounding helpers | `UPDATE … SET Message = lower(Message)`, `SET n = (Props->>'n')::int`, `SET s = Props->>'k'`, `SET flag = CASE … END`; with jsonb stage 4, `SET Props = jsonb_set(Props, $2, $3)` | ~950 lines: binder 240, physical 60, codegen 130, tests 440, docs 80 |
-| G0 | `GROUP BY` positions and output names over **column** items (the input-column-first rule, 42P10, 42702, 42601 for a non-integer constant); binder only, keys stay columns; a position naming an expression item stays 42601 until G1 | `SELECT UserId, count(*) … GROUP BY 1` | ~350 lines: parser 60, binder 110, tests 160, docs 20 |
+| G0 (built) | `GROUP BY` positions and output names over **column** items (the input-column-first rule, 42P10, 42702, 42601 for a non-integer constant); binder only, keys stay columns; a position naming an expression item stays 42601 until G1 | `SELECT UserId, count(*) … GROUP BY 1` | ~350 lines: parser 60, binder 110, tests 160, docs 20 |
 | G1 | `GROUP BY` of expressions (positions naming one included), keys the same for every row; `SELECT DISTINCT` of expressions; `same_expr` extended; the grouped resolver's exact-key case; `GroupKey`; expression keys in the structure, never streamed | `SELECT Props->>'k', count(*) … GROUP BY 1`, `SELECT DISTINCT Props->>'type'` | ~1,050 lines: binder 190, logical 30, search 140, physical 80, codegen 180, tests 390, docs 40 |
 | G2 | `COUNT`, `SUM`, `AVG` of `DISTINCT` values of an expression: `GroupLayout::distinct` as an `Expr`, the evaluated value appended as a key part, the one-row Aggregate's fold (`codegen.cppm:2271`) keying an expression by its value | `count(DISTINCT Props->>'user_id')` | ~550 lines: binder 40, physical 60, codegen 150, tests 260, docs 40 |
 

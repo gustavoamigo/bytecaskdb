@@ -11,6 +11,7 @@
 
 module;
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cctype>
 #include <cmath>
@@ -2474,6 +2475,11 @@ void params_used(const ast::Compare& c, std::set<std::uint32_t>& out) {
   }
 }
 
+// s with its GROUP BY output names resolved (ast::group_output_names);
+// nullopt where it has none. Defined after Binder, whose figure_colname
+// names an unaliased item.
+auto group_names_resolved(const ast::Select& s, const Catalog& cat) -> std::optional<ast::Select>;
+
 auto select_param_count(const ast::Select& s) -> std::uint32_t {
   if (s.set) return std::max(select_param_count(s.set->left), select_param_count(s.set->right));
   std::uint32_t n = 0;
@@ -2870,9 +2876,14 @@ public:
     SqlType type;
     std::string name;
   };
-  auto subquery(const ast::Select& q, logical::Subquery::Kind kind, std::int32_t pos) -> BoundSubquery {
+  auto subquery(const ast::Select& written, logical::Subquery::Kind kind, std::int32_t pos) -> BoundSubquery {
     if (depth_ > 0) not_yet("a subquery inside a subquery", pos);
-    if (q.for_update) not_yet("FOR UPDATE in a subquery", pos);
+    if (written.for_update) not_yet("FOR UPDATE in a subquery", pos);
+    // A GROUP BY output name is the subquery's item, never a column of the
+    // query around it (PostgreSQL reads only the subquery's own FROM for
+    // its input columns): resolved before correlation is looked for.
+    auto resolved = group_names_resolved(written, cat_);
+    const auto& q = resolved ? *resolved : written;
     if (correlated(q)) correlation(q, kind, pos);
     auto joins = std::move(joins_);
     auto scope = std::move(scope_);
@@ -5602,6 +5613,11 @@ public:
       if (assign) not_supported("INSERT … SELECT of a set operation (UNION, INTERSECT, EXCEPT)", s.pos);
       return set_operation(s);
     }
+    // GROUP BY k naming no input column: the item named k (PostgreSQL's rule).
+    if (auto resolved = group_names_resolved(s, cat_)) {
+      assign_ = std::move(assign);
+      return select(*resolved);
+    }
     if (s.from.empty()) return select_without_from(s, assign);
     if (std::ranges::any_of(s.from, [](const ast::FromItem& f) { return f.kind == ast::JoinKind::Full; })) {
       return full_join(s, assign.has_value());
@@ -6874,6 +6890,65 @@ auto view_definition(const View& v, const Catalog& cat) -> ast::CreateView {
 // its subqueries' and a derived relation's among them, is of_view. A
 // subquery shared by two places (an ORDER BY key written as a select item)
 // stays one, so the binder still finds them alike.
+// Whether `name` is a column of one of s's FROM items, as PostgreSQL 17
+// finds a GROUP BY name an input column before it looks at the select
+// list: a table's visible column or a view's, under the names the item's
+// alias gives the first of them, or a derived relation's; of a table, also
+// PostgreSQL's system columns, which the layer has none of, so binding
+// refuses the name (42703), never takes it for an output name. An item that
+// names no relation counts as having it: binding the query reports that.
+constexpr std::array<std::string_view, 6> kSystemColumns{"ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"};
+
+auto input_column(const ast::Select& s, const std::string& name, const Catalog& cat) -> bool {
+  auto renamed = [&](const ast::FromItem& item, const std::vector<std::string>& columns) {
+    if (std::ranges::contains(item.column_aliases, name)) return true;
+    for (std::size_t i = item.column_aliases.size(); i < columns.size(); ++i) {
+      if (columns[i] == name) return true;
+    }
+    return false;
+  };
+  for (const auto& item : s.from) {
+    if (item.derived) {
+      if (std::ranges::contains(item.column_aliases, name)) return true;
+      continue;
+    }
+    auto relation = lookup_name(item.table, cat);
+    if (const auto* t = cat.table(relation)) {
+      if (std::ranges::contains(kSystemColumns, name)) return true;
+      std::vector<std::string> columns;
+      for (const auto& c : t->columns) {
+        if (!c.hidden) columns.push_back(c.name);
+      }
+      if (renamed(item, columns)) return true;
+    } else if (const auto* v = cat.view(relation)) {
+      if (renamed(item, v->columns)) return true;
+    } else {
+      return true;
+    }
+  }
+  return false;
+}
+
+// An unaliased select item's output name, PostgreSQL 17's FigureColname: a
+// scalar subquery's is its column's.
+auto implicit_name(const ast::Expr& e) -> std::string {
+  if (e.kind == ast::Expr::Kind::Subquery) {
+    const auto& q = *e.subquery;
+    if (q.set || q.targets.size() != 1 || q.targets[0].kind == ast::Expr::Kind::Star) return "?column?";
+    return q.targets[0].alias.empty() ? implicit_name(q.targets[0]) : q.targets[0].alias;
+  }
+  return Binder::figure_colname(e).first;
+}
+
+auto group_names_resolved(const ast::Select& s, const Catalog& cat) -> std::optional<ast::Select> {
+  if (s.set) return std::nullopt;
+  auto keys = ast::group_output_names(s, [&](const std::string& name) { return input_column(s, name, cat); }, implicit_name);
+  if (!keys) return std::nullopt;
+  auto out = ast::clone(s);
+  out.group_by = std::move(*keys);
+  return out;
+}
+
 class ViewMarker {
 public:
   void select(ast::Select& s) {
@@ -7383,7 +7458,9 @@ private:
       for (const auto& a : c.args) compare(a);
     };
     for (const auto& e : q.targets) expr(e);
-    for (const auto& e : q.group_by) expr(e);
+    // A GROUP BY output name is q's item, read above, not an outer column.
+    auto resolved = group_names_resolved(q, cat_);
+    for (const auto& e : resolved ? resolved->group_by : q.group_by) expr(e);
     for (const auto& o : q.order_by) expr(o.expr);
     for (const auto& c : q.where) compare(c);
     for (const auto& c : q.having) compare(c);
@@ -7472,6 +7549,8 @@ private:
       if (inner) q = std::make_shared<const ast::Select>(expand(*q));
     };
     each_subquery(s, expand_slot);
+    // Resolved against the views' columns, before they are merged away.
+    if (auto resolved = group_names_resolved(s, cat_)) s.group_by = std::move(resolved->group_by);
     if (views == 0) return s;
     if (std::ranges::any_of(s.from, [](const ast::FromItem& item) { return !item.alias.empty(); })) {
       not_yet("a view in a query that names a table twice", s.from[0].pos);
