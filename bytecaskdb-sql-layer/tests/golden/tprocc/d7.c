@@ -20,10 +20,20 @@ void plan(bc_ctx *cx) {
     return;
   }
   bc_row r = bc_row_from(cx, TBL_8, old);
-  if (bc_col_null(cx, old, COL_8_16) || bc_param_null(cx, 0)) {
+  int64_t v0 = 0;
+  bool n0 = bc_col_null(cx, old, COL_8_16) || bc_param_null(cx, 0);
+  if (!n0) {
+    v0 = bc_add(cx, bc_col_i64(cx, old, COL_8_16), bc_param_i64(cx, 0));
+  }
+  int64_t v1 = 0;
+  bool n1 = n0;
+  if (!n1) {
+    v1 = bc_decimal_rescale(cx, v0, 2, BC_TYPE_DECIMAL, 12, 2, TBL_8);
+  }
+  if (n1) {
     bc_row_set_null(cx, r, COL_8_16);
   } else {
-    bc_row_set_i64(cx, r, COL_8_16, bc_add(cx, bc_col_i64(cx, old, COL_8_16), bc_param_i64(cx, 0)));
+    bc_row_set_i64(cx, r, COL_8_16, v1);
   }
   bc_update(cx, TBL_8, old, bc_row_end(cx, r));
   bc_emit_count(cx, 1);

@@ -677,23 +677,24 @@ namespace {
 
 [[noreturn]] void broken(const std::string& rule) { throw std::logic_error{"physical plan: " + rule}; }
 
-// Whether INSERT … SELECT writes a value of type `from` into a column
-// declared `to` as codegen prints it: held as the column is, at its scale,
-// and of its kind or family (integers; TEXT, VARCHAR and NAME), a CHAR(n) only
-// from its own type; or a float or an integer into a float, which codegen
-// converts. The binder's assigns_to takes no pair outside these.
+// Whether a value of type `from` is stored into a column declared `to` as
+// it is, as SET and INSERT … SELECT store it (codegen's one store): of its
+// own type, or of its family, which the row builder range- or
+// length-checks (an integer into another integer; a string into TEXT,
+// VARCHAR(n), NAME or CHAR(n), but a CHAR(n)'s only into a CHAR). Every
+// other assignment the binder (Binder::assignment) makes a cast, whose
+// type is the column's.
 auto assigns(SqlType from, SqlType to) -> bool {
-  auto is_float = [](SqlType t) { return t.kind == SqlKind::Real || t.kind == SqlKind::Double; };
   auto family = [](SqlKind k) {
     if (k == SqlKind::SmallInt || k == SqlKind::Integer || k == SqlKind::BigInt) return 1;
-    if (k == SqlKind::Text || k == SqlKind::Varchar || k == SqlKind::Name) return 2;  // a NAME is cut as it is stored
+    if (k == SqlKind::Text || k == SqlKind::Varchar || k == SqlKind::Name || k == SqlKind::Char) return 2;
     return 0;
   };
-  if (from.kind == SqlKind::Numeric || to.kind == SqlKind::Numeric) return from.kind == to.kind;  // its text, carried
-  if (is_float(to)) return is_float(from) || family(from.kind) == 1;
-  if (to.kind == SqlKind::Char) return from == to;
-  if (phys_type(from) != phys_type(to) || decimal_scale(from) != decimal_scale(to)) return false;
-  return from.kind == to.kind || (family(from.kind) != 0 && family(from.kind) == family(to.kind));
+  if (from == to) return true;
+  if (from.kind == SqlKind::Char) return to.kind == SqlKind::Char;
+  if (from.kind == SqlKind::Decimal || to.kind == SqlKind::Decimal) return false;  // a DECIMAL(p, s) is cast to its own
+  if (from.kind == to.kind) return phys_type(from) == phys_type(to);
+  return family(from.kind) != 0 && family(from.kind) == family(to.kind);
 }
 
 // A SELECT without FROM's plan, Emit over OneRow under its LIMIT: the one
@@ -855,17 +856,24 @@ private:
     params(a.args[0]);
   }
 
-  // An UPDATE's SET list, or ON CONFLICT DO UPDATE's: a column from a
-  // parameter, a column of its type, or an integer column ± a parameter or
-  // a constant.
-  void set_list(const std::vector<std::pair<ColumnRef, Expr>>& set) const {
+  // An UPDATE's SET list, or ON CONFLICT DO UPDATE's: each column of
+  // `table` once (the binder orders them by column), from a value over
+  // `table`'s columns alone (the row as read), held as the column is.
+  void set_list(std::uint32_t table, const std::vector<std::pair<ColumnRef, Expr>>& set) const {
     if (set.empty()) broken("an update that sets no column");
-    for (const auto& [col, e] : set) {
+    for (std::size_t i = 0; i < set.size(); ++i) {
+      const auto& [col, e] = set[i];
+      if (col.table != table) broken("an update of a column of another table");
+      if (std::ranges::any_of(set.begin(), set.begin() + static_cast<std::ptrdiff_t>(i), [&](const auto& x) { return x.first == col; })) {
+        broken("an update that sets a column twice");
+      }
+      if (phys_type(e.type) != col.type) broken("a column set from a value held as another type");
+      value(e);
       params(e);
-      if (e.kind == Expr::Kind::Column && e.col.type != col.type) broken("a column set from a column of another type");
-      if ((e.kind == Expr::Kind::Add || e.kind == Expr::Kind::Sub) &&
-          (e.args[0].kind != Expr::Kind::Column || e.args[0].col.type != PhysType::I64 || col.type != PhysType::I64)) {
-        broken("column + or - parameter on a type other than an integer");
+      std::vector<ColumnRef> cols;
+      logical::columns_of(e, cols);
+      if (std::ranges::any_of(cols, [&](const ColumnRef& c) { return c.table != table; })) {
+        broken("a SET value over a column of another table than the one written");
       }
     }
   }
@@ -1816,7 +1824,7 @@ private:
             if (!op.update.empty()) {
               if (!op.arbiter) broken("an insert's update with no arbiter");
               if (op.update.size() != op.rows.size()) broken("an insert's update lists not one per row");
-              for (const auto& set : op.update) set_list(set);
+              for (const auto& set : op.update) set_list(op.table, set);
             }
           } else if constexpr (std::is_same_v<T, InsertFrom>) {
             if (parent != nullptr) broken("an insert of a query's rows under another operator");
@@ -1853,7 +1861,7 @@ private:
           } else if constexpr (std::is_same_v<T, Update>) {
             returned(op.table, op.returning);
             for (const auto& c : op.checks) params(c);
-            set_list(op.set);
+            set_list(op.table, op.set);
             node(*op.input, &n);
           } else if constexpr (std::is_same_v<T, Delete>) {
             returned(op.table, op.returning);

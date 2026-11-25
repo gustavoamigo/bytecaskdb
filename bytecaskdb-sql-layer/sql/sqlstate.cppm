@@ -54,6 +54,7 @@ inline constexpr SqlState kDuplicateObject{"42710"};
 inline constexpr SqlState kAmbiguousColumn{"42702"};
 inline constexpr SqlState kDuplicateAlias{"42712"};
 inline constexpr SqlState kIndeterminateDatatype{"42P18"};
+inline constexpr SqlState kAmbiguousParameter{"42P08"};  // inconsistent types deduced for a $n
 inline constexpr SqlState kWrongObjectType{"42809"};
 inline constexpr SqlState kInvalidColumnReference{"42P10"};
 inline constexpr SqlState kInvalidForeignKey{"42830"};
@@ -118,7 +119,7 @@ inline constexpr SqlState kArraySubscriptError{"2202E"};
 [[nodiscard]] constexpr auto known_sqlstate(std::string_view code) noexcept -> std::optional<SqlState> {
   for (auto s : {kSyntaxError, kFeatureNotSupported, kNumericValueOutOfRange, kDivisionByZero, kNotNullViolation, kGroupingError,
                  kDatatypeMismatch, kUndefinedFunction, kAmbiguousFunction, kUndefinedColumn, kUndefinedTable, kUndefinedObject,
-                 kDuplicateColumn, kDuplicateTable, kDuplicateObject, kAmbiguousColumn, kDuplicateAlias, kIndeterminateDatatype, kWrongObjectType, kInvalidColumnReference, kInvalidForeignKey, kDependentObjectsStillExist, kUndefinedParameter, kDuplicateFunction, kInvalidFunctionDefinition, kNullValueNotAllowed, kNoDataFound, kTooManyRows,
+                 kDuplicateColumn, kDuplicateTable, kDuplicateObject, kAmbiguousColumn, kDuplicateAlias, kIndeterminateDatatype, kAmbiguousParameter, kWrongObjectType, kInvalidColumnReference, kInvalidForeignKey, kDependentObjectsStillExist, kUndefinedParameter, kDuplicateFunction, kInvalidFunctionDefinition, kNullValueNotAllowed, kNoDataFound, kTooManyRows,
                  kInvalidTextRepresentation, kStringDataRightTruncation, kInvalidDatetimeFormat,
                  kDatetimeFieldOverflow, kInvalidTimeZoneDisplacement, kCharacterNotInRepertoire, kInvalidParameterValue, kInvalidEscapeSequence, kSubstringError, kCannotCoerce,
                  kInvalidRowCountInLimit, kInvalidRowCountInOffset, kReservedName, kInvalidGrantOperation,

@@ -534,31 +534,6 @@ auto param_default(const Column& c) -> Datum {
   return Bytes(t.begin(), t.end());
 }
 
-// An integer or DECIMAL column: one whose arithmetic is exact in int64_t.
-auto exact_number(const Column& c) -> bool {
-  switch (c.sql.kind) {
-    case SqlKind::SmallInt:
-    case SqlKind::Integer:
-    case SqlKind::BigInt:
-    case SqlKind::Decimal: return true;
-    case SqlKind::Real:
-    case SqlKind::Double:
-    case SqlKind::Boolean:
-    case SqlKind::Bytea:
-    case SqlKind::Text:
-    case SqlKind::Varchar:
-    case SqlKind::Char:
-    case SqlKind::Name:
-    case SqlKind::Timestamp:
-    case SqlKind::TimestampTz:
-    case SqlKind::Date:
-    case SqlKind::Time:
-    case SqlKind::TimeTz:
-    case SqlKind::Numeric:  // its text: no int64_t arithmetic
-    case SqlKind::Jsonb: return false;
-  }
-  return false;
-}
 
 // ------------------------------------------------------------- constants
 
@@ -1137,6 +1112,13 @@ auto range_state(const std::string& why) -> SqlState {
 
 // A range check's message as a SqlError, with its SQLSTATE.
 [[noreturn]] void out_of_type(const std::string& why, std::int32_t pos) { throw SqlError{why, pos, range_state(why)}; }
+
+// A value's range check against its column's type `t`: a DECIMAL(p, s)'s
+// with numeric's DETAIL, as PostgreSQL's assignment gives it.
+[[noreturn]] void out_of_type(const std::string& why, std::int32_t pos, SqlType t) {
+  if (t.kind != SqlKind::Decimal) out_of_type(why, pos);
+  throw SqlError{why, pos, range_state(why)}.with_notes(decimal_overflow_detail(t), "");
+}
 
 auto is_number(SqlType t) -> bool { return is_integer(t) || t.kind == SqlKind::Decimal; }
 auto is_float(SqlType t) -> bool { return t.kind == SqlKind::Real || t.kind == SqlKind::Double; }
@@ -2323,7 +2305,10 @@ auto coerce_value(const Constant& k, const Column& c, bool assigned, std::string
   if (k.type.kind == SqlKind::Boolean) {
     auto b = std::get<bool>(k.value);
     if (c.sql.kind == SqlKind::Boolean) return b;
-    return bytes_of(b ? "true" : "false");  // assigned to a string: its text
+    // Assigned to a string: its text, boolout's into a NAME (which has no
+    // cast from boolean, so is assigned through its output), as PostgreSQL.
+    if (c.sql.kind == SqlKind::Name) return bytes_of(b ? "t" : "f");
+    return bytes_of(b ? "true" : "false");
   }
   // A cast's: a string, bytes, a date or time, or a float.
   if (!is_number(k.type)) {
@@ -2349,8 +2334,14 @@ auto coerce_value(const Constant& k, const Column& c, bool assigned, std::string
       }
     }
     if (assigned && holds_string(c.sql) && !is_float(k.type)) return bytes_of(to_text(k.value, k.type));
-    not_yet("a " + pg_type_name(k.type) + " constant " + (assigned ? "assigned to " : "compared with ") + "a " +
-                pg_type_name(c.sql) + " column",
+    // Any other assignment PostgreSQL has (a float into an integer, a
+    // DECIMAL or a REAL, a timestamp into a date): the cast folded, as
+    // PostgreSQL's planner folds it, by the cast a value computed per row
+    // takes (fold_cast), so a constant and a column's value agree.
+    if (assigned && !holds_string(c.sql) && cast_kind(k.type, c.sql) != CastKind::None) return fold_cast(k, c.sql, k.pos).value;
+    const auto column = pg_type_name(c.sql);
+    not_yet("a " + pg_type_name(k.type) + " constant " + (assigned ? "assigned to " : "compared with ") +
+                (column.find_first_of("aeiou") == 0 ? "an " : "a ") + column + " column",
             k.pos);
   }
   auto [v, scale] = scaled(k);
@@ -2454,6 +2445,33 @@ void params_in(const ast::Compare& c, std::uint32_t& n) {
   if (c.subquery) n = std::max(n, select_param_count(*c.subquery));
   if (c.escape_param) n = std::max(n, *c.escape_param + 1);
   for (const auto& a : c.args) params_in(a, n);
+}
+
+// The parameters e names, zero-based, and every one below the largest a
+// subquery in it names (params_in).
+void params_used(const ast::Expr& e, std::set<std::uint32_t>& out) {
+  if (e.kind == ast::Expr::Kind::Param) out.insert(e.param);
+  if (e.subquery) {
+    for (std::uint32_t i = 0; i < select_param_count(*e.subquery); ++i) out.insert(i);
+  }
+  if (e.lhs) params_used(*e.lhs, out);
+  if (e.rhs) params_used(*e.rhs, out);
+  for (const auto& a : e.args) params_used(a, out);
+}
+
+void params_used(const ast::Compare& c, std::set<std::uint32_t>& out) {
+  std::uint32_t n = 0;
+  params_in(c, n);
+  // A conjunct's operands as params_in walks them; a subquery's, ESCAPE's
+  // or a nested conjunct's every one up to its largest.
+  if (c.kind == ast::Compare::Kind::Compare || c.kind == ast::Compare::Kind::IsNull || c.kind == ast::Compare::Kind::Value ||
+      c.kind == ast::Compare::Kind::Quantified || c.kind == ast::Compare::Kind::Like) {
+    params_used(c.lhs, out);
+    if (c.kind != ast::Compare::Kind::IsNull && c.kind != ast::Compare::Kind::Value) params_used(c.rhs, out);
+  }
+  if (c.subquery || c.escape_param || !c.args.empty()) {
+    for (std::uint32_t i = 0; i < n; ++i) out.insert(i);
+  }
 }
 
 auto select_param_count(const ast::Select& s) -> std::uint32_t {
@@ -2734,7 +2752,7 @@ public:
     for (std::size_t i = 0; i < types.size(); ++i) {
       const auto& col = typed_params_.emplace_back(
           Column{0, "$" + std::to_string(i + 1), types[i], phys_type(types[i]), true, std::monostate{}});
-      params_[i].first = ParamUse::FirstUse{phys_type(types[i]), &col, Use::Compared};
+      params_[i].first = ParamUse::FirstUse{phys_type(types[i]), &col, Use::Compared, false, -1};
     }
     fixed_params_ = types.size();
   }
@@ -2817,6 +2835,27 @@ public:
     return out;
   }
   void set_scope(std::vector<const Table*> tables) { scope_ = std::move(tables); }
+
+  // The items of one list of assigned values, an UPDATE's or ON CONFLICT's
+  // SET or a row of VALUES, are bound between begin_list and end_list:
+  // the scope of PostgreSQL's 42P08 (inconsistent_param). `typed_before`:
+  // the parameters PostgreSQL types before it analyses the list.
+  // `value` gives an item's expression.
+  template <typename Items, typename Value>
+  void begin_list(const Items& items, Value value, std::set<std::uint32_t> typed_before) {
+    list_ = ++lists_;
+    list_deducing_.clear();
+    for (const auto& item : items) {
+      const ast::Expr& e = value(item);
+      if (e.kind != ast::Expr::Kind::Param) params_used(e, list_deducing_);
+    }
+    typed_before_ = std::move(typed_before);
+  }
+  void end_list() {
+    list_ = 0;
+    list_deducing_.clear();
+    typed_before_.clear();
+  }
 
   // A subquery's SELECT, bound as any is, then listed to run before the
   // statement's plan (logical::Subquery), its values in hidden parameters
@@ -3170,9 +3209,9 @@ public:
   }
 
   // How a statement uses a parameter: compared with a column (WHERE or a
-  // select list), assigned to one (INSERT, SET), the operand of col + $n or
-  // col - $n, or an operand of another operator in a select list.
-  enum class Use { Compared, Assigned, Added, Subtracted, Operand };
+  // select list), assigned to one (INSERT, SET), or an operand of another
+  // operator (a select list, a SET value).
+  enum class Use { Compared, Assigned, Operand };
 
   // ------------------------------------------------------ expressions over columns
 
@@ -3703,7 +3742,13 @@ public:
   void rescalable(const logical::Expr& x, const logical::Expr& y, std::uint8_t scale, std::int32_t pos) const {
     for (const auto* t : {&x, &y}) {
       auto up = scale - decimal_scale(t->type);
-      if (up > 0 && digits_of(*t) + up > static_cast<int>(kMaxDecimalPrecision)) not_yet("a numeric of more than 18 digits", pos);
+      if (up <= 0 || digits_of(*t) + up <= static_cast<int>(kMaxDecimalPrecision)) continue;
+      // In SET, a constant past DECIMAL's 18 digits at the sum's scale
+      // overflows whatever the column holds (CONTRACT.md's exclusion).
+      if (in_set_ && t->kind == logical::Expr::Kind::Param && is_fixed(t->param)) {
+        throw SqlError{"numeric field overflow", pos, kNumericValueOutOfRange};
+      }
+      not_yet("a numeric of more than 18 digits", pos);
     }
   }
 
@@ -3921,9 +3966,11 @@ public:
     for (const auto* x : {&l, &r}) {
       if (is_float(x->type)) not_yet("arithmetic of REAL and DOUBLE PRECISION", e.pos);
       if (!is_number(x->type)) {
-        throw SqlError{"operator does not exist: " + pg_type_name(l.type) + " " + std::string{arith_text(op)} + " " +
-                           pg_type_name(r.type),
-                       e.pos, kUndefinedFunction};
+        // An untyped operand ($n, an unknown literal) is PostgreSQL's unknown.
+        auto side = [&](const ast::Expr& a, const logical::Expr& v) { return untyped(a) ? std::string{"unknown"} : pg_type_name(v.type); };
+        throw SqlError{"operator does not exist: " + side(*e.lhs, l) + " " + std::string{arith_text(op)} + " " + side(*e.rhs, r),
+                       e.pos, kUndefinedFunction}
+            .with_notes("", "No operator matches the given name and argument types. You might need to add explicit type casts.");
       }
     }
     auto type = arith_type(op, l.type, r.type);
@@ -4246,8 +4293,11 @@ public:
   // number itself. A compared or operand $n is range-checked before the plan
   // runs (param_sql): against its column's type without the modifier, and a
   // DECIMAL operand against 18 digits at its scale, so a sum stays inside
-  // int64; one only assigned is checked by the row builder.
-  void use_param(std::uint32_t n, PhysType t, std::int32_t pos, const Column& col, std::uint32_t table, Use use) {
+  // int64; one only assigned is checked by the row builder. `bare`: the $n
+  // is a whole item of an assignment list (AssignmentList), not inside an
+  // expression or a cast.
+  void use_param(std::uint32_t n, PhysType t, std::int32_t pos, const Column& col, std::uint32_t table, Use use,
+                 bool bare = false) {
     // A CHAR(n) compares without its trailing spaces: a parameter would need
     // them cut at run time, as a constant is cut here.
     if (col.sql.kind == SqlKind::Char && use != Use::Assigned) not_yet("a parameter compared with a CHAR(n) column", pos);
@@ -4275,13 +4325,15 @@ public:
       }
     }
     // PostgreSQL's code only for two comparisons. It types a $n by its first
-    // use, which for UPDATE is a WHERE before the SET the layer binds first,
-    // and refuses two assignments of one $n whatever their types (42P08):
+    // use, which for UPDATE is a WHERE before the SET the layer binds first:
     // any other pair is its answer to a different statement, so 42601.
     auto clash = [&] {
       if (!p.first || p.first->use != Use::Compared || use != Use::Compared) return kSyntaxError;
       return type_refusal(p.first->col->sql.kind, col.sql.kind, false).value_or(kSyntaxError);
     };
+    if (p.first && (p.first->phys != t || compared_type(p.first->col->sql).identity != compared_type(col.sql).identity)) {
+      if (auto e = inconsistent_param(n, p, pos, col, bare)) throw std::move(*e);
+    }
     if (p.first && p.first->phys != t) {
       throw SqlError{"parameter $" + std::to_string(n + 1) + " used as both " + type_name(p.first->phys) + " and " +
                          type_name(t),
@@ -4292,8 +4344,6 @@ public:
         switch (u) {
           case Use::Compared: return "compared with ";
           case Use::Assigned: return "assigned to ";
-          case Use::Added: return "added to ";
-          case Use::Subtracted: return "subtracted from ";
           case Use::Operand: return "combined with ";
         }
         return "";
@@ -4304,7 +4354,11 @@ public:
                          second,
                      pos, clash()};
     }
-    if (!p.first) p.first = ParamUse::FirstUse{t, &col, use};
+    if (!p.first) {
+      p.first = ParamUse::FirstUse{t, &col, use, bare, pos};
+      p.list = list_;
+    }
+    if (!bare && list_ != 0 && p.list == list_) p.deduced = true;
     if (use == Use::Assigned) return;
     p.assigned_only = false;
     if (use != Use::Compared && col.sql.kind == SqlKind::Decimal) {
@@ -4321,6 +4375,33 @@ public:
   // a string), the layer, which would have to convert it before the plan
   // runs, does not yet: 42601 (docs/frontend_design.md, *Fixed parameter
   // types*).
+  // PostgreSQL's 42P08 for $n+1, used now with `col` and first by p.first,
+  // or nullopt where PostgreSQL's outcome is not that. Within one list of
+  // assigned values (an UPDATE's SET, a row of VALUES), PostgreSQL deduces
+  // a $n's type from each use inside an expression as it analyses the
+  // items, and only then coerces each bare $n item to its column, in
+  // written order: a bare $n untyped when analysed whose column's type is
+  // not the one deduced is 42P08 at that $n. Taken only where that is
+  // certain: the first use a bare item of this list, the $n typed nowhere
+  // PostgreSQL analyses first (an UPDATE's WHERE and RETURNING) nor
+  // deduced earlier in the list, its base types differing (a modifier is
+  // a later coercion); a second bare item with a deducing use still to
+  // come stays the layer's 42601.
+  [[nodiscard]] auto inconsistent_param(std::uint32_t n, const auto& p, std::int32_t pos, const Column& col, bool bare) const
+      -> std::optional<SqlError> {
+    if (list_ == 0 || p.list != list_ || !p.first || !p.first->bare || p.deduced || typed_before_.contains(n)) return std::nullopt;
+    const auto was = pg_type_name(p.first->col->sql);
+    const auto now = pg_type_name(col.sql);
+    if (was == now) return std::nullopt;
+    if (!bare) return param_mismatch(n, p.first->pos, now + " versus " + was);
+    if (list_deducing_.contains(n)) return std::nullopt;
+    return param_mismatch(n, pos, was + " versus " + now);
+  }
+  static auto param_mismatch(std::uint32_t n, std::int32_t pos, std::string detail) -> SqlError {
+    return SqlError{"inconsistent types deduced for parameter $" + std::to_string(n + 1), pos, kAmbiguousParameter}.with_notes(
+        std::move(detail), "");
+  }
+
   [[noreturn]] static void fixed_misfit(std::uint32_t n, SqlType fixed, const Column& col, Use use, std::int32_t pos) {
     auto param = "parameter $" + std::to_string(n + 1) + " of type " + sql_type_name(fixed);
     auto assigned = use == Use::Assigned;
@@ -4530,33 +4611,12 @@ public:
     return {std::move(agg), ""};
   }
 
-  // An integer literal added to or subtracted from `c`, in c's
-  // representation: a DECIMAL's scaled by 10^scale, within its 18 digits.
-  // PostgreSQL types it integer, or bigint past integer, and the sum as the
-  // column's type or wider; the row builder's check of the stored value is
-  // the one PostgreSQL's assignment makes.
-  static auto literal(const Column& c, const ast::Expr& e) -> std::int64_t {
-    if (c.sql.kind == SqlKind::SmallInt || c.sql.kind == SqlKind::Integer) {
-      // A SMALLINT or INTEGER holds less than 2^31 in magnitude, so a literal
-      // of 2^32 or more leaves the column's range whatever it is added to,
-      // as PostgreSQL's sum does: held as 2^32, the sum cannot overflow
-      // int64 and the row builder refuses it (22003), or NULL stays NULL.
-      constexpr std::int64_t kBeyond = std::int64_t{1} << 32;
-      return std::clamp(e.constant, -kBeyond, kBeyond);
-    }
-    if (c.sql.kind != SqlKind::Decimal) return e.constant;
-    std::int64_t v = e.constant;
-    for (std::uint8_t i = 0; i < c.sql.scale; ++i) {
-      if (v > kDecimalBound / 10 || v < -(kDecimalBound / 10)) throw SqlError{"numeric field overflow", e.pos, kNumericValueOutOfRange};
-      v *= 10;
-    }
-    if (v >= kDecimalBound || v <= -kDecimalBound) throw SqlError{"numeric field overflow", e.pos, kNumericValueOutOfRange};
-    return v;
-  }
-  static constexpr std::int64_t kDecimalBound = 1'000'000'000'000'000'000;  // 10^18: DECIMAL's 18 digits
-
-  // An expression whose type is fixed by its target (an assigned column).
-  auto value(const Table& t, const ast::Expr& e, const Column& target) -> logical::Expr {
+  // A value assigned to column `target`: of an INSERT's VALUES or of an
+  // INSERT … SELECT's deferred item (a constant, a parameter, DEFAULT, the
+  // clock), or, `computed`, of UPDATE's or ON CONFLICT DO UPDATE's SET, any
+  // value expression over t's columns, computed from the row as read and
+  // assigned by PostgreSQL 17's assignment cast (assignment).
+  auto value(const Table& t, const ast::Expr& e, const Column& target, bool computed = false) -> logical::Expr {
     auto want = target.type;
     // A number literal assigned to a NUMERIC: read as written, of any digits.
     if (target.sql.kind == SqlKind::Numeric && e.kind == ast::Expr::Kind::Literal &&
@@ -4565,91 +4625,140 @@ public:
     }
     if (is_constant(e)) {
       // Out of the column's type, it is refused here, before anything runs,
-      // as PostgreSQL's planner folds its assignment cast: so of several the
-      // first in the statement's order, as there.
+      // as PostgreSQL's planner folds its assignment cast.
       auto k = fold(e);
       auto v = coerce(k, target, true, "=");
-      if (auto why = out_of_range(target.sql, v)) out_of_type(*why, k.pos);
+      if (auto why = out_of_range(target.sql, v)) out_of_type(*why, k.pos, target.sql);
       return fixed(std::move(v), target.sql);
     }
-    // $n::T assigned to a column of type T binds as $n, as in a WHERE.
+    // $n::T assigned to a column of type T binds as $n, as in a WHERE; to
+    // one of another type, in SET, $n is T and its value is assigned.
     if (param_cast(e)) {
-      const auto* uncast = uncast_param(&e, target);
-      if (uncast == nullptr) not_yet("a cast of a parameter to other than its column's type", e.pos);
-      return value(t, *uncast, target);
+      if (const auto* uncast = uncast_param(&e, target)) {
+        use_param(uncast->param, want, uncast->pos, target, t.id, Use::Assigned);
+        return logical::param(uncast->param, target.sql);
+      }
+      if (!computed) not_yet("a cast of a parameter to other than its column's type", e.pos);
     }
     switch (e.kind) {
       case ast::Expr::Kind::Param:
-        use_param(e.param, want, e.pos, target, t.id, Use::Assigned);
+        use_param(e.param, want, e.pos, target, t.id, Use::Assigned, true);
         return logical::param(e.param, target.sql);
-      case ast::Expr::Kind::Column: {
-        const auto* c = column(t, e);
-        if ((c->sql.kind == SqlKind::Numeric) != (target.sql.kind == SqlKind::Numeric) &&
-            !type_refusal(c->sql.kind, target.sql.kind, true)) {
-          refuse_numeric("assigning a column of type " + pg_type_name(c->sql) + " to one of type " + pg_type_name(target.sql), e.pos);
-        }
-        jsonb_assigned(c->sql, target, e.pos);
-        if (c->type != want) {
-          throw SqlError{"column \"" + c->name + "\" is " + type_name(c->type), e.pos,
-                         type_refusal(c->sql.kind, target.sql.kind, true).value_or(kSyntaxError)};
-        }
-        return logical::column_of(t.id, *c);
-      }
-      case ast::Expr::Kind::Add:
-      case ast::Expr::Kind::Sub: {
-        auto op = e.kind == ast::Expr::Kind::Add ? "+" : "-";
-        if (e.lhs->kind != ast::Expr::Kind::Column ||
-            (e.rhs->kind != ast::Expr::Kind::Param && e.rhs->kind != ast::Expr::Kind::Const)) {
-          throw SqlError{std::string{"only column "} + op + " parameter and column " + op + " integer are supported", e.pos};
-        }
-        const auto* c = column(t, *e.lhs);
-        if (c->sql.kind == SqlKind::Numeric || target.sql.kind == SqlKind::Numeric) refuse_numeric(std::string{"operator "} + op + " of a NUMERIC", e.pos);
-        // On integers and DECIMAL, of the assigned column's type: the
-        // operator's result type is then the column's, and the row
-        // builder's range check on the stored value is the one PostgreSQL's
-        // operator makes (22003).
-        if (!exact_number(*c) || !exact_number(target) || compared_type(c->sql).identity != compared_type(target.sql).identity) {
-          throw SqlError{std::string{"operator "} + op + " is only supported on an integer or DECIMAL column of the "
-                                                         "assigned column's type",
-                         e.pos};
-        }
-        auto kind = e.kind == ast::Expr::Kind::Add ? logical::Expr::Kind::Add : logical::Expr::Kind::Sub;
-        if (e.rhs->kind == ast::Expr::Kind::Const) {
-          return logical::binary(kind, logical::column_of(t.id, *c), logical::constant(literal(*c, *e.rhs), c->sql),
-                                 c->sql);
-        }
-        use_param(e.rhs->param, PhysType::I64, e.rhs->pos, *c, t.id,
-                  e.kind == ast::Expr::Kind::Add ? Use::Added : Use::Subtracted);
-        return logical::binary(kind, logical::column_of(t.id, *c), logical::param(e.rhs->param, c->sql), c->sql);
-      }
-      case ast::Expr::Kind::Mul:
-      case ast::Expr::Kind::Div: not_yet("* and / of other than constants", e.pos);
-      case ast::Expr::Kind::Star: throw SqlError{"syntax error at or near \"*\"", e.pos};
-      case ast::Expr::Kind::Aggregate: throw SqlError{"aggregate functions are not allowed here", e.pos, kGroupingError};
-      case ast::Expr::Kind::Plus:
-      case ast::Expr::Kind::Neg: not_yet("unary + and - of other than a constant", e.pos);
-      case ast::Expr::Kind::Compare: not_yet("a comparison of other than constants as a value", e.pos);
-      case ast::Expr::Kind::IsNull:
-      case ast::Expr::Kind::Not:
-      case ast::Expr::Kind::And:
-      case ast::Expr::Kind::Or: not_yet("IS NULL, AND, OR and NOT of other than constants as a value", e.pos);
-      case ast::Expr::Kind::Cast: not_yet("a cast of a value expression in SET (#904 stage S1)", e.pos);
       case ast::Expr::Kind::Clock: {
         auto d = clock_default(e.func, e.constant, target.sql, target.name, e.pos, true);
         return clock_reading(d, target);
       }
-      case ast::Expr::Kind::Subquery: not_yet("a subquery assigned to a column", e.pos);
       case ast::Expr::Kind::Default:
         if (target.clock_default) return clock_reading(*target.clock_default, target);
         return fixed(param_default(target), target.sql);
+      case ast::Expr::Kind::Star: throw SqlError{"syntax error at or near \"*\"", e.pos};
+      case ast::Expr::Kind::Aggregate:
+        if (!computed) throw SqlError{"aggregate functions are not allowed here", e.pos, kGroupingError};
+        break;
+      case ast::Expr::Kind::Column:
+      case ast::Expr::Kind::Add:
+      case ast::Expr::Kind::Sub:
+      case ast::Expr::Kind::Mul:
+      case ast::Expr::Kind::Div:
+      case ast::Expr::Kind::Plus:
+      case ast::Expr::Kind::Neg:
+      case ast::Expr::Kind::Compare:
+      case ast::Expr::Kind::IsNull:
+      case ast::Expr::Kind::Not:
+      case ast::Expr::Kind::And:
+      case ast::Expr::Kind::Or:
+      case ast::Expr::Kind::Cast:
+      case ast::Expr::Kind::Subquery:
       case ast::Expr::Kind::Case:
       case ast::Expr::Kind::Coalesce:
-      case ast::Expr::Kind::NullIf: not_yet("CASE, COALESCE and NULLIF of other than constants", e.pos);
-      case ast::Expr::Kind::Func: not_yet(is_jsonb_accessor(e.func) ? "jsonb's " + e.func + " of other than constants here" : std::string{"|| and the string functions of other than constants"}, e.pos);
+      case ast::Expr::Kind::NullIf:
+      case ast::Expr::Kind::Func:
       case ast::Expr::Kind::Const:
-      case ast::Expr::Kind::Literal: break;  // constants, above
+      case ast::Expr::Kind::Literal: break;
     }
-    throw SqlError{"expression not supported", e.pos};
+    if (!computed) throw SqlError{"INSERT values must be parameters or constants", e.pos};
+    set_refusals(e);
+    Resolve resolve = [&](const ast::Expr& x) -> std::pair<const Table*, const Column*> { return {&t, column(t, x)}; };
+    // Restored however the value's binding ends: a folding error it throws
+    // is recorded and the statement's binding goes on (FoldedErrors).
+    struct InSet {
+      bool& flag;
+      bool was;
+      ~InSet() { flag = was; }
+    } in_set{in_set_, std::exchange(in_set_, true)};
+    return assignment(value(e, resolve), target, e.pos, "SET");
+  }
+
+  // What a SET value may not hold, wherever in it: an aggregate (42803, as
+  // PostgreSQL), a subquery (not wired to writes yet).
+  static void set_refusals(const ast::Expr& e) {
+    if (e.kind == ast::Expr::Kind::Aggregate) {
+      throw SqlError{"aggregate functions are not allowed in UPDATE", e.pos, kGroupingError};
+    }
+    if (e.kind == ast::Expr::Kind::Subquery) not_yet("a subquery assigned to a column", e.pos);
+    if (e.lhs) set_refusals(*e.lhs);
+    if (e.rhs) set_refusals(*e.rhs);
+    for (const auto& a : e.args) set_refusals(a);
+  }
+
+  // A value v assigned to column c by PostgreSQL 17's assignment cast
+  // (coerce_to_target_type, assignment context), as SET and INSERT … SELECT
+  // assign it (docs/frontend_design.md, *Expressions in UPDATE … SET*):
+  // v itself where the row builder stores it as it is (its own type; an
+  // integer into another integer, a string into another string type, both
+  // range- or length-checked as the row is built: 22003, 22001); a cast
+  // (C1's) where the value changes (into or out of a float or a DECIMAL,
+  // between date and time types, any type's text into a string column);
+  // 42804 where PostgreSQL has no assignment cast. NUMERIC of no precision
+  // other than into itself, and a float into a string, are not taken yet
+  // (0A000), `statement` naming the assignment.
+  auto assignment(logical::Expr v, const Column& c, std::int32_t pos, std::string_view statement) -> logical::Expr {
+    const auto from = v.type;
+    const auto to = c.sql;
+    if (from == to) return v;
+    auto value_into = [&] {
+      const auto from_name = pg_type_name(from);
+      const std::string article = from_name.find_first_of("aeiou") == 0 ? "an " : "a ";
+      return std::string{statement} + " of " + article + from_name + " value into column \"" + c.name + "\" of type " +
+             pg_type_name(to);
+    };
+    if (uncompared(from.kind) || uncompared(to.kind)) {
+      if (from.kind == to.kind) return v;  // its text or its jsonb value, as it is stored
+      if (from.kind == SqlKind::Jsonb && type_class(to.kind) == TypeClass::String) return cast_node(std::move(v), text_for(to));
+      if (type_refusal(from.kind, to.kind, true)) throw assignment_mismatch(c.name, pg_type_name(to), pg_type_name(from), pos);
+      refuse_numeric(value_into(), pos);
+    }
+    if (is_integer(from) && is_integer(to)) return v;
+    if (type_class(to.kind) == TypeClass::String) {
+      // A CHAR(n)'s value into another string type loses its trailing
+      // spaces (C1's cast); every other string is stored as it is, a
+      // CHAR(n) or VARCHAR(n) checked and cut by the row builder, a NAME
+      // cut to 63 bytes.
+      if (type_class(from.kind) == TypeClass::String) {
+        if (from.kind == SqlKind::Char && to.kind != SqlKind::Char) return cast_node(std::move(v), text_for(to));
+        return v;
+      }
+      if (is_float(from)) not_supported(value_into(), pos);  // its text is not float8out's yet
+      return cast_node(std::move(v), text_for(to));
+    }
+    if (type_refusal(from.kind, to.kind, true) || cast_kind(from, to) == CastKind::None) {
+      throw assignment_mismatch(c.name, pg_type_name(to), pg_type_name(from), pos);
+    }
+    return cast_node(std::move(v), to);
+  }
+
+  // The type a value's text is assigned to string column `to` through: a
+  // NAME's own (a BOOLEAN's text is then boolout's, `t`), else TEXT, which
+  // the row builder checks against a VARCHAR(n) or CHAR(n).
+  static auto text_for(SqlType to) -> SqlType {
+    return to.kind == SqlKind::Name ? SqlType{SqlKind::Name} : SqlType{SqlKind::Text};
+  }
+
+  // v cast to `to` by C1's cast, a node of its own.
+  auto cast_node(logical::Expr v, SqlType to) -> logical::Expr {
+    auto out = logical::expr(logical::Expr::Kind::Cast, to);
+    out.args.push_back(std::move(v));
+    return strict_null(std::move(out));
   }
 
   auto where(const Table& t, const std::vector<ast::Compare>& in) -> std::vector<logical::Expr> {
@@ -5171,19 +5280,6 @@ public:
       auto k = uncompared_of(a.kind, b.kind);
       refuse_uncompared(k, "a comparison of a " + uncompared_name(k) + " column", pos);
     }
-  }
-
-  // A column's or an expression's value of type `from` assigned to column
-  // `target` where one is a jsonb: jsonb to jsonb is the value; any other
-  // type to a jsonb is PostgreSQL's 42804; a jsonb to a string column, its
-  // text, is not built yet (0A000). A jsonb constant to a string column is
-  // its text, folded before it reaches here.
-  static void jsonb_assigned(SqlType from, const Column& target, std::int32_t pos) {
-    if (from.kind == target.sql.kind || (from.kind != SqlKind::Jsonb && target.sql.kind != SqlKind::Jsonb)) return;
-    if (from.kind == SqlKind::Jsonb && type_class(target.sql.kind) == TypeClass::String) {
-      not_supported("assigning a jsonb value to a column of type " + pg_type_name(target.sql), pos);
-    }
-    throw assignment_mismatch(target.name, pg_type_name(target.sql), pg_type_name(from), pos);
   }
 
   // A CHAR(n) with a VARCHAR: PostgreSQL compares the two as bpchar, the
@@ -6111,8 +6207,8 @@ public:
 
   // An INSERT … SELECT's select list as the values of the columns it fills,
   // checked as PostgreSQL checks them: their number (42601), then each in
-  // order, a deferred item bound against its column, any other of a type
-  // that assigns to it (assigns_to). Sets assigned_.
+  // order, a deferred item bound against its column, any other assigned to
+  // it as SET assigns a value (assignment). Sets assigned_.
   void assign_outputs(const AssignTo& to, const std::vector<ast::Expr>& list, const std::vector<bool>& deferred,
                       std::vector<logical::Output>& targets, std::int32_t pos) {
     auto columns = to.columns;
@@ -6126,33 +6222,10 @@ public:
         auto name = std::move(targets[i].name);
         targets[i] = {value(*to.table, list[i], *columns[i]), std::move(name)};
       } else {
-        assigns_to(targets[i].expr.type, *columns[i], list[i].pos);
+        targets[i].expr = assignment(std::move(targets[i].expr), *columns[i], list[i].pos, "INSERT … SELECT");
       }
     }
     assigned_ = std::move(columns);
-  }
-
-  // A value of type `from` written into column c by INSERT … SELECT: one of
-  // c's type or of its family, which the row builder range-checks (an
-  // integer into a SMALLINT, a TEXT into a VARCHAR(n)), a REAL or DOUBLE
-  // PRECISION into the other, or an integer into either, which the plan
-  // converts. A pair PostgreSQL refuses is 42804; any other assignment cast
-  // it makes is not taken yet (0A000, #824).
-  static void assigns_to(SqlType from, const Column& c, std::int32_t pos) {
-    const auto to = c.sql;
-    if (uncompared(from.kind) && from.kind == to.kind) return;  // its text or its jsonb value, as it is stored
-    if (from.kind == SqlKind::Jsonb || to.kind == SqlKind::Jsonb) jsonb_assigned(from, c, pos);
-    if (from.kind != SqlKind::Numeric && assignable(from, to) && (to.kind != SqlKind::Char || from == to)) return;
-    if (is_float(to) && (is_float(from) || is_integer(from))) return;
-    if (type_refusal(from.kind, to.kind, true)) throw assignment_mismatch(c.name, pg_type_name(to), pg_type_name(from), pos);
-    if (from.kind == SqlKind::Numeric || to.kind == SqlKind::Numeric) {
-      refuse_numeric("INSERT … SELECT of a " + pg_type_name(from) + " value into column \"" + c.name + "\" of type " + pg_type_name(to), pos);
-    }
-    const auto from_name = pg_type_name(from);
-    const std::string article = from_name.find_first_of("aeiou") == 0 ? "an " : "a ";
-    not_supported("INSERT … SELECT of " + article + from_name + " value into column \"" + c.name + "\" of type " +
-                      pg_type_name(to),
-                  pos);
   }
 
   // A select-list item of no aggregated query, named as PostgreSQL names
@@ -6509,8 +6582,12 @@ private:
       PhysType phys;
       const Column* col;
       Use use;
+      bool bare;          // a bare item of an assignment list (use_param)
+      std::int32_t pos;
     };
     std::optional<FirstUse> first;
+    std::uint32_t list{0};  // the assignment list of its first use, 0 for none
+    bool deduced{false};    // used inside an expression in that list (inconsistent_param)
     std::optional<SqlType> range;  // what the pre-plan range check checks: none if only an INSERT assigns it
     std::uint32_t table{0};        // the table of the column `range` comes from
     bool assigned_only{true};      // every use an assignment
@@ -6575,6 +6652,13 @@ private:
   };
   std::optional<Correlation> correlating_;
   bool in_where_{false};  // binding a one-table query's WHERE (where)
+  bool in_set_{false};    // binding an UPDATE's SET value (value)
+  // The assignment list being bound (AssignmentList), 0 for none; its
+  // parameters used inside an expression; those PostgreSQL types before it.
+  std::uint32_t list_{0};
+  std::uint32_t lists_{0};
+  std::set<std::uint32_t> list_deducing_;
+  std::set<std::uint32_t> typed_before_;
   bool in_set_arm_{false};  // binding an arm of a set operation (set_arm)
   // What a HAVING parameter compared with COUNT or SUM is typed by: no
   // column of a table, kept where a parameter's first use points.
@@ -8016,14 +8100,105 @@ auto arbiter(const Table& t, const ast::Insert::OnConflict& oc) -> std::uint32_t
 // row as read. A constant is checked against the column's type now, as
 // PostgreSQL folds its cast when it plans the statement; a parameter
 // before the plan runs (Binder::check_assigned).
-auto assigned_value(Binder& b, const Table& t, const ast::Expr& e, const Column& c) -> logical::Expr {
-  auto v = b.value(t, e, c);
+auto assigned_value(Binder& b, const Table& t, const ast::Expr& e, const Column& c, bool computed = false) -> logical::Expr {
+  auto v = b.value(t, e, c, computed);
   if (v.kind == logical::Expr::Kind::Param && b.is_fixed(v.param)) {
-    if (auto why = out_of_range(c.sql, b.fixed_value(v.param))) out_of_type(*why, e.pos);
+    if (auto why = out_of_range(c.sql, b.fixed_value(v.param))) out_of_type(*why, e.pos, c.sql);
   } else if (v.kind == logical::Expr::Kind::Param) {
     b.check_assigned(v.param, c, t.id);
   }
   return v;
+}
+
+// The data exceptions of folding SET's constants (1/0, a constant out of its
+// column's type), which PostgreSQL's planner raises, after the statement
+// is analysed and in the column order its rewriter sorts SET into: each is
+// recorded on its item as the items are bound in written order, and the
+// one on the lowest-numbered column raised, with no position, once the
+// statement is bound (raise). An error of analysis, a literal's input
+// function's among them, is thrown as it is met.
+class FoldedErrors {
+public:
+  // v bound by `bind`, or nullopt with its folding error recorded at
+  // column number `at`.
+  template <typename F>
+  auto bind(std::size_t at, F&& bind) -> std::optional<logical::Expr> {
+    try {
+      return std::forward<F>(bind)();
+    } catch (const SqlError& e) {
+      if (!e.sqlstate().starts_with("22") || e.at_analysis()) throw;
+      if (!first_ || at < first_->first) {
+        auto state = known_sqlstate(e.sqlstate()).value_or(kNumericValueOutOfRange);
+        first_.emplace(at, SqlError{e.what(), -1, state}.with_notes(std::string{e.detail()}, std::string{e.hint()},
+                                                                   std::string{e.context()}));
+      }
+      return std::nullopt;
+    }
+  }
+  // Column c assigned by a SET item; a second item for it is PostgreSQL's
+  // 42601, which its rewriter raises after the statement is analysed and
+  // before the planner folds a constant, with no position.
+  void assign(const Column& c) {
+    if (!assigned_.insert(c.id).second && !repeated_) repeated_ = c.name;
+  }
+  void raise() const {
+    if (repeated_) throw SqlError{"multiple assignments to same column \"" + *repeated_ + "\"", -1};
+    if (first_) throw first_->second;
+  }
+
+private:
+  std::optional<std::pair<std::size_t, SqlError>> first_;
+  std::set<std::uint32_t> assigned_;
+  std::optional<std::string> repeated_;
+};
+
+// A SET item's value, a list begin_list scopes.
+auto set_value(const ast::Assignment& a) -> const ast::Expr& { return a.value; }
+// A VALUES row's item.
+auto row_value(const ast::Expr& e) -> const ast::Expr& { return e; }
+
+// Ends the Binder's assignment list however its binding ends.
+struct ListScope {
+  Binder& b;
+  template <typename Items, typename Value>
+  ListScope(Binder& binder, const Items& items, Value value, std::set<std::uint32_t> typed_before) : b{binder} {
+    b.begin_list(items, value, std::move(typed_before));
+  }
+  ListScope(const ListScope&) = delete;
+  ListScope& operator=(const ListScope&) = delete;
+  ~ListScope() { b.end_list(); }
+};
+
+// UPDATE's SET: each column from any value expression over the row as
+// read (Binder::value, computed), in the table's column order, so the
+// plan computes and stores them in it and a row's error is the
+// lowest-numbered column's, as PostgreSQL's. A column assigned twice is
+// raised with the folding errors (FoldedErrors::assign). PostgreSQL types
+// the parameters of the WHERE and RETURNING before the SET.
+auto update_set(Binder& b, const Table& t, const ast::Update& u, FoldedErrors& folded)
+    -> std::vector<std::pair<logical::ColumnRef, logical::Expr>> {
+  const auto& set = u.set;
+  std::set<std::uint32_t> typed_before;
+  for (const auto& w : u.where) params_used(w, typed_before);
+  for (const auto& r : u.returning) params_used(r, typed_before);
+  ListScope list{b, set, set_value, std::move(typed_before)};
+  std::vector<std::tuple<std::size_t, logical::ColumnRef, logical::Expr>> items;
+  for (const auto& a : set) {
+    // A primary key column too: the row moves to its new key, each row's
+    // checked in turn, as PostgreSQL's unique check does.
+    const auto* c = t.column(a.column);
+    if (c == nullptr || c->hidden) {
+      throw SqlError{"column \"" + a.column + "\" of relation \"" + t.name + "\" does not exist", a.pos, kUndefinedColumn};
+    }
+    folded.assign(*c);
+    auto at = static_cast<std::size_t>(c - t.columns.data());
+    auto v = folded.bind(at, [&] { return assigned_value(b, t, a.value, *c, true); });
+    if (v) items.emplace_back(at, logical::column_of(t.id, *c).col, std::move(*v));
+  }
+  std::ranges::stable_sort(items, {}, [](const auto& i) { return std::get<0>(i); });
+  std::vector<std::pair<logical::ColumnRef, logical::Expr>> out;
+  for (auto& [at, col, v] : items) out.emplace_back(col, std::move(v));
+  return out;
 }
 
 // ON CONFLICT DO UPDATE's SET, one list per row of VALUES (`rows`, the
@@ -8034,7 +8209,8 @@ auto assigned_value(Binder& b, const Table& t, const ast::Expr& e, const Column&
 // another integer type, which the row builder checks the value against; a
 // type PostgreSQL does not assign from is 42804. An unqualified column is
 // ambiguous (42702), as both relations have it. EXCLUDED inside an
-// expression is not supported yet.
+// expression is not supported yet (#908). The items are stored in column
+// order and their folding errors raised as UPDATE's (FoldedErrors).
 auto conflict_update(Binder& b, const Table& t, const std::vector<ast::Assignment>& set,
                      const std::vector<std::vector<std::optional<logical::Expr>>>& rows)
     -> std::vector<std::vector<std::pair<logical::ColumnRef, logical::Expr>>> {
@@ -8060,20 +8236,23 @@ auto conflict_update(Binder& b, const Table& t, const std::vector<ast::Assignmen
   };
   // Each assignment: its column and its value, or the column EXCLUDED gives.
   struct Item {
+    std::size_t at;  // the column's number: items are stored in their order
     logical::ColumnRef target;
     std::optional<logical::Expr> value;
     const Column* excluded{nullptr};
   };
   std::vector<Item> items;
-  std::set<std::uint32_t> assigned;
+  FoldedErrors folded;
+  ListScope list{b, set, set_value, {}};
   for (const auto& a : set) {
     const auto* c = t.column(a.column);
     if (c == nullptr || c->hidden) {
       throw SqlError{"column \"" + a.column + "\" of relation \"" + t.name + "\" does not exist", a.pos, kUndefinedColumn};
     }
-    if (!assigned.insert(c->id).second) throw SqlError{"multiple assignments to same column \"" + a.column + "\"", a.pos};
+    folded.assign(*c);
     const auto& e = a.value;
     auto target = logical::column_of(t.id, *c).col;
+    auto at = static_cast<std::size_t>(c - t.columns.data());
     if (e.kind == ast::Expr::Kind::Column && e.table == kExcluded) {
       const auto* x = excluded_column(e);
       if (x->sql != c->sql && !(is_integer(x->sql) && is_integer(c->sql))) {
@@ -8085,12 +8264,14 @@ auto conflict_update(Binder& b, const Table& t, const std::vector<ast::Assignmen
         }
         not_yet("EXCLUDED." + x->name + " assigned to a column of another type", e.pos);
       }
-      items.push_back({target, std::nullopt, x});
+      items.push_back({at, target, std::nullopt, x});
       continue;
     }
     qualified(e);
-    items.push_back({target, assigned_value(b, t, e, *c), nullptr});
+    if (auto v = folded.bind(at, [&] { return assigned_value(b, t, e, *c, true); })) items.push_back({at, target, std::move(v), nullptr});
   }
+  folded.raise();
+  std::ranges::stable_sort(items, {}, &Item::at);
   // A column the rows leave out proposes its default, bound once.
   std::map<std::size_t, logical::Expr> defaults;
   std::vector<std::vector<std::pair<logical::ColumnRef, logical::Expr>>> out;
@@ -8372,6 +8553,7 @@ auto bind_statement(const ast::Statement& stmt, const Catalog& cat, std::span<co
           // Each row is written as one INSERT of it would be, in order. A
           // column left out with a clock default takes the statement's reading.
           for (const auto& values : s.rows) {
+            ListScope list{b, values, row_value, {}};
             auto& row = out.rows.emplace_back(t->columns.size());
             for (std::size_t i = 0; i < targets.size(); ++i) {
               auto at = static_cast<std::size_t>(targets[i] - t->columns.data());
@@ -8398,16 +8580,14 @@ auto bind_statement(const ast::Statement& stmt, const Catalog& cat, std::span<co
           return {b.select(s), s.pos};
         } else if constexpr (std::is_same_v<T, ast::Update>) {
           const auto* t = b.updated_table(s.table, s.pos);
-          std::vector<std::pair<logical::ColumnRef, logical::Expr>> set;
-          for (const auto& a : s.set) {
-            // A primary key column too: the row moves to its new key, each
-            // row's checked in turn, as PostgreSQL's unique check does.
-            const auto* c = Binder::column(*t, a.column, a.pos);
-            set.emplace_back(logical::column_of(t->id, *c).col, assigned_value(b, *t, a.value, *c));
-          }
+          FoldedErrors folded;
+          auto set = update_set(b, *t, s, folded);
           b.set_scope({t});
           auto rows = Binder::rows(*t, s.current_of.empty() ? b.where(*t, s.where) : b.current_of(*t, own, s.pos));
-          return {logical::node(logical::Update{std::move(rows), t, std::move(set), b.checks(*t), b.returning(*t, s.returning)}),
+          auto checks = b.checks(*t);
+          auto returning = b.returning(*t, s.returning);
+          folded.raise();
+          return {logical::node(logical::Update{std::move(rows), t, std::move(set), std::move(checks), std::move(returning)}),
                   s.pos};
         } else {
           const auto* t = b.updated_table(s.table, s.pos);

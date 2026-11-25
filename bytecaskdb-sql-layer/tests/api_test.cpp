@@ -2474,7 +2474,7 @@ TEST_CASE("embedded API: expressions over columns in the select list", "[sql][ap
   CHECK(state("SELECT SUM(i) + 1 FROM ce") == "42601");
   CHECK(state("SELECT i + 1, COUNT(*) FROM ce GROUP BY i") == "42601");
   CHECK(state("SELECT $1 + $2 FROM ce") == "42725");
-  CHECK(state("UPDATE ce SET i = i * 2") == "42601");
+  CHECK(state("UPDATE ce SET i = f * 2") == "42601");
   CHECK(state("SELECT id FROM ce WHERE f * 2 = 4") == "42601");  // a float in an expression filter
   CHECK(state("SELECT id FROM ce WHERE random(1, 2) = 1") == "42601");
 }
@@ -5174,6 +5174,12 @@ TEST_CASE("embedded API: INSERT … SELECT writes each of a query's rows as an I
   CHECK(db->execute("INSERT INTO dst (k, s) SELECT a, c FROM sv").affected == 2);
   CHECK(db->execute("INSERT INTO dst (k) SELECT x.a FROM src x JOIN src y ON x.a = y.a").affected == 3);
 
+  // PostgreSQL 17's assignment casts, as SET's (#824, #904 S1): a float
+  // rounded to an integer (rint: 1.5 is 2, 3.5 is 4), an integer's text.
+  (void)db->execute("DELETE FROM dst");
+  CHECK(db->execute("INSERT INTO dst (k, s) SELECT d, a FROM src").affected == 3);
+  CHECK(db->execute("SELECT k, s FROM dst ORDER BY s").rows ==
+        Grid{{i(2), text("1")}, {kNull, text("2")}, {i(4), text("3")}});
   CHECK(db->execute("INSERT INTO dst (n) SELECT c FROM src").affected == 3);  // each fits VARCHAR(3)
   // Data errors are the row builder's, and the statement writes nothing.
   const auto before = db->execute("SELECT COUNT(*) FROM dst").rows;
@@ -5193,10 +5199,9 @@ TEST_CASE("embedded API: INSERT … SELECT writes each of a query's rows as an I
   CHECK(state("INSERT INTO dst (k) SELECT c FROM src") == "42804");  // VARCHAR into INTEGER
   CHECK(state("INSERT INTO dst (at) SELECT a FROM src") == "42804");
   CHECK(state("INSERT INTO dst (k) SELECT $1::text") == "42804");
-  // Not yet: an assignment cast the plan does not make (#824), and a query
+  // Not yet: a float's text (its output is not float8out's), and a query
   // whose rows come through no Emit (#682).
-  CHECK(state("INSERT INTO dst (s) SELECT a FROM src") == "0A000");
-  CHECK(state("INSERT INTO dst (k) SELECT d FROM src") == "0A000");
+  CHECK(state("INSERT INTO dst (s) SELECT d FROM src") == "0A000");
   CHECK(state("INSERT INTO dst (k) SELECT COUNT(*) FROM src") == "0A000");
   CHECK(state("INSERT INTO dst (k) SELECT a FROM src GROUP BY a") == "0A000");
   CHECK(state("INSERT INTO dst (k) SELECT DISTINCT a FROM src") == "0A000");
@@ -5816,4 +5821,104 @@ END $$)");
     CHECK(error("SELECT f::real FROM c WHERE id = 6") == "22003 value out of range: overflow");
     CHECK(error("SELECT f::real FROM c WHERE id = 7") == "22003 value out of range: underflow");
   }
+}
+
+TEST_CASE("embedded API: SET of an expression reads the row before the update", "[sql][api][update]") {
+  sql_test::TempDir dir{"api_set_expressions"};
+  auto db = Database::open(dir.path());
+  (void)db->execute(
+      "CREATE TABLE s (id INT PRIMARY KEY, a SMALLINT, n INT, b BIGINT, d NUMERIC(5,2), r REAL, f DOUBLE PRECISION, "
+      "t TEXT, v VARCHAR(3), ch CHAR(3), nm NAME, bo BOOLEAN, dt DATE, ts TIMESTAMP, j JSONB, by BYTEA)");
+  (void)db->execute(
+      "INSERT INTO s VALUES (1, 5, 5, 5, 2.50, 1.5, 2.5, 'x', 'ab', 'ab', 'nm', true, '2024-03-01', '2024-03-01 10:00', "
+      "'{\"n\": \"7\", \"s\": \"str\", \"o\": {\"z\": 1}}', '\\x6162')");
+  const auto table_id = db->catalog()->table({kPublicSchema, "s"})->id;
+  auto text = [](const Value& v) -> std::string {
+    if (std::holds_alternative<std::monostate>(v)) return "NULL";
+    const auto& b = std::get<std::vector<std::byte>>(v);
+    return {reinterpret_cast<const char*>(b.data()), b.size()};  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+  };
+  // The one row an UPDATE … RETURNING of text values gives.
+  auto row = [&](std::string_view sql, const std::vector<Value>& params = {}) {
+    auto r = db->execute(sql, params);
+    REQUIRE(r.rows.size() == 1);
+    std::vector<std::string> out;
+    for (const auto& v : r.rows[0]) out.push_back(text(v));
+    return out;
+  };
+  // An error as its SQLSTATE and message, and whether it is a range error on the table.
+  auto error = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ExecError& e) {
+      auto out = std::string{sqlstate(e)} + " " + e.what();
+      if (!e.note().empty()) out += " | " + std::string{e.note()};
+      if (e.constraint() && e.constraint()->constraint == BC_C_RANGE) {
+        out += e.constraint()->object_id == table_id ? " (range on s)" : " (range)";
+      }
+      return out;
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what() + (e.pos() < 0 ? "" : " @" + std::to_string(e.pos()));
+    }
+    return "ran";
+  };
+  auto snapshot = [&] { return db->execute("SELECT * FROM s").rows; };
+
+  // Every value is computed from the row as read: PostgreSQL 17 writes 6 and x5.
+  CHECK(row("UPDATE s SET n = n + 1, t = t || n RETURNING n::text, t") == std::vector<std::string>{"6", "x5"});
+  // Assignment casts, each value PostgreSQL 17's.
+  CHECK(row("UPDATE s SET t = bo RETURNING t") == std::vector<std::string>{"true"});
+  CHECK(row("UPDATE s SET nm = bo RETURNING nm::text") == std::vector<std::string>{"t"});
+  CHECK(row("UPDATE s SET t = d RETURNING t") == std::vector<std::string>{"2.50"});
+  CHECK(row("UPDATE s SET t = j->'o' RETURNING t") == std::vector<std::string>{"{\"z\": 1}"});
+  CHECK(row("UPDATE s SET t = dt RETURNING t") == std::vector<std::string>{"2024-03-01"});
+  CHECK(row("UPDATE s SET t = by RETURNING t") == std::vector<std::string>{"\\x6162"});
+  CHECK(row("UPDATE s SET t = ch RETURNING t || '|'") == std::vector<std::string>{"ab|"});
+  CHECK(row("UPDATE s SET n = f RETURNING n::text") == std::vector<std::string>{"2"});  // rint
+  CHECK(row("UPDATE s SET n = d RETURNING n::text") == std::vector<std::string>{"3"});  // half away from zero
+  CHECK(row("UPDATE s SET d = n * 1.005 RETURNING d::text") == std::vector<std::string>{"3.02"});
+  CHECK(row("UPDATE s SET f = n, r = f RETURNING f::int::text, r::numeric(3,1)::text") == std::vector<std::string>{"3", "2.5"});
+  CHECK(row("UPDATE s SET dt = ts, ts = dt RETURNING dt::text, ts::text") ==
+        std::vector<std::string>{"2024-03-01", "2024-03-01 00:00:00"});
+  CHECK(row("UPDATE s SET n = (j->>'n')::int, t = j->>'s', v = upper(v) RETURNING n::text, t, v") ==
+        std::vector<std::string>{"7", "str", "AB"});
+  CHECK(row("UPDATE s SET t = CASE WHEN n > 0 THEN 'p' ELSE 'q' END, bo = n > 100 RETURNING t, bo::text") ==
+        std::vector<std::string>{"p", "false"});
+  // $n::T of another type than the column's: $n is T, its value assigned.
+  CHECK(row("UPDATE s SET t = $1::int RETURNING t", {Value{std::int64_t{7}}}) == std::vector<std::string>{"7"});
+  CHECK(row("UPDATE s SET n = n * $1 RETURNING n::text", {Value{std::int64_t{2}}}) == std::vector<std::string>{"14"});
+  // A NULL operand gives NULL.
+  CHECK(row("UPDATE s SET n = n + NULL::int, t = NULL::text || t RETURNING n::text, t") ==
+        std::vector<std::string>{"NULL", "NULL"});
+  (void)db->execute("UPDATE s SET n = 5, a = 32767, t = 'x'");
+
+  // A statement that raises writes nothing.
+  const auto before = snapshot();
+  CHECK(error("UPDATE s SET a = a + 1") == "22003 smallint out of range for column \"a\" of table \"s\" (range on s)");
+  CHECK(error("UPDATE s SET a = a + a").starts_with("22003 smallint out of range"));  // int2pl's own
+  CHECK(error("UPDATE s SET a = a + a").ends_with("(range on s)"));
+  CHECK(error("UPDATE s SET b = b + 9223372036854775807").starts_with("22003 bigint out of range"));
+  CHECK(error("UPDATE s SET b = b + 9223372036854775807").ends_with("(range on s)"));
+  CHECK(error("UPDATE s SET d = d + 1000") ==
+        "22003 numeric field overflow | A field with precision 5, scale 2 must round to an absolute value less than 10^3. "
+        "(range on s)");
+  CHECK(error("UPDATE s SET v = t || 'abcd'").starts_with("22001 value too long for type character varying(3)"));
+  CHECK(error("UPDATE s SET ch = t || 'abcd'").starts_with("22001 value too long for type character(3)"));
+  CHECK(error("UPDATE s SET n = (j->>'s')::int") == "22P02 invalid input syntax for type integer: \"str\"");
+  // Of two items failing on one row, the lower-numbered column's error.
+  CHECK(error("UPDATE s SET n = n / (n - n), a = a + 1") == "22003 smallint out of range for column \"a\" of table \"s\" (range on s)");
+  CHECK(error("UPDATE s SET a = a + 1, n = n / (n - n)") == "22003 smallint out of range for column \"a\" of table \"s\" (range on s)");
+  // A folded constant's error too, without a position; a literal's input
+  // error first, in written order, with its position.
+  CHECK(error("UPDATE s SET n = 1/0, a = 99999") == "22003 smallint out of range");
+  CHECK(error("UPDATE s SET a = 99999, n = 1/0") == "22003 smallint out of range");
+  CHECK(error("UPDATE s SET n = 1/0 WHERE id = 'zz'") == "22P02 invalid input syntax for type integer: \"zz\" @32");
+  CHECK(error("UPDATE s SET n = 'zz', a = 99999") == "22P02 invalid input syntax for type integer: \"zz\" @17");
+  CHECK(snapshot() == before);
+
+  // ON CONFLICT DO UPDATE takes the same expressions, over the row that holds the key.
+  CHECK(row("INSERT INTO s (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET n = s.n + 1, t = upper(s.v) RETURNING n::text, t") ==
+        std::vector<std::string>{"6", "AB"});
+  CHECK(error("INSERT INTO s (id, n) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET n = s.n + excluded.n")
+            .starts_with("42601 EXCLUDED in an expression is not supported yet"));
 }

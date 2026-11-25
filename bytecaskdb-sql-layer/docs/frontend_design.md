@@ -73,15 +73,15 @@ kind the transformer doesn't take is refused with its position.
   than target columns" or "more target columns than expressions"), then
   each value against its column in order. A constant, an unknown literal,
   `NULL` and a `$n` are bound against their column as a `VALUES` item is
-  (`'5'` is an INTEGER, `'x'` 22P02). Any other value must be of its
-  column's type or family: an integer into an integer column, `TEXT` or
-  `VARCHAR` into `TEXT` or `VARCHAR(n)`, a `DECIMAL` of the same scale,
-  `CHAR(n)` of the same length, which the row builder checks as it checks
-  a parameter (22003, 22001); a `REAL` or `DOUBLE PRECISION` into the
-  other; an integer into either, which the plan converts. A pair PostgreSQL
-  has no assignment cast for is 42804, its message PostgreSQL's (without
-  its hint); every other assignment cast PostgreSQL makes is refused
-  (0A000, #824). Refused too (0A000): a query that aggregates, groups or is
+  (`'5'` is an INTEGER, `'x'` 22P02). Any other value is assigned as
+  `UPDATE`'s `SET` assigns one (*Expressions in UPDATE … SET*, the
+  assignment table): an integer into an integer column and a string into
+  a string column as they are, which the row builder checks as it checks
+  a parameter (22003, 22001), every other pair PostgreSQL 17 assigns by
+  C1's cast to the column's type; a pair PostgreSQL has no assignment cast
+  for is 42804 with its message and HINT. A `REAL` or `DOUBLE PRECISION`
+  into a string column, and `NUMERIC` of no precision into or out of
+  another type, are refused (0A000). Refused too (0A000): a query that aggregates, groups or is
   `DISTINCT`, and a set operation, whose rows the plan gives through no
   `Emit` (#682); and `INSERT … SELECT` in a procedure. The plan is the
   query's, its rows sent to the write (`planner_design.md`, *INSERT …
@@ -119,8 +119,8 @@ kind the transformer doesn't take is refused with its position.
   or constraint name"), as in PostgreSQL. The `SET` binds over two
   relations, the target table and `excluded`, the row proposed: a column
   qualified by the table's name is the holder's, bound as `UPDATE`'s `SET`
-  binds (a column, column ± a parameter or integer, a constant, a
-  parameter, `DEFAULT`); `excluded.col` is the value the row proposed for
+  binds (any value expression, a constant, a parameter, `DEFAULT`; its
+  items stored in column order); `excluded.col` is the value the row proposed for
   `col`, its parameter, or `col`'s default where the row leaves it out. An
   unqualified column is 42702 ("column reference … is ambiguous"), an
   unknown `excluded` column 42703 ("column excluded.x does not exist"), an
@@ -1168,12 +1168,11 @@ operators PostgreSQL has for it but the accessors (`@>`, `<@`, `?`, `?|`,
 and `-` of a jsonb, by the binder) and the JSON functions but
 `jsonb_typeof` and `jsonb_array_length` (named `jsonb_…` or `json_…`,
 `to_json`, `to_jsonb`, `row_to_json`, `array_to_json`), its casts to
-`numeric(p, s)`, and to `varchar(n)`, `char` and `name`, which cut or pad; a jsonb column's value
-assigned to a string column (`INSERT … SELECT v::text` works); `json`
+`numeric(p, s)`, and to `varchar(n)`, `char` and `name`, which cut or pad; `json`
 (stage 1c), a domain, a procedure argument and a PL/pgSQL variable of
 jsonb. A form the parser takes for no type keeps its 42601 with jsonb:
 `IN`, `BETWEEN`, `IS DISTINCT FROM` and `LIKE` in a select list, `COLLATE`
-(PostgreSQL's is 42804), a cast in `UPDATE`'s `SET`.
+(PostgreSQL's is 42804).
 
 **jsonb's accessors and casts out** (`jsonb_design.md`, stage 3). `j -> k`
 and `j ->> k` with a text key or an integer index, `j #> p` and `j #>> p`
@@ -1270,20 +1269,19 @@ That includes:
   expression, a collation or an operator class in `ON CONFLICT`'s target,
   `DO UPDATE … WHERE`, and `ON CONFLICT` into a view or in a procedure
   (0A000); `INSERT … SELECT … ON CONFLICT DO UPDATE`, `excluded` inside an
-  expression, and `excluded.col` into a column of another type PostgreSQL
-  assigns to (42601, not yet);
+  expression (#908), and `excluded.col` into a column of another type
+  PostgreSQL assigns to (42601, not yet);
 - `INSERT … SELECT` of an aggregated, grouped or `DISTINCT` query or a set
-  operation (#682), of a value outside its column's type or family that
-  PostgreSQL assigns (a conversion through text, `CHAR(n)` into another
-  string type or length, a `DECIMAL` of another scale or into or out of an
-  integer or float, a date or time into another date or time type, #824),
-  or in a procedure (0A000);
+  operation (#682), or in a procedure (0A000); a `REAL` or `DOUBLE
+  PRECISION` value assigned to a string column, and `NUMERIC` of no
+  precision assigned into or out of another type, by `INSERT … SELECT` or
+  `SET` (0A000); a subquery in a `SET` value (42601);
 - `CASE` or `COALESCE` of a float beside another number, a `BETWEEN` or
   `IN` as a value, `GREATEST` and `LEAST`, `CASE` outside the plain select
   list (#685);
 - the quotient of a numeric other than constants, arithmetic and
   comparison of `REAL` and `DOUBLE PRECISION` as values, an expression in
-  `GROUP BY`, `SET`, an aggregated select list or the `ORDER BY` of a
+  `GROUP BY`, an aggregated select list or the `ORDER BY` of a
   grouped or aggregated query (#685, #686), `ORDER BY random()` and
   `ORDER BY t.*`;
 - `OVERLAY` of columns and parameters,
@@ -1301,14 +1299,13 @@ That includes:
 - a cast to `VARCHAR(n)` or `CHAR(n)`, and of a float to text (42601,
   #907); a cast of a `CHAR(n)` to other than a string type (0A000); a cast
   to or from `NUMERIC` of no precision but jsonb to it and it to text or
-  `name` (0A000, *NUMERIC without a precision*); a cast in `UPDATE`'s
-  `SET` of other than a constant or a parameter (42601, #904 stage S1);
+  `name` (0A000, *NUMERIC without a precision*);
   text in a date or time form the layer's input does not read, which
   PostgreSQL reads (`'today'`), is 22007 (*Known differences*); a cast of a
   parameter to `DECIMAL`, `VARCHAR(n)` or `CHAR(n)`, to a type another use
-  of it does not give it, or, in `VALUES` or `SET`, to other than its
-  column's type; a cast parameter inside an expression in `SET` or
-  `HAVING`, or in an aggregated select list; a numeric literal of more than 18 digits, a string literal in arithmetic (two string literals under one operator are
+  of it does not give it, or, in `VALUES`, to other than its column's
+  type; a cast parameter inside an expression in `HAVING`, or in an
+  aggregated select list; a numeric literal of more than 18 digits, a string literal in arithmetic (two string literals under one operator are
   PostgreSQL's 42725, operator is not unique), unary `-` or `abs`
   of a parameter, and a constant beside an aggregate;
 - `EXTRACT(EPOCH FROM …)` and `EXTRACT(JULIAN FROM …)` of a timestamp,
@@ -1414,8 +1411,11 @@ recompile after a DDL folds them again, to the types they meet then.
   A type PostgreSQL does not assign is 42804. The value's range is checked
   when the statement is compiled, as PostgreSQL checks it when it plans
   it, whether or not a row is written; of several out of range, the first
-  in the statement's order is the error, as there (a too-long string
-  before a later column's numeric overflow).
+  in the statement's order is the error in `VALUES`, as there (a too-long
+  string before a later column's numeric overflow), and the lowest-numbered
+  column's in `SET`, with no position (*Expressions in UPDATE … SET*,
+  **Errors and their order**). A `DECIMAL(p, s)` past its precision carries
+  numeric's DETAIL.
 - **Compared** (`WHERE`, `HAVING`): only a constant the column's type holds
   exactly. `smallint_col = 7.0` is `= 7`; `smallint_col = 40000`,
   `dec2_col = 1.005` and `real_col = 0.1` are refused (*Known differences*).
@@ -1651,7 +1651,8 @@ until then.
   aggregate inside an expression (an expression is taken inside an
   aggregate, *Aggregates*), an expression in the select list of an
   aggregated query or under `DISTINCT`, an expression in the `ORDER BY` of
-  a grouped or aggregated query, in `GROUP BY`, `SET` or a `WHERE`.
+  a grouped or aggregated query, in `GROUP BY` or a `WHERE`. `SET` takes
+  any value expression (*Expressions in UPDATE … SET*, #904 stage S1).
 
 ### Expressions in WHERE, ON and HAVING (stage P)
 
@@ -1758,7 +1759,7 @@ Each refusal of a clause names the clause as PG 17 does.
 | `IS [NOT] DISTINCT FROM`, `= ANY($1)` of an array, `IN` of a row | 42601, now with the position | not a stage P form |
 | A jsonb or NUMERIC comparison | as today (`numeric_compared`, :4597-4602) | `jsonb_design.md` stage 2 |
 | A correlated subquery inside an expression | as today | #836 |
-| `UPDATE … SET col = expr` beyond `col ± x` | as today (:4085-4175) | open question 6 |
+| `UPDATE … SET col = expr` beyond `col ± x` | built by #904 stage S1 (*Expressions in UPDATE … SET*) | open question 6 |
 | `ORDER BY`, `GROUP BY` of an aggregated query's expression | as today | not a filter |
 
 #### Three-valued logic of an expression filter
@@ -2286,8 +2287,9 @@ in *Open questions on #904*; tracking issue #904. Stage M1, `MIN` and `MAX`
 of text, is built (*MIN and MAX of text*, its as-built notes), and so are
 stage C0, the text input fixes (*Casts of an expression*, **Integer input,
 constants included**, its as-built notes), and stage C1, casts of any
-expression (*Casts of an expression*, **As built (C1)**); the other stages
-are not yet. It covers the six gaps #904 lists,
+expression (*Casts of an expression*, **As built (C1)**), and stage S1,
+expressions in `UPDATE … SET` (*Expressions in UPDATE … SET (#896)*,
+**As built (S1)**); the other stages are not yet. It covers the six gaps #904 lists,
 found while building jsonb stage 3: a cast of an expression, `GROUP BY`
 of an expression, `SELECT DISTINCT` and `COUNT(DISTINCT …)` of an
 expression, an expression in `UPDATE … SET` (#896), `MIN`/`MAX` of text,
@@ -2753,6 +2755,8 @@ error raised. NOT NULL is checked when the row is complete, as today.
 | `GREATEST`, `LEAST` | 42601, as everywhere today | open question 12 |
 | An aggregate | 42803 `aggregate functions are not allowed in UPDATE`, PG 17's message | PG refuses it |
 | `INSERT … VALUES` of a column expression | 42601 `INSERT values must be parameters or constants`, as today (`binder.cppm:8343-8346`) | `VALUES` has no row; the widened `value()` must keep this guard |
+| A `$n` the `SET` types twice where PG 17 runs it: a cast or an operator first, then a bare `$n` into a column of another type (`SET b = $1::int, a = $1::smallint`, `SET b = $1 + 1, a = $1`), or a bare `$n` beside a `WHERE` or `RETURNING` use of another type (`SET a = $1 WHERE b = $1`) | 42601 `parameter $1 is …`, as before S1 | the layer gives a `$n` one type; PG types it by its first use and casts the later ones (as built, below) |
+| A `$n` beside a `DECIMAL(p, s)` column with more fractional digits than `s` (`SET d = d + $1` of `0.005`) | 22P02 `value "0.005" has more fractional digits than its column's scale of 2`, as before S1 | the layer reads such a `$n` at the column's scale; PG 17 types it `numeric` and rounds the result (`12.35`) |
 
 **`col + $n` and `col - $n` today.** The special branch (`binder.cppm:
 4638-4660`, `literal()` at :4575-4592) and `Checker::set_list`'s Add/Sub
@@ -2775,6 +2779,84 @@ DECIMAL literal that would rescale past 18 digits refused at bind.
   DECIMAL constant operand of a DECIMAL `+` or `-` at the sum's scale. It
   stays a bind-time refusal, so `CONTRACT.md:313` is unchanged, and its
   test stays.
+
+**As built (S1).** As designed, but for these:
+
+- **One rule, `Binder::assignment`**, replaces INSERT … SELECT's
+  `assigns_to` and the column, `col ± $n` and `col ± k` branches of
+  `Binder::value`. A value of the column's own type, an integer into
+  another integer and a string into another string type are stored as
+  they are (the row builder checks the range, the length and a NAME's 63
+  bytes); a `CHAR(n)` value into another string type, and every other
+  pair the table takes, is a C1 `Cast` node to the column's type (to
+  `name` for a NAME column, so a boolean is `t`, else to text). A cast to
+  `VARCHAR(n)` or `CHAR(n)` is never made: the row builder's 22001 is the
+  assignment's. `physical::assigns` checks the same rule: a value stored
+  as it is, else one of the column's own type.
+- **`$n` in a SET value** is typed by its operator, as in a select list:
+  `n = n + $1` describes `$1` as `n`'s type, which the parameter's use
+  messages now call "combined with" rather than "added to" or
+  "subtracted from" (`Use::Added` and `Use::Subtracted` are gone).
+- **Folding errors** are the binder's: an error of class 22 not raised at
+  analysis (`SqlError::at_analysis`, the mark a literal's input error
+  carries) is recorded on its item by `FoldedErrors` and raised, the
+  lowest-numbered column's, without a position, once the `WHERE` and
+  `RETURNING` are bound, so an analysis error anywhere in the statement
+  comes first, as PostgreSQL 17's (`SET n = 1/0 WHERE id = 'zz'` is
+  22P02). A `DECIMAL(p, s)` constant past its precision, in `SET` and in
+  `VALUES`, now carries numeric's DETAIL.
+- **The DECIMAL literal check** is `rescalable`'s: in a SET value, a
+  constant operand of `+` or `-` past 18 digits at the sum's scale is
+  22003 `numeric field overflow`, at bind, as `literal()` raised it;
+  elsewhere it stays 42601.
+- **INSERT VALUES** of anything but a constant, a parameter, `DEFAULT` or
+  the clock is 42601 `INSERT values must be parameters or constants`
+  before it is bound, so the general path never sees a VALUES item.
+- **The arithmetic operator's 42883** names an untyped operand `unknown`
+  and carries PostgreSQL's HINT, in a select list and a `SET` alike
+  (`SET b = b - $1` of a bytea is `operator does not exist: bytea -
+  unknown`).
+- **Range errors keep a suffix**: the row builder's 22003 and 22001 add
+  `for column "a" of table "s"` to PostgreSQL's message, as an `INSERT`'s
+  already do.
+- **A column assigned twice** in `SET` (an UPDATE's or ON CONFLICT's) is
+  PG 17's 42601 `multiple assignments to same column "a"`, raised by its
+  rewriter: after every analysis error of the statement, before the
+  folding errors (`SET a = 1/0, a = 3` is 42601), with no position
+  (`FoldedErrors::assign`). A `SET` column the table lacks is PG 17's
+  42703 `column "zz" of relation "t" does not exist`.
+- **A constant of a pair the old constant coercion did not take** (a
+  float into an integer, a DECIMAL or a REAL; a real into a BIGINT; a
+  timestamp into a date) is folded by C1's cast (`fold_cast`), so
+  `SET b = 2.5::float8` stores `2` as `SET b = f` does, and `'1e30'::float8`
+  into an integer is 22003 `integer out of range` at bind, as PG 17's
+  planner raises it even when no row matches. `VALUES` and INSERT …
+  SELECT's constant items take the same fold. A boolean constant into a
+  NAME is `t` or `f`, boolout's text, as a computed one is; into another
+  string type `true` or `false`.
+- **PG 17's 42P08** `inconsistent types deduced for parameter $1`, with
+  its DETAIL (`integer versus smallint`) and position, where a list of
+  assigned values (a `SET`, a row of `VALUES`) types an untyped `$n` two
+  ways: PG deduces a `$n`'s type from its uses inside expressions while
+  it analyses the list, then coerces each bare `$n` item in written
+  order, so `SET a = $1, b = $1 + 1` (a smallint) and `VALUES (8, $1, $1)`
+  into a smallint and an integer are 42P08 (`Binder::inconsistent_param`).
+  The layer raises it only where the outcome is certain: the first use a
+  bare item of the list, the `$n` in no `WHERE` or `RETURNING` (which PG
+  types first), base types that differ (`DECIMAL`s of two scales are one
+  `numeric`). A second bare item when a use inside an expression is still
+  to come (`SET a = $1, nm = $1, b = $1 + 1`) stays the layer's 42601; the
+  forms PG runs are in the refused table above.
+- Tests: `binder: a SET value is any value expression, assigned by
+  PostgreSQL 17's assignment casts`, `embedded API: SET of an expression
+  reads the row before the update`, `wire:
+  test_a_set_expression_types_its_parameters_as_postgresql_17`, the
+  golden plans of `col ± $n` (now evaluated as any expression, their range
+  error on the table), the proof machine's `set_an_expression` rule (an
+  expression over a keyed row assigned to a column of each kind, compared
+  on SQLSTATE where either side raises) and the functional cases in
+  `dml.yaml` (four `SET` cases, and the INSERT … SELECT assignment case
+  whose mark is lifted).
 
 #### MIN and MAX of text
 
@@ -2915,6 +2997,9 @@ moves from 22P02 to 22003.
   PostgreSQL 17's values and errors`, `plan API: the cast helpers keep
   their input function's SQLSTATE`, `proof: test_sql_machine`,
   `tests/functional/cases/postgresql/casts.yaml`.
+- **Widened** (S1, as built), the jsonb row (`CONTRACT.md:118`): its 0A000
+  list loses a jsonb column's value assigned to a string column, and its
+  42601 list loses a cast in UPDATE's SET; both are the SET row's.
 - **Widened** (C1), `CONTRACT.md:119`: the jsonb casts out are casts of
   any expression, as above; its `ARRAY[ARRAY[…]]` and text[] words stay.
 - **Widened** (C0), `CONTRACT.md:111`: a string constant cast to an
@@ -3046,7 +3131,7 @@ tests.
 | M1 | `MIN`/`MAX` of text: the plan API's bytes slot, a stream's holder; depends on no other stage | `SELECT max(Id) …`, `min(Props->>'k')` | ~700 lines: binder 40, physical 40, codegen 120, plan API 180, tests 270, docs 50 |
 | C0 (built) | input fixes shared by constants, parameters and (later) casts: `integer_from` (`0x`, `0o`, `0b`, `_`, the value in its 22003), `float_from`'s `real` (`strtof`, its message), `decimal_from`'s `'Infinity'`; the `ARRAY[ARRAY]` message | `'0x1F'::int`, a hex integer parameter | ~300 lines: text 90, binder 10, tests 170, docs 30 |
 | C1 (built) | casts of expressions: `cast_kind`, the `Cast` kind replacing `JsonbCast`, the plan API's cast helpers, cast naming; casts in procedure expressions | `WHERE (Props->>'x')::bigint > $1`, `ORDER BY (Props->>'n')::int`, `sum((Props->>'n')::int)`, `$1::text::int` | ~1,150 lines: binder 190, physical 50, codegen 150, plan API 330, tests 370, docs 60 |
-| S1 | expressions in `SET` with the assignment table, the store shared with `INSERT … SELECT` (closes #824), column-order evaluation, `$n::T` of another type; needs C1's output and rounding helpers | `UPDATE … SET Message = lower(Message)`, `SET n = (Props->>'n')::int`, `SET s = Props->>'k'`, `SET flag = CASE … END`; with jsonb stage 4, `SET Props = jsonb_set(Props, $2, $3)` | ~950 lines: binder 240, physical 60, codegen 130, tests 440, docs 80 |
+| S1 (built) | expressions in `SET` with the assignment table, the store shared with `INSERT … SELECT` (closes #824), column-order evaluation, `$n::T` of another type; needs C1's output and rounding helpers | `UPDATE … SET Message = lower(Message)`, `SET n = (Props->>'n')::int`, `SET s = Props->>'k'`, `SET flag = CASE … END`; with jsonb stage 4, `SET Props = jsonb_set(Props, $2, $3)` | ~950 lines: binder 240, physical 60, codegen 130, tests 440, docs 80 |
 | G0 | `GROUP BY` positions and output names over **column** items (the input-column-first rule, 42P10, 42702, 42601 for a non-integer constant); binder only, keys stay columns; a position naming an expression item stays 42601 until G1 | `SELECT UserId, count(*) … GROUP BY 1` | ~350 lines: parser 60, binder 110, tests 160, docs 20 |
 | G1 | `GROUP BY` of expressions (positions naming one included), keys the same for every row; `SELECT DISTINCT` of expressions; `same_expr` extended; the grouped resolver's exact-key case; `GroupKey`; expression keys in the structure, never streamed | `SELECT Props->>'k', count(*) … GROUP BY 1`, `SELECT DISTINCT Props->>'type'` | ~1,050 lines: binder 190, logical 30, search 140, physical 80, codegen 180, tests 390, docs 40 |
 | G2 | `COUNT`, `SUM`, `AVG` of `DISTINCT` values of an expression: `GroupLayout::distinct` as an `Expr`, the evaluated value appended as a key part, the one-row Aggregate's fold (`codegen.cppm:2271`) keying an expression by its value | `count(DISTINCT Props->>'user_id')` | ~550 lines: binder 40, physical 60, codegen 150, tests 260, docs 40 |
@@ -3373,14 +3458,15 @@ fail on them.
   a column declared `VARCHAR`, a constant cast to it (`'a'::varchar`), and
   a parameter cast to it (`SELECT $1::varchar`, the parameter and the
   column both 25). A `VARCHAR(n)` is described as PostgreSQL describes it.
-- **A DECIMAL operand of `col ± $n` past 18 digits is 22003.** The layer's
+- **A DECIMAL operand of `+` or `-` of `$n` in `SET` past 18 digits is 22003.** The layer's
   DECIMAL is a scaled 64-bit integer (`types_design.md`), so the operand is
   checked against 18 digits at the column's scale before the plan runs,
   even when the column is NULL. PostgreSQL's unconstrained `numeric` may
   still complete (NULL plus anything is NULL). The machine's operands stay
   inside 18 digits.
-- **A DECIMAL literal operand of `col ± n` past 18 digits once scaled is
-  refused at bind** ("numeric field overflow"), whatever the column holds.
+- **A DECIMAL literal operand of `+` or `-` in `SET` past 18 digits once
+  scaled is refused at bind** ("numeric field overflow"), whatever the
+  column holds.
   PostgreSQL computes the sum and fails only when it doesn't fit the
   column. The machine's literals stay inside 18 digits.
 - **A numeric quotient of columns is refused; one of constants is exact

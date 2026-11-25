@@ -976,6 +976,7 @@ PostgreSQL's code only for a statement PostgreSQL also refuses with it:
 | an arithmetic operator PostgreSQL has none of for a date or time type beside an operand of type unknown (`date * unknown`, `unknown / time`) | `42883` |
 | `time + time`, and `date + unknown`, which PostgreSQL finds ambiguous | `42725` |
 | a `$n` no use gives a type | `42P18` |
+| an untyped `$n` a `SET` list or a `VALUES` row types two ways, as PostgreSQL deduces it | `42P08` |
 | a column reference both joined tables have | `42702` |
 | a column listed twice in an `INSERT` | `42701` |
 | an aggregate beside a bare column or in `ORDER BY`, or in an `UPDATE` | `42803` |
@@ -993,6 +994,9 @@ or string column, a join on columns of two types, and an unsupported
 assigns it: PostgreSQL types a `$n` by its first use, which for `UPDATE` is
 its `WHERE` before the `SET` the layer binds first, and refuses an untyped `$n`
 assigned to two columns of different types with `42P08` whatever the types.
+Where a list of assigned values (a `SET`, a row of `VALUES`) is certain to
+give PostgreSQL's `42P08`, the layer raises it too, with its DETAIL
+(`frontend_design.md`, *Expressions in UPDATE … SET*, as built).
 The planner plans every statement the binder takes; its "no plan"
 refusal, `FeatureNotSupported`, `0A000`, is for a logical plan the binder
 never builds (`planner_design.md`, *What the search refuses*). HammerDB's driver sends

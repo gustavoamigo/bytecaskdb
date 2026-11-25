@@ -635,8 +635,6 @@
 
 - name: INSERT … SELECT with an assignment cast PostgreSQL makes
   features: [E101-01]
-  # INSERT … SELECT of an integer value into column "s" of type text is not supported yet (0A000, #824)
-  unimplemented: true
   setup:
     - CREATE TABLE src (a INTEGER PRIMARY KEY, d DOUBLE PRECISION)
     - INSERT INTO src VALUES (1, 2.5), (2, 3.5)
@@ -649,3 +647,152 @@
   teardown:
     - DROP TABLE dst
     - DROP TABLE src
+
+- name: UPDATE … SET of any value expression, every value from the row before the update
+  features: [E101-03]
+  setup:
+    - CREATE TABLE se (id INTEGER PRIMARY KEY, n INTEGER, t TEXT, j JSONB, b BOOLEAN)
+    - "INSERT INTO se VALUES (1, 5, 'x', '{\"n\": \"7\", \"s\": \"Str\"}', true), (2, NULL, NULL, NULL, NULL)"
+  steps:
+    - sql: UPDATE se SET n = n + 1, t = t || n WHERE id = 1 RETURNING n, t
+      expected: [[6, x5]]
+    - sql: UPDATE se SET n = (j->>'n')::int, t = j->>'s' RETURNING id, n, t
+      expected: [[1, 7, Str], [2, null, null]]
+    - sql: UPDATE se SET t = lower(t), b = n > 6 RETURNING id, t, b
+      expected: [[1, str, t], [2, null, null]]
+    - sql: UPDATE se SET t = CASE WHEN n > 5 THEN 'big' ELSE 'small' END, n = coalesce(n, 0) * 2 RETURNING id, n, t
+      expected: [[1, 14, big], [2, 0, small]]
+    - sql: SELECT id, n, t, b FROM se ORDER BY id
+      expected: [[1, 14, big, t], [2, 0, small, null]]
+  teardown:
+    - DROP TABLE se
+
+- name: UPDATE … SET assigns a value of another type by PostgreSQL's assignment cast
+  features: [E101-03]
+  setup:
+    - CREATE TABLE sa (id INTEGER PRIMARY KEY, a SMALLINT, n INTEGER, d NUMERIC(5, 2), f DOUBLE PRECISION, t TEXT, v VARCHAR(3), ch CHAR(3), nm NAME, bo BOOLEAN, dt DATE, ts TIMESTAMP, j JSONB, by BYTEA)
+    - "INSERT INTO sa VALUES (1, 5, 5, 2.50, 2.5, 'x', 'ab', 'ab', 'nm', true, '2024-03-01', '2024-03-01 10:00', '{\"o\": {\"z\": 1}}', '\\x6162')"
+  steps:
+    - sql: UPDATE sa SET t = bo RETURNING t
+      expected: [["true"]]
+    - sql: UPDATE sa SET nm = bo RETURNING nm
+      expected: [[t]]
+    - sql: UPDATE sa SET t = d RETURNING t
+      expected: [["2.50"]]
+    - sql: UPDATE sa SET t = j->'o' RETURNING t
+      expected: [["{\"z\": 1}"]]
+    - sql: UPDATE sa SET t = dt RETURNING t
+      expected: [["2024-03-01"]]
+    - sql: UPDATE sa SET t = by RETURNING t
+      expected: [[\x6162]]
+    - sql: UPDATE sa SET t = ch || '|' RETURNING t
+      expected: [[ab|]]
+    - sql: UPDATE sa SET n = f RETURNING n
+      expected: [[2]]
+    - sql: UPDATE sa SET n = d RETURNING n
+      expected: [[3]]
+    - sql: UPDATE sa SET d = n * 1.005 RETURNING d
+      expected: [["3.02"]]
+    - sql: UPDATE sa SET f = n RETURNING f
+      expected: [[3]]
+    - sql: UPDATE sa SET dt = ts, ts = dt RETURNING dt, ts
+      expected: [["2024-03-01", "2024-03-01 00:00:00"]]
+    - sql: UPDATE sa SET a = n + 1 RETURNING a
+      expected: [[4]]
+    - sql: SELECT a, n, d, t, nm, dt, ts FROM sa
+      expected: [[4, 3, "3.02", ab|, t, "2024-03-01", "2024-03-01 00:00:00"]]
+  teardown:
+    - DROP TABLE sa
+
+- name: UPDATE … SET refuses as PostgreSQL refuses, and writes nothing
+  features: [E101-03]
+  setup:
+    - CREATE TABLE sr (id INTEGER PRIMARY KEY, a SMALLINT, n INTEGER, d NUMERIC(5, 2), t TEXT, v VARCHAR(3), ch CHAR(3), bo BOOLEAN, dt DATE, tm TIME, j JSONB)
+    - "INSERT INTO sr VALUES (1, 32767, 5, 2.50, 'x', 'ab', 'ab', true, '2024-03-01', '10:00', '{\"s\": \"str\"}')"
+  steps:
+    - sql: UPDATE sr SET n = t
+      error: "42804"
+    - sql: UPDATE sr SET bo = n
+      error: "42804"
+    - sql: UPDATE sr SET n = j
+      error: "42804"
+    - sql: UPDATE sr SET tm = dt
+      error: "42804"
+    - sql: UPDATE sr SET n = sum(n)
+      error: "42803"
+    - sql: UPDATE sr SET a = a + 1
+      error: "22003"
+    - sql: UPDATE sr SET a = n + 100000
+      error: "22003"
+    - sql: UPDATE sr SET d = d + 1000
+      error: "22003"
+    - sql: UPDATE sr SET v = t || 'abcd'
+      error: "22001"
+    - sql: UPDATE sr SET ch = t || 'abcd'
+      error: "22001"
+    - sql: UPDATE sr SET n = (j->>'s')::int
+      error: "22P02"
+    - sql: UPDATE sr SET n = n / (n - n), a = a + 1
+      error: "22003"
+    - sql: UPDATE sr SET a = a + 1, n = n / (n - n)
+      error: "22003"
+    - sql: UPDATE sr SET n = 1/0, a = 99999
+      error: "22003"
+    - sql: UPDATE sr SET a = 99999, n = 1/0
+      error: "22003"
+    - sql: UPDATE sr SET n = 'zz', a = 99999
+      error: "22P02"
+    - sql: SELECT a, n, d, t, v, ch FROM sr
+      expected: [[32767, 5, "2.50", x, ab, "ab "]]
+  teardown:
+    - DROP TABLE sr
+
+- name: ON CONFLICT DO UPDATE SET of any value expression over the row that holds the key
+  features: [E101-03]
+  setup:
+    - CREATE TABLE sc (id INTEGER PRIMARY KEY, n INTEGER, t TEXT)
+    - INSERT INTO sc VALUES (1, 5, 'x')
+  steps:
+    - sql: INSERT INTO sc VALUES (1, 0, 'y') ON CONFLICT (id) DO UPDATE SET n = sc.n * 2 + 1, t = upper(sc.t) || sc.n RETURNING n, t
+      expected: [[11, X5]]
+    - sql: INSERT INTO sc VALUES (2, 0, 'y') ON CONFLICT (id) DO UPDATE SET n = sc.n * 2 RETURNING n, t
+      expected: [[0, y]]
+    - sql: SELECT id, n, t FROM sc ORDER BY id
+      expected: [[1, 11, X5], [2, 0, y]]
+  teardown:
+    - DROP TABLE sc
+
+- name: UPDATE … SET of a constant, a column twice and a parameter typed two ways, as PostgreSQL
+  features: [E101-03]
+  setup:
+    - CREATE TABLE sk (id INTEGER PRIMARY KEY, a SMALLINT, n INTEGER, d NUMERIC(5, 2), r REAL, nm NAME, t TEXT, dt DATE)
+    - INSERT INTO sk VALUES (1, 1, 1, 1.00, 1, 'x', 'x', '2024-01-01')
+  steps:
+    - sql: UPDATE sk SET nm = true RETURNING nm
+      expected: [[t]]
+    - sql: UPDATE sk SET t = true RETURNING t
+      expected: [["true"]]
+    - sql: INSERT INTO sk (id, nm) SELECT 2, false RETURNING nm
+      expected: [[f]]
+    - sql: INSERT INTO sk (id, nm) VALUES (3, true) RETURNING nm
+      expected: [[t]]
+    - sql: UPDATE sk SET n = 2.5::float8, d = 2.5::float8, r = 2.5::float8, a = 3.5::real WHERE id = 1 RETURNING a, n, d, r
+      expected: [[4, 2, "2.50", 2.5]]
+    - sql: UPDATE sk SET dt = '2024-02-03 10:00'::timestamp WHERE id = 1 RETURNING dt
+      expected: [["2024-02-03"]]
+    - sql: UPDATE sk SET n = '1e30'::float8 WHERE false
+      error: "22003"
+    - sql: UPDATE sk SET n = 1, n = 2
+      error: "42601"
+    - sql: UPDATE sk SET n = 1/0, n = 2
+      error: "42601"
+    - sql: UPDATE sk SET a = $1, n = $1 + 1
+      params: [5]
+      error: "42P08"
+    - sql: INSERT INTO sk (id, a, n) VALUES (9, $1, $1)
+      params: [5]
+      error: "42P08"
+    - sql: SELECT id, a, n, d, r, nm, dt FROM sk ORDER BY id
+      expected: [[1, 4, 2, "2.50", 2.5, t, "2024-02-03"], [2, null, null, null, null, f, null], [3, null, null, null, null, t, null]]
+  teardown:
+    - DROP TABLE sk
