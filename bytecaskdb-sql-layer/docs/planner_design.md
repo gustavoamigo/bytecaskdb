@@ -15,7 +15,8 @@ tables*).
 The first of the post-MVP designs (#487, *Next*). The parser, the plan API
 and TinyCC are unchanged by it; the binder's output changed. The rest of
 the dialect is #534's (*Slices*). *Expressions in casts, group keys,
-DISTINCT, SET and text MIN/MAX (#904)* is approved (2026-11-22), not built yet.
+DISTINCT, SET and text MIN/MAX (#904)* is approved (2026-11-22); its
+stages M1, C0, C1, S1 and G0 are built, the others not yet.
 
 ## Why
 
@@ -1832,7 +1833,10 @@ fixes `from_text` shares (`integer_from`, `float_from`'s `real`,
 Stage C1, casts of any expression, is built, with its as-built notes under
 *Plan API calls for runtime casts*, and so is stage S1, expressions in
 `UPDATE … SET`, with its as-built notes under *UPDATE SET of an
-expression*. The other stages are not yet. The dialect, PG 17's behaviour, the
+expression*. Stage G0, `GROUP BY` positions and output names of column
+items, is built in the parser and binder alone: its keys are columns, so
+nothing here changed (its notes are `frontend_design.md`'s **As built
+(G0)**). The other stages are not yet. The dialect, PG 17's behaviour, the
 refusals, the stages (M1, C0, C1, S1, G0, G1, G2) and the open questions are
 `frontend_design.md`, *Expressions in casts, GROUP BY, DISTINCT, SET and
 MIN/MAX of text (#904)*. This section is how the plan, the search, the

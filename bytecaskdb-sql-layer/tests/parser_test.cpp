@@ -291,6 +291,47 @@ TEST_CASE("parser: ORDER BY an output name orders by its item, never the input c
   CHECK(twice.order_by[0].expr.table == "t");
 }
 
+TEST_CASE("parser: GROUP BY positions name select items, with PostgreSQL 17's errors (#904 G0)", "[sql][parser][group]") {
+  // A position is its item's column, (1) included; the item keeps its own.
+  auto s = std::get<Select>(parse("SELECT qty, count(*) FROM t GROUP BY 1, (1), name"));
+  REQUIRE(s.group_by.size() == 3);
+  CHECK(s.group_by[0].kind == Expr::Kind::Column);
+  CHECK(s.group_by[0].column == "qty");
+  CHECK(s.group_by[0].alias.empty());
+  CHECK(s.group_by[1].column == "qty");
+  CHECK(s.group_by[2].column == "name");
+  CHECK(std::get<Select>(parse("SELECT name AS qty, qty AS name FROM t GROUP BY 2")).group_by[0].column == "qty");
+  auto qualified = std::get<Select>(parse("SELECT x.qty FROM t AS x GROUP BY 1"));
+  CHECK(qualified.group_by[0].table == qualified.targets[0].table);
+  // A bare name stays as written: only the binder knows the input columns.
+  CHECK(std::get<Select>(parse("SELECT qty AS k FROM t GROUP BY k")).group_by[0].column == "k");
+  auto error_of = [](const char* sql) {
+    try {
+      (void)parse(sql);
+    } catch (const SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what() + " @" + std::to_string(e.pos());
+    }
+    return std::string{"parsed"};
+  };
+  // PostgreSQL 17, each run.
+  CHECK(error_of("SELECT qty, count(*) FROM t GROUP BY 3") == "42P10 GROUP BY position 3 is not in select list @37");
+  CHECK(error_of("SELECT qty, count(*) FROM t GROUP BY 0") == "42P10 GROUP BY position 0 is not in select list @37");
+  CHECK(error_of("SELECT qty, count(*) FROM t GROUP BY -1") == "42P10 GROUP BY position -1 is not in select list @37");
+  for (const auto* sql : {"SELECT qty FROM t GROUP BY 'x'", "SELECT qty FROM t GROUP BY 1.5", "SELECT qty FROM t GROUP BY NULL",
+                          "SELECT qty FROM t GROUP BY true", "SELECT qty FROM t GROUP BY 9999999999"}) {
+    CHECK(error_of(sql) == "42601 non-integer constant in GROUP BY @27");
+  }
+  // An item holding an aggregate: 42803 at the aggregate.
+  CHECK(error_of("SELECT qty, count(*) FROM t GROUP BY 2") == "42803 aggregate functions are not allowed in GROUP BY @12");
+  CHECK(error_of("SELECT qty, count(*) + 1 FROM t GROUP BY 2") == "42803 aggregate functions are not allowed in GROUP BY @12");
+  // An expression item is not a key yet (G1); * has no positions yet.
+  CHECK(error_of("SELECT qty + 1 FROM t GROUP BY 1") == "42601 GROUP BY of an expression is not supported yet @31");
+  CHECK(error_of("SELECT 1, count(*) FROM t GROUP BY 1") == "42601 GROUP BY of an expression is not supported yet @35");
+  CHECK(error_of("SELECT * FROM t GROUP BY 1") ==
+        "42601 GROUP BY position with * in the select list is not supported yet @25");
+  CHECK(error_of("SELECT qty FROM t GROUP BY 1::int").starts_with("42601 GROUP BY takes columns"));
+}
+
 TEST_CASE("parser: COUNT, ORDER BY, LIMIT and column + parameter", "[sql][parser]") {
   auto s = std::get<Select>(parse("SELECT count(*), count(qty) FROM t WHERE name = $1 ORDER BY name DESC, id LIMIT 3"));
   REQUIRE(s.targets.size() == 2);
