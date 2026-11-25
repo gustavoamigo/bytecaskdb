@@ -758,9 +758,6 @@
 
 - name: GROUP BY a position or output name of an expression
   features: [E051-02]
-  # a position or output name naming an expression item is refused until
-  # #904 stage G1 (42601 GROUP BY of an expression is not supported yet)
-  unimplemented: true
   setup:
     - CREATE TABLE gx (id INTEGER PRIMARY KEY, a INTEGER)
     - INSERT INTO gx VALUES (1, 1), (2, 1), (3, 2)
@@ -803,3 +800,115 @@
   teardown:
     - DROP TABLE gu
     - DROP TABLE gw
+
+- name: GROUP BY of expressions, each key computed per row
+  features: [E051-02, E051-04]
+  setup:
+    - CREATE TABLE gz (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, s TEXT, d DOUBLE PRECISION, j JSONB)
+    - "INSERT INTO gz VALUES (1, 1, 2, 'Ab', 0.0, '{\"k\": \"x\", \"type\": \"t1\"}'), (2, 1, 3, 'ab', -0.0, '{\"k\": \"y\"}'), (3, 2, 2, NULL, 'NaN', '{\"k\": \"x\", \"type\": \"t2\"}'), (4, NULL, NULL, 'AB', 'NaN', NULL), (5, 1, 1, 'x', 1, '{\"type\": \"t1\"}')"
+  steps:
+    - sql: SELECT j->>'k', count(*) FROM gz GROUP BY 1
+      expected: [[null, 2], [x, 2], [y, 1]]
+    - sql: SELECT lower(s), count(*) FROM gz GROUP BY lower(s) ORDER BY 2 DESC, 1
+      expected: [[ab, 3], [x, 1], [null, 1]]
+      ordered: true
+    - sql: SELECT a + b, count(*) FROM gz GROUP BY a + b
+      expected: [[null, 1], [2, 1], [3, 1], [4, 2]]
+    - sql: SELECT (a::text), count(*) FROM gz GROUP BY (a::text)
+      expected: [[null, 1], [1, 3], [2, 1]]
+    - sql: SELECT a, lower(s), count(*) FROM gz GROUP BY a, lower(s)
+      expected: [[null, ab, 1], [1, ab, 2], [1, x, 1], [2, null, 1]]
+    - sql: SELECT lower(gz.s) AS l, count(*) FROM gz GROUP BY l
+      expected: [[null, 1], [ab, 3], [x, 1]]
+    # -0.0 and 0.0 one group, every NaN one; which row's -0 or 0 a group
+    # shows is PostgreSQL's plan's, so the counts alone
+    - sql: SELECT count(*) FROM gz GROUP BY -d
+      expected: [[1], [2], [2]]
+    - sql: SELECT lower(s) FROM gz GROUP BY lower(s) HAVING lower(s) > 'a'
+      expected: [[ab], [x]]
+    - sql: SELECT lower(s), count(*) FROM gz GROUP BY lower(s) ORDER BY lower(s) DESC LIMIT 2
+      expected: [[null, 1], [x, 1]]
+      ordered: true
+    - sql: SELECT a, sum(b) FROM gz GROUP BY a ORDER BY sum(b) DESC NULLS LAST
+      expected: [[1, 6], [2, 2], [null, null]]
+      ordered: true
+    - sql: SELECT a + 01, count(*) FROM gz GROUP BY a + 1
+      expected: [[null, 1], [2, 3], [3, 1]]
+    - sql: SELECT id, b, lower(s) FROM gz GROUP BY 1, lower(s)
+      expected: [[1, 2, ab], [2, 3, ab], [3, 2, null], [4, null, ab], [5, 1, x]]
+    - sql: SELECT count(*) FROM gz GROUP BY 1 + 1
+      expected: [[5]]
+    - sql: SELECT 1, count(*) FROM gz GROUP BY 1
+      expected: [[1, 5]]
+    - sql: SELECT upper(s) FROM gz GROUP BY lower(s)
+      error: "42803"
+    - sql: SELECT s FROM gz GROUP BY lower(s)
+      error: "42803"
+    - sql: SELECT a + 1 FROM gz GROUP BY 1 + a
+      error: "42803"
+    - sql: SELECT a + 1.0 FROM gz GROUP BY a + 1
+      error: "42803"
+    - sql: SELECT id, b FROM gz GROUP BY id + 0
+      error: "42803"
+    - sql: SELECT count(*) FROM gz GROUP BY a + count(*)
+      error: "42803"
+    # A cast to the column's own type is the column; unary + and a relabel
+    # to another type are expressions the column is not
+    - sql: SELECT a, count(*) FROM gz GROUP BY a::int4
+      expected: [[null, 1], [1, 3], [2, 1]]
+    - sql: SELECT id, b FROM gz GROUP BY id::int4
+      expected: [[1, 2], [2, 3], [3, 2], [4, null], [5, 1]]
+    - sql: SELECT +a, count(*) FROM gz GROUP BY +a
+      expected: [[null, 1], [1, 3], [2, 1]]
+    - sql: SELECT a, count(*) FROM gz GROUP BY +a
+      error: "42803"
+    - sql: SELECT a FROM gz GROUP BY +a HAVING a > 1
+      error: "42803"
+    - sql: SELECT s, count(*) FROM gz GROUP BY s::varchar
+      error: "42803"
+  teardown:
+    - DROP TABLE gz
+
+- name: GROUP BY of a key the same for every row gives no group over no rows
+  features: [E051-04]
+  setup:
+    - CREATE TABLE gn (id INTEGER PRIMARY KEY, s TEXT)
+  steps:
+    - sql: SELECT count(*) FROM gn GROUP BY 1 + 1
+      expected: []
+    - sql: SELECT count(*) FROM gn GROUP BY 'x'::text
+      expected: []
+    - sql: SELECT 1, count(*) FROM gn GROUP BY 1
+      expected: []
+    - sql: SELECT DISTINCT 1 FROM gn
+      expected: []
+    - sql: SELECT DISTINCT lower(s) FROM gn
+      expected: []
+    - sql: SELECT count(*) FROM gn
+      expected: [[0]]
+  teardown:
+    - DROP TABLE gn
+
+- name: SELECT DISTINCT of expressions
+  features: [E051-01]
+  setup:
+    - CREATE TABLE dz (id INTEGER PRIMARY KEY, a INTEGER, s TEXT, d DOUBLE PRECISION, j JSONB)
+    - "INSERT INTO dz VALUES (1, 1, 'Ab', 0.0, '{\"type\": \"t1\"}'), (2, 1, 'ab', -0.0, '{\"type\": \"t2\"}'), (3, 2, NULL, 1, NULL), (4, NULL, 'x', 'NaN', '{\"type\": \"t1\"}')"
+  steps:
+    - sql: SELECT DISTINCT j->>'type' FROM dz
+      expected: [[null], [t1], [t2]]
+    - sql: SELECT DISTINCT lower(s) FROM dz ORDER BY lower(s)
+      expected: [[ab], [x], [null]]
+      ordered: true
+    - sql: SELECT DISTINCT a, lower(s) FROM dz
+      expected: [[null, x], [1, ab], [2, null]]
+    - sql: SELECT DISTINCT a * 2, 5 FROM dz
+      expected: [[null, 5], [2, 5], [4, 5]]
+    - sql: SELECT DISTINCT abs(d) FROM dz
+      expected: [[0], [1], [NaN]]
+    - sql: SELECT DISTINCT lower(s) FROM dz ORDER BY s
+      error: "42P10"
+    - sql: SELECT DISTINCT lower(s), count(*) FROM dz GROUP BY lower(s)
+      expected: [[null, 1], [ab, 2], [x, 1]]
+  teardown:
+    - DROP TABLE dz

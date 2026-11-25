@@ -249,17 +249,31 @@ struct OrderItem {
 // Whether two expressions are written alike, as PostgreSQL's equal() finds
 // two select items or an ORDER BY key and a select item one: their kinds,
 // names, constants and operands; never their positions or AS names. A
-// subquery is the same one only as the same parse.
-[[nodiscard]] auto same_expr(const Expr& a, const Expr& b) -> bool {
-  auto both = [](const std::unique_ptr<Expr>& x, const std::unique_ptr<Expr>& y) {
-    return x == nullptr ? y == nullptr : y != nullptr && same_expr(*x, *y);
+// subquery is the same one only as the same parse. Two column references
+// are alike where `same_column` says: by default as written; the binder's
+// GROUP BY matching passes one that compares the columns they resolve to,
+// so `lower(t.b)` is `lower(b)`. A literal is alike only one of its class
+// and text: `1` and `1.0`, `1.0` and `1.00`, `'1'` and `1` differ, and an
+// integer's text is its value's (the parser prints it), so `01` is `1`.
+template <typename SameColumn>
+[[nodiscard]] auto same_expr(const Expr& a, const Expr& b, const SameColumn& same_column) -> bool {
+  if (a.kind == Expr::Kind::Column && b.kind == Expr::Kind::Column) return same_column(a, b);
+  auto alike = [&](const Expr& x, const Expr& y) { return same_expr(x, y, same_column); };
+  auto both = [&](const std::unique_ptr<Expr>& x, const std::unique_ptr<Expr>& y) {
+    return x == nullptr ? y == nullptr : y != nullptr && alike(*x, *y);
   };
   return a.kind == b.kind && a.column == b.column && a.param == b.param && a.table == b.table && a.schema == b.schema &&
          a.constant == b.constant && a.fn == b.fn && a.distinct == b.distinct && a.star == b.star && a.negated == b.negated &&
          a.literal.kind == b.literal.kind && a.literal.text == b.literal.text && a.literal.b == b.literal.b &&
          a.cmp == b.cmp && a.cast_type == b.cast_type && a.cast_schema == b.cast_schema && a.cast_typmods == b.cast_typmods && a.subquery == b.subquery &&
          a.func == b.func && both(a.lhs, b.lhs) && both(a.rhs, b.rhs) &&
-         std::ranges::equal(a.args, b.args, same_expr);
+         std::ranges::equal(a.args, b.args, alike);
+}
+
+[[nodiscard]] auto same_expr(const Expr& a, const Expr& b) -> bool {
+  return same_expr(a, b, [](const Expr& x, const Expr& y) {
+    return x.column == y.column && x.table == y.table && x.schema == y.schema;
+  });
 }
 
 // A FOREIGN KEY constraint of CREATE TABLE, on a column (REFERENCES) or

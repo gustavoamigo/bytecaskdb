@@ -284,6 +284,42 @@ def param_value(v):
     return v.value if isinstance(v, Calc) else v
 
 
+def draw_int_value(data, ints: list[str], depth: int) -> str:
+    """An integer expression of one of the columns `ints`: its c % k under
+    +, -, * of small literals, abs, COALESCE and CASE, `depth` of them; no
+    operator that leaves its type or raises."""
+    c = data.draw(st.sampled_from(ints), label="expression column")
+    e = f"({c} % {data.draw(st.integers(2, 9), label='modulus')})"
+    for _ in range(depth):
+        f = data.draw(st.sampled_from(["+", "-", "*", "abs", "coalesce", "case"]), label="operator")
+        n = data.draw(st.integers(-9, 9), label="operand")
+        if f in ("+", "-", "*"):
+            e = f"({e} {f} {n})"
+        elif f == "abs":
+            e = f"abs({e})"
+        elif f == "coalesce":
+            e = f"coalesce({e}, {n})"
+        else:
+            e = f"CASE WHEN {e} > {n} THEN {e} ELSE {n} END"
+    return e
+
+
+def draw_text_value(data, texts: list[str]) -> tuple[str, str]:
+    """A text column of `texts`, and an expression of it: lower, upper,
+    btrim, || and substring, one or two deep."""
+    c = data.draw(st.sampled_from(texts), label="expression column")
+    e = c
+    for _ in range(data.draw(st.integers(1, 2), label="depth")):
+        f = data.draw(st.sampled_from(["lower", "upper", "btrim", "concat", "substring"]), label="function")
+        if f == "concat":
+            e = f"({e} || 'x')"
+        elif f == "substring":
+            e = f"substring({e} from {data.draw(st.integers(1, 3), label='from')} for {data.draw(st.integers(0, 3), label='for')})"
+        else:
+            e = f"{f}({e})"
+    return c, e
+
+
 def draw_expression(data, t: Table, rows: list[tuple]) -> str | None:
     """A WHERE conjunct of expressions over t's integer and text columns, the
     same SQL on both sides (docs/planner_design.md, *Tests of stage P*): an
@@ -299,22 +335,7 @@ def draw_expression(data, t: Table, rows: list[tuple]) -> str | None:
     if not ints and not texts:
         return None
     kind = data.draw(st.sampled_from((["int"] if ints else []) + (["text"] if texts else [])), label="expression of")
-
-    def int_value(depth: int) -> str:
-        c = data.draw(st.sampled_from(ints), label="expression column")
-        e = f"({c} % {data.draw(st.integers(2, 9), label='modulus')})"
-        for _ in range(depth):
-            f = data.draw(st.sampled_from(["+", "-", "*", "abs", "coalesce", "case"]), label="operator")
-            n = data.draw(st.integers(-9, 9), label="operand")
-            if f in ("+", "-", "*"):
-                e = f"({e} {f} {n})"
-            elif f == "abs":
-                e = f"abs({e})"
-            elif f == "coalesce":
-                e = f"coalesce({e}, {n})"
-            else:
-                e = f"CASE WHEN {e} > {n} THEN {e} ELSE {n} END"
-        return e
+    int_value = lambda depth: draw_int_value(data, ints, depth)  # noqa: E731
 
     if kind == "int":
         e = int_value(data.draw(st.integers(0, 2), label="depth"))
@@ -330,16 +351,7 @@ def draw_expression(data, t: Table, rows: list[tuple]) -> str | None:
         if form == "expression":
             return f"{e} {data.draw(st.sampled_from(['=', '<', '>=']), label='op')} {int_value(1)}"
         return f"{e} {form} {n('operand')}"
-    c = data.draw(st.sampled_from(texts), label="expression column")
-    e = c
-    for _ in range(data.draw(st.integers(1, 2), label="depth")):
-        f = data.draw(st.sampled_from(["lower", "upper", "btrim", "concat", "substring"]), label="function")
-        if f == "concat":
-            e = f"({e} || 'x')"
-        elif f == "substring":
-            e = f"substring({e} from {data.draw(st.integers(1, 3), label='from')} for {data.draw(st.integers(0, 3), label='for')})"
-        else:
-            e = f"{f}({e})"
+    c, e = draw_text_value(data, texts)
     held = [r[names.index(c)] for r in rows if r[names.index(c)] is not None]
     text = lambda v: "'" + v.replace("'", "''") + "'"  # noqa: E731
     lit = lambda label: text(data.draw(st.sampled_from(held) if held else st.text(alphabet="abAB x", max_size=3), label=label))  # noqa: E731
@@ -1331,6 +1343,38 @@ class SqlMachine(Sides, RuleBasedStateMachine):
         names = [c.name for c in t.columns]
         targets = data.draw(st.lists(st.sampled_from(names), min_size=1, max_size=3, unique=True), label="targets")
         self.select(t.name, targets, where, extra=extra)
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
+    def group_by_an_expression(self, data):
+        # GROUP BY or SELECT DISTINCT of an expression of an integer or text
+        # column, written as itself or by its position, beside a column key
+        # now and then, under a key path's conjuncts (#904 stage G1): its
+        # groups held in a structure, NULL one group, ordered by the keys
+        # so both sides list them alike.
+        t = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
+        ints = [c.name for c in t.columns if c.type.kind == "int"]
+        texts = [c.name for c in t.columns if c.type.kind == "text"]
+        if not ints and not texts:
+            return
+        kind = data.draw(st.sampled_from((["int"] if ints else []) + (["text"] if texts else [])), label="key of")
+        e = draw_int_value(data, ints, data.draw(st.integers(0, 2), label="depth")) if kind == "int" else draw_text_value(data, texts)[1]
+        where, _, _ = self.where_on_a_path(data, t)
+        conds = [compared(t, c, op, v, i + 1, False) for i, (c, op, v) in enumerate(where)]
+        pg_conds = [compared(t, c, op, v, i + 1, True) for i, (c, op, v) in enumerate(where)]
+        params = [param_value(v) for _, _, v in where]
+        types = [t.column(c).type for c, _, _ in where]
+        beside = data.draw(st.none() | st.sampled_from(ints + texts), label="column key")
+        form = data.draw(st.sampled_from(["written", "position", "distinct"]), label="form")
+        items = ([beside] if beside else []) + [e]
+        keys = ", ".join(items) if form == "written" else ", ".join(str(i + 1) for i in range(len(items)))
+        order = ", ".join(str(i + 1) for i in range(len(items)))
+        def text(cs):
+            w = f" WHERE {' AND '.join(cs)}" if cs else ""
+            if form == "distinct":
+                return f"SELECT DISTINCT {', '.join(items)} FROM {t.name}{w} ORDER BY {order}"
+            return f"SELECT {', '.join(items)}, count(*) FROM {t.name}{w} GROUP BY {keys} ORDER BY {order}"
+        self.both(text(conds), params, text(pg_conds), types)
 
     @precondition(lambda self: self.tables)
     @rule(data=st.data())

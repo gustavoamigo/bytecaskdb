@@ -1321,6 +1321,39 @@ TEST_CASE("search: GROUP BY streams groups in an index's order, or holds them in
   CHECK(has(one, "if (!xs0_1) {"));
 }
 
+TEST_CASE("search: an expression key is held in a structure, never streamed, its groups sorted (#904 G1)",
+          "[sql][search][group]") {
+  sql_test::Fixture f;
+  using sql_test::Fixture;
+  f.ddl(CreateTableDdl{{kPublicSchema, "g"}, {Fixture::col("k", PhysType::I64, false), Fixture::col("a", PhysType::I64, true),
+                             Fixture::col("v", PhysType::I64, true)}, {"k"}});
+  f.ddl(CreateIndexDdl{"g_a", {kPublicSchema, "g"}, {{"a"}}});
+  const auto& cat = f.cat();
+  // g_a streams GROUP BY a; beside an expression key it would split a's
+  // groups by v + 1, so the groups are held, keyed by a and the value of
+  // v + 1, evaluated before the key is begun.
+  auto mixed = plan_sql(cat, "SELECT a, v + 1, count(*) FROM g GROUP BY a, v + 1", {{"g", 1000}});
+  CHECK_FALSE(has(mixed, "bool st0"));
+  CHECK(has(mixed, "bc_agg a0 = bc_agg_open(cx, 3);"));
+  const auto begin = mixed.source.find("bc_sort_key gb0 = bc_sort_key_begin(cx);");
+  REQUIRE(begin != std::string::npos);
+  CHECK(mixed.source.find("bc_add_bigint") < begin);
+  CHECK(has(mixed, "bc_sort_key_i64(cx, gb0, v"));
+  CHECK(has(mixed, "bc_agg_min_i64(cx, gg0, 2, v"));
+  CHECK(has(mixed, "bc_agg_i64(cx, g0, 2)"));
+  // A constant key stays a key: grouped, so no group over no rows.
+  auto constant = plan_sql(cat, "SELECT count(*) FROM g GROUP BY 1 + 1", {{"g", 1000}});
+  CHECK(has(constant, "bc_agg_open"));
+  // ORDER BY a GroupKey or an aggregate sorts the groups; no path's order
+  // gives either.
+  auto by_key = plan_sql(cat, "SELECT v + 1, count(*) FROM g GROUP BY v + 1 ORDER BY 1 DESC", {{"g", 1000}});
+  CHECK(has(by_key, "bc_sorter s0"));
+  CHECK(has(by_key, "BC_SORT_DESC"));
+  auto by_count = plan_sql(cat, "SELECT a, count(*) FROM g GROUP BY a ORDER BY count(*) DESC, a", {{"g", 1000}});
+  CHECK(has(by_count, "bc_sorter s0"));
+  CHECK(has(by_count, "bc_agg_open"));
+}
+
 TEST_CASE("search: a structure of groups that may pass the memory budget is a choice point, or left out",
           "[sql][search][cost][group][memory][choice]") {
   sql_test::Fixture f;

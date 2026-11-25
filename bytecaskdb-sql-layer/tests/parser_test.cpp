@@ -324,12 +324,43 @@ TEST_CASE("parser: GROUP BY positions name select items, with PostgreSQL 17's er
   // An item holding an aggregate: 42803 at the aggregate.
   CHECK(error_of("SELECT qty, count(*) FROM t GROUP BY 2") == "42803 aggregate functions are not allowed in GROUP BY @12");
   CHECK(error_of("SELECT qty, count(*) + 1 FROM t GROUP BY 2") == "42803 aggregate functions are not allowed in GROUP BY @12");
-  // An expression item is not a key yet (G1); * has no positions yet.
-  CHECK(error_of("SELECT qty + 1 FROM t GROUP BY 1") == "42601 GROUP BY of an expression is not supported yet @31");
-  CHECK(error_of("SELECT 1, count(*) FROM t GROUP BY 1") == "42601 GROUP BY of an expression is not supported yet @35");
+  // An expression item is a key (G1), a constant one too; * has no
+  // positions yet.
+  CHECK(std::get<Select>(parse("SELECT qty + 1 FROM t GROUP BY 1")).group_by[0].kind == Expr::Kind::Add);
+  CHECK(std::get<Select>(parse("SELECT 1, count(*) FROM t GROUP BY 1")).group_by[0].kind == Expr::Kind::Literal);
   CHECK(error_of("SELECT * FROM t GROUP BY 1") ==
         "42601 GROUP BY position with * in the select list is not supported yet @25");
-  CHECK(error_of("SELECT qty FROM t GROUP BY 1::int").starts_with("42601 GROUP BY takes columns"));
+}
+
+TEST_CASE("parser: GROUP BY takes any value expression (#904 G1)", "[sql][parser][group]") {
+  auto s = std::get<Select>(parse("SELECT lower(name), count(*) FROM t GROUP BY lower(name), qty + 1, (qty::text), 1::int"));
+  REQUIRE(s.group_by.size() == 4);
+  CHECK(s.group_by[0].kind == Expr::Kind::Func);
+  CHECK(s.group_by[0].func == "lower");
+  CHECK(s.group_by[1].kind == Expr::Kind::Add);
+  CHECK(s.group_by[2].kind == Expr::Kind::Cast);
+  // 1::int is a constant expression, never a position (PostgreSQL 17).
+  CHECK(s.group_by[3].kind == Expr::Kind::Cast);
+  // A key written alike a select item, an integer's text its value: a + 01 is a + 1.
+  auto alike = std::get<Select>(parse("SELECT qty + 01 FROM t GROUP BY qty + 1"));
+  CHECK(same_expr(alike.targets[0], alike.group_by[0]));
+  auto scaled = std::get<Select>(parse("SELECT qty + 1.0 FROM t GROUP BY qty + 1.00"));
+  CHECK_FALSE(same_expr(scaled.targets[0], scaled.group_by[0]));
+  auto error_of = [](const char* sql) {
+    try {
+      (void)parse(sql);
+    } catch (const SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what() + " @" + std::to_string(e.pos());
+    }
+    return std::string{"parsed"};
+  };
+  // PostgreSQL 17: an aggregate in a key is 42803 at the aggregate.
+  CHECK(error_of("SELECT qty FROM t GROUP BY qty + count(*)") == "42803 aggregate functions are not allowed in GROUP BY @33");
+  // Not yet: grouping sets, ROLLUP, CUBE, () and a subquery.
+  CHECK(error_of("SELECT qty FROM t GROUP BY ROLLUP (qty)") == "42601 GROUP BY takes columns @0");
+  CHECK(error_of("SELECT qty FROM t GROUP BY GROUPING SETS ((qty))") == "42601 GROUP BY takes columns @0");
+  CHECK(error_of("SELECT qty FROM t GROUP BY ()") == "42601 GROUP BY takes columns @0");
+  CHECK(error_of("SELECT count(*) FROM t GROUP BY (SELECT 1)") == "42601 a subquery in GROUP BY is not supported yet @32");
 }
 
 TEST_CASE("parser: COUNT, ORDER BY, LIMIT and column + parameter", "[sql][parser]") {

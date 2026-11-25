@@ -197,6 +197,41 @@ void slot_sums(bc_ctx* cx) {
     bc_emit_end(cx);
   }
 }
+// GROUP BY an expression, as codegen prints one (#904 G1): each row's key
+// evaluated first, `qty > 10 ? $1 : NULL`, then keyed as a part of its own,
+// NULL or bytes; on a group's first row the key's value goes to a bytes
+// slot (bc_agg_min_bytes on an empty slot), NULL left unset, so a group
+// is made, a slot's held bytes are made and then grown, and a NULL part
+// keyed. The groups are then given from the slot.
+void expression_key(bc_ctx* cx) {
+  bc_agg a = bc_agg_open(cx, 2);
+  bc_cursor c = bc_scan_open(cx, kTbl, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    bool n = bc_col_i64(cx, row, kQtyCol) <= 10;
+    bc_view v = n ? bc_empty(cx) : bc_param_bytes(cx, 0);
+    bc_sort_key k = bc_sort_key_begin(cx);
+    if (n) {
+      bc_sort_key_null(cx, k, BC_SORT_ASC, BC_SORT_NULLS_FIRST);
+    } else {
+      bc_sort_key_bytes(cx, k, v, BC_SORT_ASC, BC_SORT_NULLS_FIRST);
+    }
+    bc_group g = bc_agg_group(cx, a, bc_sort_key_end(cx, k));
+    if (bc_agg_null(cx, g, 0) && !n) bc_agg_min_bytes(cx, g, 1, v);
+    bc_agg_count(cx, g, 0);
+  }
+  bc_group g{};
+  while (bc_agg_next(cx, a, nullptr, &g)) {
+    bc_emit_begin(cx);
+    if (bc_agg_null(cx, g, 1)) {
+      bc_emit_null(cx);
+    } else {
+      bc_emit_bytes(cx, bc_agg_bytes(cx, g, 1));
+    }
+    bc_emit_i64(cx, bc_agg_i64(cx, g, 0));
+    bc_emit_end(cx);
+  }
+}
 // A streamed COUNT(DISTINCT), as codegen prints one: t's rows in id order
 // come in groups by qty > 10, each value, param 0 or empty, kept in an
 // aggregate keyed by the value alone and cleared as each group ends, so
@@ -312,6 +347,12 @@ TEST_CASE("plan API: an allocation failure in any call is BC_E_MEMORY, never an 
        {PhysType::I64, PhysType::I64, PhysType::I64},
        BC_OK,
        {{std::int64_t{1}, std::int64_t{10}, std::int64_t{10}}, {std::int64_t{2}, std::int64_t{50}, std::int64_t{30}}}},
+      {"a structure keyed by an expression, its value in a slot",
+       expression_key,
+       {bytes("big")},
+       {PhysType::Bytes, PhysType::I64},
+       BC_OK,
+       {{bc_value{}, std::int64_t{1}}, {bytes("big"), std::int64_t{2}}}},
       {"a streamed COUNT(DISTINCT), its values cleared per group",
        streamed_distinct,
        {bytes("v")},
