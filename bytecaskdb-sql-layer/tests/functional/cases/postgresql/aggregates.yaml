@@ -912,3 +912,47 @@
       expected: [[null, 1], [ab, 2], [x, 1]]
   teardown:
     - DROP TABLE dz
+
+- name: COUNT, SUM and AVG of DISTINCT values of an expression
+  features: [E091-07]
+  setup:
+    - CREATE TABLE dx (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, d DOUBLE PRECISION, j JSONB, n DECIMAL(10, 2))
+    - CREATE TABLE dxu (id INTEGER PRIMARY KEY, tid INTEGER, w INTEGER)
+    - "INSERT INTO dx VALUES (1, 1, 'A', 0.0, '{\"u\": \"x\"}', 1.5), (2, 2, 'a', -0.0, '{\"u\": \"X\"}', 1.50), (3, 2, 'B', 'NaN', '{\"u\": \"x\"}', 2), (4, NULL, NULL, 'NaN', '{}', NULL), (5, 3, 'b', 1, '{\"u\": null}', 3)"
+    - INSERT INTO dxu VALUES (1, 1, 5), (2, 1, 5), (3, 2, 6), (4, 3, NULL)
+  steps:
+    - sql: SELECT count(DISTINCT lower(b)), count(DISTINCT j->>'u'), sum(DISTINCT a + 1), avg(DISTINCT a * 2) FROM dx
+      expected: [[2, 2, 9, "4.0000000000000000"]]
+    - sql: SELECT count(DISTINCT -d), sum(DISTINCT n * 2), avg(DISTINCT n) FROM dx
+      expected: [[3, "13.00", "2.1666666666666667"]]
+    - sql: SELECT sum(DISTINCT -d), avg(DISTINCT -d) FROM dx WHERE id <> 3 AND id <> 4
+      expected: [[-1, "-0.5"]]
+    - sql: SELECT count(DISTINCT a + 1), count(DISTINCT a), sum(DISTINCT a + 1), count(a + 1) FROM dx
+      expected: [[3, 3, 9, 4]]
+    - sql: SELECT count(DISTINCT lower(b)), sum(DISTINCT a + 1) FROM dx WHERE id = $1
+      params: [2]
+      expected: [[1, 3]]
+    - sql: SELECT count(DISTINCT lower(b)), sum(DISTINCT a + 1), avg(DISTINCT a + 1) FROM dx WHERE id > $1
+      params: [99]
+      expected: [[0, null, null]]
+    - sql: SELECT a % 2, count(DISTINCT lower(b)), sum(DISTINCT a + 1), avg(DISTINCT id % 2) FROM dx GROUP BY 1 ORDER BY 1
+      expected:
+        - [0, 2, 3, "0.50000000000000000000"]
+        - [1, 2, 6, "1.00000000000000000000"]
+        - [null, 0, null, "0.00000000000000000000"]
+      ordered: true
+    - sql: SELECT a FROM dx GROUP BY a HAVING count(DISTINCT lower(b)) > $1
+      params: [1]
+      expected: [[2]]
+    - sql: SELECT count(DISTINCT t.a + u.w), sum(DISTINCT u.w * t.a) FROM dx t JOIN dxu u ON t.id = u.tid
+      expected: [[2, 17]]
+    - sql: SELECT count(DISTINCT a + $1), sum(DISTINCT a * $1) FROM dx
+      params: [3]
+      expected: [[3, 18]]
+    - sql: SELECT count(DISTINCT a / 0) FROM dx
+      error: "22012"
+    - sql: SELECT count(DISTINCT a / 0) FROM dx WHERE a IS NULL
+      expected: [[0]]
+  teardown:
+    - DROP TABLE dxu
+    - DROP TABLE dx

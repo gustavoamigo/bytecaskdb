@@ -336,7 +336,8 @@ TEST_CASE("physical: a DOUBLE column is never read from a key, wherever codegen 
   count_d.args.push_back(col(kD, SqlKind::Double));
   CHECK(refusal(plan(node(physical::Aggregate{node(scan({p(0)}, {})), count_d, true}))).empty());
   refused(plan(node(physical::Aggregate{covering(), count_d, true})), "DOUBLE column read from a key");
-  // An expression as the argument: one eval prints, a column of DISTINCT values only.
+  // An expression as the argument: one eval prints, of DISTINCT values too
+  // (keyed by its value, #904 G2), but not one no sort key holds or of CHAR type.
   auto sum_e = logical::expr(logical::Expr::Kind::Aggregate, SqlType{SqlKind::BigInt});
   sum_e.fn = logical::Expr::Fn::Sum;
   sum_e.args.push_back(logical::binary(logical::Expr::Kind::Add, col(kId), col(kV), SqlType{SqlKind::BigInt}));
@@ -344,7 +345,14 @@ TEST_CASE("physical: a DOUBLE column is never read from a key, wherever codegen 
   auto count_e = sum_e;
   count_e.fn = logical::Expr::Fn::Count;
   count_e.distinct = true;
-  refused(plan(node(physical::Aggregate{node(scan({p(0)}, {})), count_e, true})), "DISTINCT values of other than a column");
+  CHECK(refusal(plan(node(physical::Aggregate{node(scan({p(0)}, {})), count_e, true}))).empty());
+  auto count_j = count_e;
+  count_j.args[0].type = SqlType{SqlKind::Jsonb};
+  refused(plan(node(physical::Aggregate{node(scan({p(0)}, {})), count_j, true})), "DISTINCT values no sort key holds");
+  auto count_c = count_e;
+  count_c.args[0] = logical::expr(logical::Expr::Kind::Coalesce, SqlType{SqlKind::Char, 3});
+  count_c.args[0].args = {col(kV, SqlKind::Char), col(kV, SqlKind::Char)};
+  refused(plan(node(physical::Aggregate{node(scan({p(0)}, {})), count_c, true})), "DISTINCT values of a CHAR expression");
   auto nested = sum_e;
   nested.args[0] = count_d;
   refused(plan(node(physical::Aggregate{node(scan({p(0)}, {})), nested, true})), "does not print");

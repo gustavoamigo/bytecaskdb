@@ -522,10 +522,11 @@ auto least_past(std::uint64_t budget, std::uint64_t fixed, std::uint64_t per_ent
 // keys*): its marker alone where it may be NULL, else the marker and the
 // least value, 8 bytes for an integer or a DOUBLE, 1 for a BOOLEAN, 2 for an
 // empty byte string.
-auto least_part_bytes(const ColumnRef& c, bool may_be_null) -> std::uint64_t {
+auto least_part_bytes(PhysType t, bool may_be_null) -> std::uint64_t {
   if (may_be_null) return 1;
-  return 1 + (c.type == PhysType::Bool ? 1 : c.type == PhysType::Bytes ? 2 : 8);
+  return 1 + (t == PhysType::Bool ? 1 : t == PhysType::Bytes ? 2 : 8);
 }
+auto least_part_bytes(const ColumnRef& c, bool may_be_null) -> std::uint64_t { return least_part_bytes(c.type, may_be_null); }
 
 // The fewest bytes a stored row of `t` holds: its header, bitmap and fixed
 // columns, in the smallest layout its rows may have.
@@ -2720,7 +2721,8 @@ private:
     for (auto t : l.held) per += least_row_bytes(q.rels[q.index_of(t)].table()) + kHashEntryBytes + key;
     // The group's key is one byte-string part of the value's key: at least
     // its marker and its bytes.
-    for (const auto& d : l.distinct) per += 1 + key + least_part_bytes(d, false) + kGroupEntryBytes + kAggSlotBytes;
+    // A distinct value is never NULL: a NULL argument is skipped.
+    for (const auto& d : l.distinct) per += 1 + key + least_part_bytes(d.phys(), false) + kGroupEntryBytes + kAggSlotBytes;
     if (sort != nullptr) {
       per += kSortEntryBytes + key;
       for (const auto& part : sort->keys) {
@@ -2816,7 +2818,6 @@ private:
     }
     for (const auto& a : aggs) {
       if ((a.fn != Expr::Fn::Count || a.distinct) && a.args.empty()) no_plan("an aggregate call with no argument");
-      if (a.distinct && a.args[0].kind != Expr::Kind::Column) no_plan("an aggregate of DISTINCT values of other than a column");
     }
     // The ORDER BY of the groups: by key columns, which an access path's
     // order may give, or by GroupKeys and aggregates, which only a sort of

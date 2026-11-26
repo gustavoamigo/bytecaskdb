@@ -6,11 +6,11 @@ which resolves names and types. It also covers the layer's known
 differences from PostgreSQL in what SQL means. The planner is
 `planner_design.md`. The TPROC-C statements the layer runs are in
 `testing_design.md`, *The TPROC-C statements*. *Expressions in casts,
-GROUP BY, DISTINCT, SET and MIN/MAX of text (#904)* is approved (2026-11-22);
-its stages M1, `MIN` and `MAX` of text, C0, the text input fixes, C1,
-casts of expressions, S1, expressions in `SET`, and G0, `GROUP BY`
-positions and output names of column items, are built, the other stages
-not yet.
+GROUP BY, DISTINCT, SET and MIN/MAX of text (#904)* is approved (2026-11-22)
+and built, every stage: M1, `MIN` and `MAX` of text, C0, the text input
+fixes, C1, casts of expressions, S1, expressions in `SET`, G0 and G1,
+`GROUP BY` and `SELECT DISTINCT` of expressions, and G2, aggregates of
+`DISTINCT` values of an expression.
 
 ## Standing rules
 
@@ -635,8 +635,8 @@ evaluated on each row a plan reads, never a key's bound.
 
 **Aggregates**, with PostgreSQL's results:
 - `COUNT(*)` counts rows, `COUNT(col)` non-NULL values, `COUNT(DISTINCT
-  col)` distinct non-NULL values. All three are `bigint`, and 0 over no
-  rows.
+  x)` distinct non-NULL values of a column or an expression. All three are
+  `bigint`, and 0 over no rows.
 - The argument of `COUNT`, `SUM`, `MIN`, `MAX` and `AVG` is a column or
   any expression of the `FROM` columns a select list takes (*Expressions
   over columns*): `SUM(v * 2)`, `COUNT(1)`, `MAX(CASE … END)`, a view
@@ -655,16 +655,18 @@ evaluated on each row a plan reads, never a key's bound.
   select item's expression. The plans that answer an aggregate from the
   keys (`KeyAggregates`, `CountRange`) take a column argument only; any
   other is folded by a loop over the rows.
-- Every aggregate over a column takes `ALL` (the default) or `DISTINCT`.
-  `DISTINCT` folds each distinct non-NULL value of the column once: a
+- Every aggregate takes `ALL` (the default) or `DISTINCT`. `DISTINCT`
+  folds each distinct non-NULL value of its argument, a column or an
+  expression, once per group: a
   `DOUBLE PRECISION`'s `-0.0` and `0.0` are one value and NaN is one, as
   `COUNT(DISTINCT)` already took them. `MIN(DISTINCT x)` and `MAX(DISTINCT
   x)` are `MIN(x)` and `MAX(x)`, bound as such. The values seen are held
   per group in the statement's memory, a key each, and a statement that
   passes its budget fails with 54000, never spilling (`planner_design.md`,
-  *Memory*). With `DISTINCT` the argument is a column: `SUM(DISTINCT a +
-  1)` is not taken yet (0A000), since the distinct values are keyed by the
-  column's encoding.
+  *Memory*). An expression's values are compared as PostgreSQL's equality
+  compares them, text bytewise (*SELECT DISTINCT and aggregates of
+  DISTINCT values of an expression*, #904 stage G2); `COUNT` of one of
+  CHAR type other than a column is refused (0A000), as its `GROUP BY` is.
 - `SUM` over `SMALLINT` or `INTEGER` is `bigint`. Over `BIGINT` or
   `DECIMAL` it is `numeric`, kept at the input's scale. It is NULL over no
   rows.
@@ -1269,18 +1271,16 @@ That includes:
   compared with other than a column (*Expressions in WHERE, ON and HAVING
   (stage P)*, *What stays refused*);
 - correlated subqueries but the slice above (#836), nested subqueries and the others above, a subquery in `FROM`, and a derived relation but a grouped view aggregated over;
-- `DISTINCT ON`, `DISTINCT` of a constant or over groups it does not select
-  every key of, an aggregate of `DISTINCT` values of an expression (0A000),
-  `GROUP BY` of an expression, and `HAVING` of anything but the
-  comparisons above;
+- `DISTINCT ON`, `DISTINCT` over groups it does not select every key of,
+  `COUNT` of `DISTINCT` values of a CHAR expression other than a column
+  (0A000), and `HAVING` of anything but the comparisons above;
 - a `FULL JOIN` that is not the whole `FROM` of two tables (#712), or under
   an aggregate, `GROUP BY`, `DISTINCT`, `OFFSET`, `INSERT … SELECT` or a set
   operation, or of a grouped view, an outer join's `ON` comparing an expression of columns,
   more than 32 tables (0A000, *Known differences*), a `RIGHT JOIN` of a join that has an outer join,
   an outer join in parentheses or of a join in parentheses, `USING` or `NATURAL` in
   parentheses or after a comma,
-  `FOR UPDATE` of a join (#697), an alias of a join, a `GROUP BY` position
-  or output name of an expression item (#904 stage G1), a `GROUP BY`
+  `FOR UPDATE` of a join (#697), an alias of a join, a `GROUP BY`
   position with `*` in the select list, and an output name (`GROUP BY` or
   `ORDER BY`) of both a qualified column and an unqualified one under a
   `NATURAL` join, but where the qualifier is the first `FROM` item and no
@@ -2318,7 +2318,9 @@ expressions in `UPDATE … SET` (*Expressions in UPDATE … SET (#896)*,
 **As built (S1)**), and stage G0, `GROUP BY` positions and output names
 of column items (*GROUP BY of an expression*, **As built (G0)**), and
 stage G1, `GROUP BY` and `SELECT DISTINCT` of expressions (**As built
-(G1)**, there); stage G2 is not yet. It covers the six gaps #904 lists,
+(G1)**, there), and stage G2, `COUNT`, `SUM` and `AVG` of `DISTINCT`
+values of an expression (*SELECT DISTINCT and aggregates of DISTINCT
+values of an expression*, **As built (G2)**): every stage is built. It covers the six gaps #904 lists,
 found while building jsonb stage 3: a cast of an expression, `GROUP BY`
 of an expression, `SELECT DISTINCT` and `COUNT(DISTINCT …)` of an
 expression, an expression in `UPDATE … SET` (#896), `MIN`/`MAX` of text,
@@ -2338,7 +2340,7 @@ verbose`, and its tables dropped after. Code citations are to
 | `SELECT $1::text::int` | 42601, as above | Describe: parameter `text`, result `integer`; `'zz'` is 22P02 at execution |
 | `SELECT … GROUP BY props->>'k'`, `GROUP BY lower(b)`, `GROUP BY 1` | 42601 `GROUP BY takes columns` (`sql/parser.cppm:1955-1960`) | groups |
 | `SELECT DISTINCT props->>'k'`, `DISTINCT lower(b)` | 42601 `SELECT DISTINCT of other than columns …` (`binder.cppm:5643-5646`) | rows |
-| `count(DISTINCT props->>'k')`, `sum(DISTINCT a + 1)` | 0A000 `an aggregate of DISTINCT values of an expression` (`binder.cppm:4506`) | values |
+| `count(DISTINCT props->>'k')`, `sum(DISTINCT a + 1)` | 0A000 `an aggregate of DISTINCT values of an expression` (`binder.cppm:4506`); built by G2 | values |
 | `UPDATE t SET s = j->>'k'`, `SET n = (j->>'k')::int`, `SET t = upper(t)`, `SET n = n * 2`, `SET t = CASE … END` | 42601, each with its operator's message (`Binder::value(Table, …, target)`, `binder.cppm:4598-4687`) | rows written |
 | `SELECT max(t)`, `min(v)`, `max(ch)`, `max(j->>'k')` | 42601 `MAX of a text column is not supported` (`aggregate_support`, `binder.cppm:4442-4445`) | values |
 | `j #> ARRAY[ARRAY['a'],ARRAY['b']]`, `j #> '{a,b}'::text[]` | 42601 | `1`, both |
@@ -2810,6 +2812,44 @@ is 2 in PG 17, 0A000 here until stage 2) and of NUMERIC of no precision
 are 0A000. The distinct values are held in the statement's memory; past
 its budget, 54000.
 
+**As built (G2).** As above, with these particulars:
+
+- The binder takes any argument a non-DISTINCT call takes
+  (`aggregate_arg`); the old 0A000 is gone. An argument of CHAR type other
+  than a column (`count(DISTINCT coalesce(ch, ch))`, 3 in PG 17 over `'a'`,
+  `'a  '`, `'b'`, `'c'`) is 0A000 `COUNT of DISTINCT values of a CHAR
+  expression other than a column is not supported yet`, as its `GROUP BY`
+  is (open question 9): bpchar's equality ignores trailing spaces, which
+  an evaluated value's key does not. jsonb (`count(DISTINCT j->'u')`) and
+  NUMERIC of no precision keep their 0A000; `sum(DISTINCT lower(b))` and
+  `sum(DISTINCT coalesce(ch, ch))` are PG's 42883.
+- Arguments of `DISTINCT` calls written alike in one query (`ast::same_expr`,
+  each column compared by what it resolves to) are one bound copy, so
+  `sum(DISTINCT a + 1)` beside `count(DISTINCT a + 1)` keys each value once:
+  a literal binds to a parameter of its own each time it is written, which
+  would make the two bindings differ. An argument that draws `random()` is
+  never shared: each call draws its own values, as PG's
+  `find_compatible_agg` shares no aggregate with a volatile function, so
+  two `sum(DISTINCT random(1, 1000000000))` give two sums.
+- PG 17's values, each checked: over `(1,'A',0.0,{"u":"x"},1.5)`,
+  `(2,'a',-0.0,{"u":"X"},1.50)`, `(2,'B',NaN,{"u":"x"},2)`, a row of
+  NULLs and NaN, `(3,'b',1,{"u":null},3)`: `count(DISTINCT lower(b))` 2,
+  `count(DISTINCT j->>'u')` 2, `sum(DISTINCT a+1)` 9, `avg(DISTINCT a*2)`
+  4.0000000000000000, `count(DISTINCT -d)` 3, `sum(DISTINCT n*2)` 13.00,
+  `avg(DISTINCT n)` 2.1666666666666667; per `GROUP BY a % 2`, in `HAVING`,
+  in `ORDER BY`, over a join and with parameters, as the functional case
+  records. `count(DISTINCT a / 0)` is 22012 for a row where `a` is not
+  NULL, 0 over rows where it is.
+- Tests: `binder: COUNT, SUM and AVG of DISTINCT values of an expression
+  (#904 G2)`, `embedded API: COUNT, SUM and AVG of DISTINCT values of an
+  expression give PostgreSQL 17's (#904 G2)`, the expression lines of
+  `embedded API: the distinct values of an aggregate are held in the
+  statement's memory and fail past it`, `physical: a DOUBLE column is
+  never read from a key, wherever codegen reads it`, `proof:
+  test_sql_machine` (rule `aggregate_of_distinct_expression`), and the case `COUNT, SUM and AVG of
+  DISTINCT values of an expression` in
+  `tests/functional/cases/postgresql/aggregates.yaml`.
+
 #### Expressions in UPDATE … SET (#896)
 
 **What a SET value may be.** Any value expression the select list takes,
@@ -3262,13 +3302,13 @@ tests.
 
 | Stage | Builds | Unblocks (Mattermost-style) | Size (code + tests + docs) |
 |---|---|---|---|
-| M1 | `MIN`/`MAX` of text: the plan API's bytes slot, a stream's holder; depends on no other stage | `SELECT max(Id) …`, `min(Props->>'k')` | ~700 lines: binder 40, physical 40, codegen 120, plan API 180, tests 270, docs 50 |
+| M1 (built) | `MIN`/`MAX` of text: the plan API's bytes slot, a stream's holder; depends on no other stage | `SELECT max(Id) …`, `min(Props->>'k')` | ~700 lines: binder 40, physical 40, codegen 120, plan API 180, tests 270, docs 50 |
 | C0 (built) | input fixes shared by constants, parameters and (later) casts: `integer_from` (`0x`, `0o`, `0b`, `_`, the value in its 22003), `float_from`'s `real` (`strtof`, its message), `decimal_from`'s `'Infinity'`; the `ARRAY[ARRAY]` message | `'0x1F'::int`, a hex integer parameter | ~300 lines: text 90, binder 10, tests 170, docs 30 |
 | C1 (built) | casts of expressions: `cast_kind`, the `Cast` kind replacing `JsonbCast`, the plan API's cast helpers, cast naming; casts in procedure expressions | `WHERE (Props->>'x')::bigint > $1`, `ORDER BY (Props->>'n')::int`, `sum((Props->>'n')::int)`, `$1::text::int` | ~1,150 lines: binder 190, physical 50, codegen 150, plan API 330, tests 370, docs 60 |
 | S1 (built) | expressions in `SET` with the assignment table, the store shared with `INSERT … SELECT` (closes #824), column-order evaluation, `$n::T` of another type; needs C1's output and rounding helpers | `UPDATE … SET Message = lower(Message)`, `SET n = (Props->>'n')::int`, `SET s = Props->>'k'`, `SET flag = CASE … END`; with jsonb stage 4, `SET Props = jsonb_set(Props, $2, $3)` | ~950 lines: binder 240, physical 60, codegen 130, tests 440, docs 80 |
 | G0 (built) | `GROUP BY` positions and output names over **column** items (the input-column-first rule, 42P10, 42702, 42601 for a non-integer constant); binder only, keys stay columns; a position naming an expression item stays 42601 until G1 | `SELECT UserId, count(*) … GROUP BY 1` | ~350 lines: parser 60, binder 110, tests 160, docs 20 |
 | G1 (built) | `GROUP BY` of expressions (positions naming one included), keys the same for every row; `SELECT DISTINCT` of expressions; `same_expr` extended; the grouped resolver's exact-key case; `GroupKey`; expression keys in the structure, never streamed | `SELECT Props->>'k', count(*) … GROUP BY 1`, `SELECT DISTINCT Props->>'type'` | ~1,050 lines: binder 190, logical 30, search 140, physical 80, codegen 180, tests 390, docs 40 |
-| G2 | `COUNT`, `SUM`, `AVG` of `DISTINCT` values of an expression: `GroupLayout::distinct` as an `Expr`, the evaluated value appended as a key part, the one-row Aggregate's fold (`codegen.cppm:2271`) keying an expression by its value | `count(DISTINCT Props->>'user_id')` | ~550 lines: binder 40, physical 60, codegen 150, tests 260, docs 40 |
+| G2 (built) | `COUNT`, `SUM`, `AVG` of `DISTINCT` values of an expression: `GroupLayout::distinct` as an `Expr`, the evaluated value appended as a key part, the one-row Aggregate's fold (`codegen.cppm:2271`) keying an expression by its value | `count(DISTINCT Props->>'user_id')` | ~550 lines: binder 40, physical 60, codegen 150, tests 260, docs 40 |
 
 `GREATEST`/`LEAST` (Mattermost's `SET LastPostAt = GREATEST(LastPostAt,
 $1)`) and P3's expressions over keys and aggregates are not #904's rows:

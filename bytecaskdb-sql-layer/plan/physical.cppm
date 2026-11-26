@@ -450,14 +450,15 @@ struct GroupAggregate {
 // date, time, DECIMAL or BOOLEAN in its int64_t (bc_agg_min_i64), a DOUBLE
 // in its double (bc_agg_min_f64, -0.0 and NaN kept as they are), text in its
 // held bytes (bc_agg_min_bytes). An aggregate of
-// DISTINCT values also keeps a structure of its own, one per argument,
-// that the aggregates over that argument share.
+// DISTINCT values also keeps a structure of its own, one per argument, a
+// column or an expression, that the aggregates over that argument share:
+// two arguments written alike (equal Exprs) are one.
 struct GroupLayout {
   std::uint32_t slots{1};
   std::vector<std::optional<std::uint32_t>> key_slot;  // per column: its slot, or nullopt for one read from a held row
   std::vector<std::uint32_t> agg_slot;                 // per aggregate
   std::vector<std::uint32_t> held;                     // the tables whose first row each group holds
-  std::vector<ColumnRef> distinct;                     // each DISTINCT aggregate's argument, once
+  std::vector<Expr> distinct;                          // each DISTINCT aggregate's argument, once
   std::vector<std::uint32_t> expr_slot;                // per expression key
 };
 
@@ -482,7 +483,7 @@ struct GroupLayout {
     }
     l.agg_slot.push_back(l.slots);
     l.slots += a.fn == Expr::Fn::Avg ? 2 : 1;
-    if (a.distinct && std::ranges::find(l.distinct, a.args[0].col) == l.distinct.end()) l.distinct.push_back(a.args[0].col);
+    if (a.distinct && std::ranges::find(l.distinct, a.args[0]) == l.distinct.end()) l.distinct.push_back(a.args[0]);
   }
   return l;
 }
@@ -897,12 +898,16 @@ private:
   }
 
   // An aggregate call's argument: none (COUNT(*)) or one, a value codegen's
-  // eval prints, evaluated once per row; of DISTINCT values only a column,
-  // whose key the values are grouped by.
+  // eval prints, evaluated once per row. Of DISTINCT values, a column is
+  // keyed by its row's part, an expression by its evaluated value; neither
+  // may be of a type no sort key holds.
   void argument(const Expr& a) const {
     if (a.args.size() > 1) broken("an aggregate call of more than one argument");
     if (a.args.empty()) return;
-    if (a.distinct && a.args[0].kind != Expr::Kind::Column) broken("an aggregate of DISTINCT values of other than a column");
+    if (a.distinct && !keyable(a.args[0].phys())) broken("an aggregate of DISTINCT values no sort key holds");
+    if (a.distinct && a.args[0].kind != Expr::Kind::Column && a.args[0].type.kind == SqlKind::Char) {
+      broken("an aggregate of DISTINCT values of a CHAR expression");
+    }
     // MIN and MAX fold an int64_t, a double or bytes (bc_agg_min_bytes).
     const auto t = a.args[0].phys();
     if ((a.fn == Expr::Fn::Min || a.fn == Expr::Fn::Max) && t != PhysType::I64 && t != PhysType::F64 && t != PhysType::Bytes) {

@@ -15,8 +15,8 @@ tables*).
 The first of the post-MVP designs (#487, *Next*). The parser, the plan API
 and TinyCC are unchanged by it; the binder's output changed. The rest of
 the dialect is #534's (*Slices*). *Expressions in casts, group keys,
-DISTINCT, SET and text MIN/MAX (#904)* is approved (2026-11-22); its
-stages M1, C0, C1, S1 and G0 are built, the others not yet.
+DISTINCT, SET and text MIN/MAX (#904)* is approved (2026-11-22) and
+built, every stage (M1, C0, C1, S1, G0, G1, G2).
 
 ## Why
 
@@ -583,7 +583,7 @@ output.
 | `LIMIT` | `Limit` | an `int64_t` counter in the loop's condition, so the cursor never steps past the limit. Under `OFFSET o`, `LIMIT l` is `Limit` n = o + l (every row without a `LIMIT`) with offset o: what is below sees n, and the loop passes on a row only once the counter reaches o. A one-row aggregate under an offset emits nothing; a plan with an offset is never resumed, which would skip its rows again |
 | `COUNT(*)`, `COUNT(col NOT NULL)`, no residual | `CountRange` | `bc_count_range` over the access path's range |
 | `COUNT`, `SUM` otherwise | `Aggregate` | an accumulator local, `bc_add`; a "seen" `bool` for SUM's NULL. Over at most one row no accumulator: its input's misses are the condition its row is emitted under |
-| `COUNT(DISTINCT col)`, one row | `Aggregate` | `bc_agg_group` keyed by the column, then a count of `bc_agg_next` |
+| `COUNT(DISTINCT x)`, one row | `Aggregate` | `bc_agg_group` keyed by the column (`bc_col_key`), or by an expression's value (a sort key of one part), then a count of `bc_agg_next` |
 | `COUNT(*)`, `MIN`, `MAX` from the keys | `KeyAggregates` | `bc_count_range`, and one step per `MIN` or `MAX` (*Aggregates*) |
 | `MIN`, `MAX`, `AVG`, several aggregates, `GROUP BY` | `GroupAggregate` | a structure (`bc_agg_*`) or a stream (locals) (*Aggregates*) |
 | A join by key | `IndexJoin` | the inner key built from the outer row: `bc_key_*` of `bc_col_*`; nested in the outer loop |
@@ -1628,9 +1628,9 @@ before. The planner holds the argument's columns (`columns_of`) as it
 holds a column argument's: read by the plan, in its input's tables, kept
 above a sort's rows. Two calls alike are one aggregate, found by their
 bound expressions, a `HAVING`'s among them. `CountRange` and
-`KeyAggregates` take a column argument only, and `DISTINCT` values are
-keyed by a column's encoding, so the binder refuses `DISTINCT` of an
-expression (0A000) and `check` refuses it in a plan.
+`KeyAggregates` take a column argument only. `DISTINCT` values of a
+column are keyed by its encoding, of an expression by its evaluated value
+(*Group keys and DISTINCT values of an expression*, #904 stage G2).
 
 **Answered from the keys.** One group of every row, no `HAVING`, whose
 outputs are each `COUNT(*)`, or `MIN` or `MAX` of one column held as
@@ -1702,9 +1702,9 @@ the order they first appeared. Where it keeps what it gives for a group
   and `SUM`, `MIN`, `MAX` and `AVG` NULL where `bc_agg_null`. Of a DOUBLE
   they are `bc_agg_add_f64`, `bc_agg_min_f64` and `bc_agg_max_f64`, and the
   slot is read by `bc_agg_f64`;
-- the aggregates of `DISTINCT` values over one column (`COUNT`, `SUM`,
-  `AVG`) share an aggregate of their own, one slot, keyed by the group's
-  key and the value: a pair new to it is folded into each of them, once, so
+- the aggregates of `DISTINCT` values over one argument, a column or an
+  expression (`COUNT`, `SUM`, `AVG`), share an aggregate of their own, one
+  slot, keyed by the group's key and the value: a pair new to it is folded into each of them, once, so
   `SUM(DISTINCT v)` beside `COUNT(DISTINCT v)` sees each value once.
   `MIN(DISTINCT v)` and `MAX(DISTINCT v)` are
   bound without the quantifier: the extremes of the distinct values are
@@ -1838,7 +1838,8 @@ items, is built in the parser and binder alone: its keys are columns, so
 nothing here changed (its notes are `frontend_design.md`'s **As built
 (G0)**). Stage G1, `GROUP BY` and `SELECT DISTINCT` of expressions, is
 built, with its as-built notes under *Group keys and DISTINCT values of an
-expression*. Stage G2 is not yet. The dialect, PG 17's behaviour, the
+expression*, and so is stage G2, aggregates of `DISTINCT` values of an
+expression, with its as-built notes there too. The dialect, PG 17's behaviour, the
 refusals, the stages (M1, C0, C1, S1, G0, G1, G2) and the open questions are
 `frontend_design.md`, *Expressions in casts, GROUP BY, DISTINCT, SET and
 MIN/MAX of text (#904)*. This section is how the plan, the search, the
@@ -2091,7 +2092,7 @@ a scalar's text is at most a few dozen bytes. Each cast of fixed size
   equality is bytewise. `GroupLayout::distinct` holds each DISTINCT
   argument once, as an `Expr` compared with `==` (the aggregates share one
   bound copy); that, the DISTINCT value appended as a key part and the
-  one-row Aggregate's fold below are G2's, not G1's. `check` refuses: an expression key that is streamed, holds
+  one-row Aggregate's fold below are G2's (built, its notes below). `check` refuses: an expression key that is streamed, holds
   an aggregate or `random()`, or has no sort-key suffix (jsonb, NUMERIC,
   CHAR); a `GroupKey` outside a `GroupEmit`'s outputs, a `HAVING` filter
   over the `GroupAggregate` or a sort of its groups, or past the keys; and
@@ -2156,6 +2157,38 @@ As built (G1), where it departs from the above:
   group_by_an_expression` in `tests/proof/test_sql_machine.py`, and
   `tests/functional/cases/postgresql/aggregates.yaml`. No golden plan.
 
+As built (G2), where it departs from the above or adds to it:
+
+- `GroupLayout::distinct` is a `std::vector<Expr>`, each `DISTINCT`
+  argument once by `==`. The binder makes arguments written alike one
+  bound copy (`aggregate_arg`, per query): a literal binds to a parameter
+  of its own each time it is written, so two bindings of `a + 1` would
+  not be equal and would key their values twice. An argument that draws
+  `random()` keeps a copy per call (PG shares no volatile aggregate), so
+  each call keys its own draws in a structure of its own.
+- Codegen's `fold_distinct`, shared by a structure and a stream, evaluates
+  each argument once per row with `eval` before any key builder opens,
+  skips its NULL, and `distinct_value` appends a column's part by
+  `sort_key_part` (as before) or an expression's by
+  `bc_sort_key_<suffix>(v)`; the folds take the evaluated value. The
+  one-row `Aggregate`'s `fold` keys a column by `bc_col_key` as before and
+  an expression by a one-part sort key of its value (`dvk`); over at most
+  one row (`emit_one_row`) a `COUNT(DISTINCT expr)` is its row's 0 or 1.
+- `check` (`argument`) takes an expression argument of `DISTINCT` values
+  and refuses one of a type no sort key holds (jsonb, NUMERIC) or of CHAR
+  type other than a column (the binder's 0A000); the search's no-plan refusal of one goes.
+  `group_past` counts a distinct value's part by its `PhysType`
+  (`least_part_bytes`), never NULL.
+- A plan with an aggregate of `DISTINCT` values takes no covering scan, as
+  before, so the argument is evaluated from the row in hand.
+- Tests: `binder: COUNT, SUM and AVG of DISTINCT values of an expression
+  (#904 G2)`, `embedded API: COUNT, SUM and AVG of DISTINCT values of an
+  expression give PostgreSQL 17's (#904 G2)` (one structure for two calls
+  over one argument, from the plan's source), the expression lines of the
+  `DISTINCT` memory test (54000), `physical: a DOUBLE column is never read
+  from a key, wherever codegen reads it` (the check's refusals), `proof:
+  test_sql_machine` (rule `aggregate_of_distinct_expression`), and the functional case in
+  `aggregates.yaml`. No golden plan.
 #### UPDATE SET of an expression
 
 - **Search**: none; `op.set` is copied into `physical::Update`
