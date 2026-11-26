@@ -10,9 +10,10 @@ revision 21); and the accessors `->`, `->>`, `#>`, `#>>`, `jsonb_typeof`,
 `jsonb_array_length` and the casts to `boolean` and the numbers (plan API
 revision 22). Stage 4 is built but for `json_build_array` and
 `json_build_object`, which wait for stage 1c: containment, existence,
-modification and construction (plan API revision 25). *Stages of jsonb*
-says what each built and how it differs from this design. Stages 1b, 1c, 2,
-5 and 6 are not built.
+modification and construction (plan API revision 25). Stage 2 is built:
+comparison, order, groups, `DISTINCT` and set operations by the jsonb sort
+key (plan API revision 26). *Stages of jsonb* says what each built and how
+it differs from this design. Stages 1b, 1c, 5 and 6 are not built.
 
 This document covers PostgreSQL's `jsonb` type, and `json` where it is
 cheap: what the layer matches exactly, how a value is stored, the plan API
@@ -1196,8 +1197,9 @@ These remain after every stage, each a known difference in
 - **Stored layout.** The binary layout is the layer's own, not PG 17's
   JEntry format; only the wire's binary form (version 1 and the text) is
   PG 17's.
-- **Group representative.** The first row's value; PG 17's depends on the
-  plan. Both print an input value.
+- **Group representative.** The first row's value (for `INTERSECT`, the
+  right arm's first); PG 17's depends on the plan. Both print an input
+  value.
 - **Parameter OIDs in text format.** A text-format parameter the layer
   types jsonb is read as jsonb whatever OID the client gave; PG 17 refuses
   OIDs 25 and 1043 with 42804.
@@ -1477,6 +1479,60 @@ estimates of changed lines, code and tests.
 - **Stage 2: comparison and order** (about 1,300 lines). The sort key
   from a walk of the node, `bc_sub_has_jsonb`, the first-value aggregate
   slot and its own plan API test, binder lifts. Revision 23.
+  **As built.** Everything above, plan API revision 26 (23 to 25 went to
+  stages 3 and 4 and #904's casts), with these choices the code made:
+  - The sort key is `sql/jsonb.cppm`'s `sort_key`, one iterative walk over
+    `open_container` and `child_at` (the stage-4 readers) with a charged
+    stack, writing into a buffer `sort_key_bound` (the node's length plus
+    one) sized: a write past it is `Corrupt`, never a write outside it. It
+    checks what it copies (a NUL in a string or key, a number's rules, the
+    end tables, depth 10000), not key order or UTF-8, as a lookup does.
+  - `bc_sort_key_jsonb(cx, key, j, dir, nulls)` adds the key as a sort
+    key's part, as the other `bc_sort_key_*` calls do, its bound charged
+    first and its bytes inverted under `DESC`; `bc_sort_key_col` of a jsonb
+    column does the same from the row. A jsonb part never decodes: no
+    `bc_sort_key_part_jsonb`. `key_codec`'s `sortable(PhysType)` is
+    `keyable`'s types and jsonb: what a sort, group or set key may hold,
+    while a table's or index's key still refuses it.
+  - Comparison is one call, `bc_jsonb_cmp(cx, a, b)`, -1, 0 or 1 from
+    `memcmp` of the two sort keys, built and released per call; codegen
+    prints `bc_jsonb_cmp(...) op 0` wherever it prints a comparison (a
+    filter, a value, `HAVING`, a join's `ON`). Order still has one
+    definition, the sort key. Folded constants compare by the same keys
+    (`jsonb_order` in the binder).
+  - No first-value aggregate slot. A jsonb expression key of `GROUP BY` or
+    `DISTINCT` is held as its first row's text in the slot an expression key
+    already has (`bc_agg_min_bytes` on the group's first row) and read back
+    by `bc_jsonb_in`: the same value, its scale kept. A jsonb column key is
+    read from the group's held first row, as every non-integer column key
+    is. `COUNT(DISTINCT j)` of a column keys it by its sort key, not its
+    stored bytes (`1` and `1.0` differ there).
+  - Set operations key each row's jsonb by its sort key and carry it in the
+    payload as its text, as stage 1 did for `UNION ALL`; `UNION` prints the
+    first row of each value, `INTERSECT` the right arm's (the layer's
+    existing choice for every type), `EXCEPT` the left's.
+  - Subqueries of jsonb: a `BC_SUB_SET` holds each row's sort key
+    (`bc_sub_has_jsonb`), `BC_SUB_BOUNDS` keeps the extremes by their sort
+    keys and hands the plan their text, and a scalar subquery its text; each
+    read back by `bc_param_jsonb`. So `= ANY`, `IN (SELECT …)`, `> ALL`
+    and the rest of `ANY` and `ALL`, and a scalar subquery of jsonb run.
+  - A correlated subquery takes an outer jsonb column as its argument by
+    `bc_sub_arg_jsonb`, which sets the parameter to the value's text, read
+    back by `bc_param_jsonb` as a jsonb parameter the caller gave
+    (`EXISTS (SELECT 1 FROM r WHERE r.j = m.j)`).
+  - The binder's `uncompared` is NUMERIC's alone again; an assignment still
+    takes a jsonb only from a jsonb or into a string type.
+  - Not built, as for every type: `GREATEST`, `LEAST`, `COLLATE` (42601,
+    PostgreSQL's is 42804), `IN`, `BETWEEN` and `IS DISTINCT FROM` in a
+    select list (42601), `DISTINCT ON`.
+  - Tests: `jsonb_test`'s sort key cases (PostgreSQL 17's order of 63
+    values in 53 classes, prefix-freedom, the bound, damage, the stack's
+    charge), `plan_api_jsonb_ops_test`'s `bc_jsonb_cmp` and sort cases
+    (and the budget sweep), embedded API cases, a proof test drawing
+    values and parameters against PostgreSQL 17 on both targets, the fuzz
+    properties widened to the sort key, and functional cases recorded from
+    PostgreSQL 17 (stage 2's marks of `jsonb.yaml` lifted, seven cases
+    added). No benchmark: no speed-up is claimed.
 - **Stage 4: containment, existence, modification, constructors** (about
   3,200 lines, up from 3,000: a modification re-encodes the tables on its
   path, and the builder writes binary). Containment walks both trees with

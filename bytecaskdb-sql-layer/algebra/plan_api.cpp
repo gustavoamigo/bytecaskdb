@@ -1303,6 +1303,7 @@ struct bc_ctx {
     bool saw_null{false};
     Datum value;                   // BC_SUB_VALUE: its row's
     std::optional<Datum> lo, hi;   // BC_SUB_BOUNDS: the non-NULL extremes
+    Bytes lo_key, hi_key;          // and, of a jsonb, their sort keys, which order them
     // Where the handle tables and the blocking structures stood at
     // bc_sub_begin: bc_sub_end releases what the run made after. `steps` is
     // the loop depth then, and `top` the id of the innermost step (0: none),
@@ -2708,7 +2709,7 @@ auto sort_value_max_bytes(PhysType type, std::size_t len) -> std::uint64_t {
     case PhysType::Bool: return 1;
     case PhysType::Bytes: return 2 * std::uint64_t{len} + 2;
     case PhysType::Num: throw std::logic_error("a sort key part that is a NUMERIC");
-    case PhysType::Jsonb: throw std::logic_error("a sort key part that is a jsonb");
+    case PhysType::Jsonb: return std::uint64_t{len} + 1;  // len: the node's (jsonb::sort_key_bound)
   }
   return 0;
 }
@@ -4761,6 +4762,60 @@ void fail_jsonb(bc_ctx* cx, const jsonb::Outcome& r) {
   }
 }
 
+// The next part of sort key k: a jsonb node's sort key (jsonb::sort_key),
+// inverted under DESC. Its bound is charged before it is built; a node that
+// does not decode is BC_E_CORRUPT.
+void jsonb_sort_part(bc_ctx* cx, bc_sort_key k, BytesView node, std::uint32_t dir, std::uint32_t nulls) {
+  jsonb::Outcome r;
+  add_sort_key_part(cx, k, dir, nulls, PhysType::Jsonb, node.size(), [&](Bytes& out, KeyPart part) {
+    auto at = out.size();
+    out.resize(at + jsonb::sort_key_bound(node));
+    std::size_t length = 0;
+    r = jsonb::sort_key(node, jsonb_memory(cx), std::span{out}.subspan(at), length);
+    out.resize(at + length);
+    if (part.desc) {
+      for (auto& b : std::span{out}.subspan(at)) b = ~b;
+    }
+  });
+  if (!r.ok()) fail_jsonb(cx, r);
+}
+
+// A node's sort key, charged, in a buffer the caller releases (`held`).
+auto jsonb_key(bc_ctx* cx, BytesView node, BufferOut& out) -> bool {
+  if (!out.cx->take(jsonb::sort_key_bound(node))) {
+    fail_jsonb(cx, {jsonb::Status::Refused, std::nullopt, ""});
+    return false;
+  }
+  out.held += jsonb::sort_key_bound(node);
+  out.buf.resize(jsonb::sort_key_bound(node));
+  std::size_t length = 0;
+  auto r = jsonb::sort_key(node, jsonb_memory(cx), out.buf, length);
+  if (!r.ok()) {
+    fail_jsonb(cx, r);
+    return false;
+  }
+  out.buf.resize(length);
+  return true;
+}
+
+// A subquery's jsonb value, emitted as its text: its sort key, which a
+// BC_SUB_SET holds and bc_sub_has_jsonb looks up. Charged while it is built.
+auto jsonb_text_key(bc_ctx* cx, BytesView text, Bytes& key) -> bool {
+  BufferOut value{cx, {}};
+  std::span<std::byte> parsed;
+  auto r = jsonb::parse(text_of(text), jsonb_memory(cx), {&value, BufferOut::alloc}, parsed);
+  if (!r.ok()) {
+    fail_jsonb(cx, r);
+    cx->release(value.held);
+    return false;
+  }
+  BufferOut out{cx, {}};
+  auto ok = jsonb_key(cx, *jsonb::node_of(parsed), out);
+  cx->release(value.held + out.held);
+  if (ok) key = std::move(out.buf);
+  return ok;
+}
+
 // Text parsed into the arena: the node's handle, the step's (or the pins'
 // for `pinned`, until reset).
 auto parse_into(bc_ctx* cx, BytesView text, bool pinned) -> bc_jsonb {
@@ -5046,7 +5101,28 @@ void end_sub_row(bc_ctx* cx) {
       case PhysType::Bool: v = r.boolean(); break;
       case PhysType::Bytes:
       case PhysType::Num: v = Bytes(r.bytes.begin(), r.bytes.end()); break;
-      case PhysType::Jsonb: throw std::logic_error("a subquery of jsonb");  // refused at bc_sub_begin
+      case PhysType::Jsonb: {
+        // Its text, read back by bc_param_jsonb; a set holds its sort key
+        // instead, so equal values are one, and bounds are ordered by it.
+        Bytes key;
+        if ((s.kind == BC_SUB_SET || s.kind == BC_SUB_BOUNDS) && !jsonb_text_key(cx, r.bytes, key)) return;
+        if (s.kind == BC_SUB_SET) {
+          v = std::move(key);
+          break;
+        }
+        v = Bytes(r.bytes.begin(), r.bytes.end());
+        if (s.kind != BC_SUB_BOUNDS) break;
+        ++s.rows;
+        if (!s.lo || std::ranges::lexicographical_compare(key, s.lo_key)) {
+          s.lo = v;
+          s.lo_key = key;
+        }
+        if (!s.hi || std::ranges::lexicographical_compare(s.hi_key, key)) {
+          s.hi = std::move(v);
+          s.hi_key = std::move(key);
+        }
+        return;
+      }
     }
   }
   ++s.rows;
@@ -5159,8 +5235,7 @@ void bc_sub_begin(bc_ctx* cx, uint32_t sub, int32_t kind, int32_t type, uint32_t
   BC_GUARD_BEGIN
   if (!cx->ok()) return;
   auto t = type > 0 && type < 256 ? phys_type(static_cast<std::uint8_t>(type)) : std::nullopt;
-  // A subquery of jsonb folds its sort key (stage 2): not built.
-  if (cx->sub || cx->emit || !t || *t == PhysType::Jsonb || kind < BC_SUB_VALUE || kind > BC_SUB_SET ||
+  if (cx->sub || cx->emit || !t || kind < BC_SUB_VALUE || kind > BC_SUB_SET ||
       !caller_null(cx, param, sub_params_of(kind))) {
     cx->fail(BC_E_HANDLE, "bc_sub_begin: a subquery running, a row begun, an unknown kind or type, or its "
                           "parameters past the given ones or ones the caller gave");
@@ -5249,6 +5324,19 @@ bool bc_sub_has_bool(bc_ctx* cx, uint32_t sub, bool v) {
   return {};
 }
 
+bool bc_sub_has_jsonb(bc_ctx* cx, uint32_t sub, bc_jsonb j) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return false;
+  auto node = cx->resolve_jsonb(j);
+  if (!node) return false;
+  BufferOut key{cx, {}};
+  auto ok = jsonb_key(cx, *node, key);
+  cx->release(key.held);
+  return ok && sub_has(cx, sub, Datum{std::move(key.buf)});
+  BC_GUARD_END(cx)
+  return {};
+}
+
 bool bc_sub_has_bytes(bc_ctx* cx, uint32_t sub, bc_view v) {
   BC_GUARD_BEGIN
   auto b = cx->resolve(v);
@@ -5304,6 +5392,22 @@ void bc_sub_arg_bytes(bc_ctx* cx, uint32_t i, bc_view v) {
   auto b = cx->resolve(v);
   if (!b) return;
   sub_arg(cx, i, Datum{Bytes(b->begin(), b->end())});
+  BC_GUARD_END(cx)
+}
+
+// Set as its text, which bc_param_jsonb parses back, as a jsonb parameter
+// the caller gave; the text is charged while it is written.
+void bc_sub_arg_jsonb(bc_ctx* cx, uint32_t i, bc_jsonb j) {
+  BC_GUARD_BEGIN
+  auto node = cx->resolve_jsonb(j);
+  if (!node) return;
+  BufferOut out{cx, {}};
+  auto text = node_text(cx, *node, out);
+  if (text) {
+    auto bytes = std::as_bytes(*text);
+    sub_arg(cx, i, Datum{Bytes(bytes.begin(), bytes.end())});
+  }
+  cx->release(out.held);
   BC_GUARD_END(cx)
 }
 
@@ -6336,6 +6440,23 @@ bool bc_jsonb_contains(bc_ctx* cx, bc_jsonb a, bc_jsonb b) {
   return false;
 }
 
+int bc_jsonb_cmp(bc_ctx* cx, bc_jsonb a, bc_jsonb b) {
+  BC_GUARD_BEGIN
+  auto x = jsonb_arg(cx, a);
+  if (!x) return 0;
+  auto y = jsonb_arg(cx, b);
+  if (!y) return 0;
+  BufferOut kx{cx, {}};
+  BufferOut ky{cx, {}};
+  auto ok = jsonb_key(cx, x->node, kx) && jsonb_key(cx, y->node, ky);
+  auto o = std::lexicographical_compare_three_way(kx.buf.begin(), kx.buf.end(), ky.buf.begin(), ky.buf.end());
+  cx->release(kx.held + ky.held);
+  if (!ok) return 0;
+  return std::is_lt(o) ? -1 : std::is_gt(o) ? 1 : 0;
+  BC_GUARD_END(cx)
+  return 0;
+}
+
 bool bc_jsonb_exists(bc_ctx* cx, bc_jsonb j, bc_view key) {
   BC_GUARD_BEGIN
   auto src = jsonb_arg(cx, j);
@@ -6919,6 +7040,15 @@ void bc_sort_key_bytes(bc_ctx* cx, bc_sort_key k, bc_view v, uint32_t dir, uint3
   BC_GUARD_END(cx)
 }
 
+void bc_sort_key_jsonb(bc_ctx* cx, bc_sort_key k, bc_jsonb j, uint32_t dir, uint32_t nulls) {
+  BC_GUARD_BEGIN
+  if (!cx->ok()) return;
+  auto node = cx->resolve_jsonb(j);
+  if (!node) return;
+  jsonb_sort_part(cx, k, *node, dir, nulls);
+  BC_GUARD_END(cx)
+}
+
 void bc_sort_key_null(bc_ctx* cx, bc_sort_key k, uint32_t dir, uint32_t nulls) {
   BC_GUARD_BEGIN
   add_sort_key_part(cx, k, dir, nulls, std::nullopt, 0, [](Bytes&, KeyPart) {});
@@ -6932,6 +7062,15 @@ void bc_sort_key_col(bc_ctx* cx, bc_sort_key k, bc_view row, uint32_t col, uint3
   auto v = read_column(cx, *rc);
   if (!v) return;
   auto type = v->state == bytecask::sql::ColumnState::Absent ? std::nullopt : std::optional{rc->slot->type};
+  if (type == PhysType::Jsonb) {
+    auto node = jsonb::node_of(v->bytes);
+    if (!node) {
+      cx->fail(BC_E_CORRUPT, "a stored jsonb value does not decode: an unknown format byte or no node");
+      return;
+    }
+    jsonb_sort_part(cx, k, *node, dir, nulls);
+    return;
+  }
   add_sort_key_part(cx, k, dir, nulls, type, v->bytes.size(),
                     [&](Bytes& out, KeyPart part) { key_put_column(out, *v, part); });
   BC_GUARD_END(cx)

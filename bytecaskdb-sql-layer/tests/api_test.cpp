@@ -4003,8 +4003,9 @@ TEST_CASE("embedded API: COUNT, SUM and AVG of DISTINCT values of an expression 
   // An error the argument raises is the statement's, on a row that meets it.
   CHECK(state("SELECT count(DISTINCT a / 0) FROM de") == "22012");
   CHECK(run("SELECT count(DISTINCT a / 0) FROM de WHERE a IS NULL") == Grid{{i(0)}});
-  // Refused as the argument's type is.
-  CHECK(state("SELECT count(DISTINCT j->'u') FROM de") == "0A000");
+  // A jsonb by its value (jsonb stage 2): "x" twice is one, a JSON null a
+  // value, a missing key NULL.
+  CHECK(run("SELECT count(DISTINCT j->'u'), count(DISTINCT j) FROM de") == Grid{{i(3), i(4)}});
 }
 
 TEST_CASE("embedded API: ORDER BY an expression of the FROM columns sorts by its value per row", "[sql][api]") {

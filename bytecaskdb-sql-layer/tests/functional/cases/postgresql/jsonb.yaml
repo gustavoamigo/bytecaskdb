@@ -1,6 +1,6 @@
-# jsonb (docs/jsonb_design.md): stages 1, 3 and 4 build the type, its accessors and casts out, and
-# its containment, existence, modification and construction; the cases of stages 2 and 5 are
-# marked unimplemented until their stage lands. Results recorded from PostgreSQL 17.
+# jsonb (docs/jsonb_design.md): stages 1 to 4 build the type, its comparison and order, its
+# accessors and casts out, and its containment, existence, modification and construction; the
+# cases of stage 5 are marked unimplemented until it lands. Results recorded from PostgreSQL 17.
 
 - name: "a jsonb column takes any JSON value and returns jsonb_out's text"
   features: [pg:jsonb]
@@ -245,8 +245,6 @@
 
 - name: "jsonb equality is structural, with numeric equality"
   features: [pg:jsonb]
-  # jsonb does not compare, order or group yet (stage 2 of docs/jsonb_design.md, 0A000)
-  unimplemented: true
   steps:
     - sql: "SELECT '1.0'::jsonb = '1', '-0'::jsonb = '0', '{\"a\":1,\"b\":2}'::jsonb = '{\"b\":2,\"a\":1}', '[1,2]'::jsonb = '[2,1]'"
       expected: [[t, t, t, f]]
@@ -255,8 +253,6 @@
 
 - name: "jsonb orders as PostgreSQL's jsonb_ops in a C database"
   features: [pg:jsonb]
-  # jsonb does not compare, order or group yet (stage 2 of docs/jsonb_design.md, 0A000)
-  unimplemented: true
   setup:
     - "CREATE TABLE jb (id INTEGER PRIMARY KEY, j jsonb, s TEXT)"
   steps:
@@ -283,8 +279,6 @@
 
 - name: "GROUP BY and DISTINCT merge equal jsonb values"
   features: [pg:jsonb]
-  # jsonb does not compare, order or group yet (stage 2 of docs/jsonb_design.md, 0A000)
-  unimplemented: true
   setup:
     - "CREATE TABLE jb (id INTEGER PRIMARY KEY, j jsonb, s TEXT)"
   steps:
@@ -295,6 +289,173 @@
       ordered: true
     - sql: "SELECT count(DISTINCT j) FROM jb"
       expected: [[2]]
+  teardown:
+    - "DROP TABLE jb"
+
+- name: "jsonb IN, BETWEEN, NULLIF, a simple CASE and = ANY compare by value"
+  features: [pg:jsonb]
+  setup:
+    - "CREATE TABLE jb (id INTEGER PRIMARY KEY, j jsonb, s TEXT)"
+    - "INSERT INTO jb (id, j) VALUES (1, '1.0'), (2, '\"a\"'), (3, '[]'), (4, '{\"b\": 2, \"a\": 1}'), (5, NULL), (6, 'true')"
+  steps:
+    - sql: "SELECT id FROM jb WHERE j IN ('1', '{\"a\": 1, \"b\": 2}') ORDER BY id"
+      expected: [[1], [4]]
+    - sql: "SELECT id FROM jb WHERE j NOT IN ('1', '\"a\"') ORDER BY id"
+      expected: [[3], [4], [6]]
+    - sql: "SELECT id FROM jb WHERE j BETWEEN 'null' AND 'true' ORDER BY id"
+      expected: [[1], [2], [6]]
+    - sql: "SELECT id, nullif(j, '1'), CASE j WHEN '1' THEN 'one' WHEN '[]' THEN 'empty' ELSE 'other' END FROM jb ORDER BY id"
+      expected:
+        - [1, null, one]
+        - [2, "\"a\"", other]
+        - [3, "[]", empty]
+        - [4, "{\"a\": 1, \"b\": 2}", other]
+        - [5, null, other]
+        - [6, "true", other]
+      ordered: true
+    - sql: "SELECT nullif('{\"a\":1}'::jsonb, '{\"a\":1.0}') IS NULL, nullif('[1]'::jsonb, '[2]')"
+      expected: [[t, "[1]"]]
+    - sql: "SELECT id FROM jb WHERE id < 3 AND '1'::jsonb IN ('1.0', '2') AND '[1, 2]'::jsonb BETWEEN '[0]' AND '[1, 3]' ORDER BY id"
+      expected: [[1], [2]]
+    - sql: "SELECT id FROM jb WHERE j = ANY (SELECT j FROM jb WHERE id IN (1, 3)) ORDER BY id"
+      expected: [[1], [3]]
+  teardown:
+    - "DROP TABLE jb"
+
+- name: "jsonb compared with a parameter, an accessor's value and another column"
+  features: [pg:jsonb]
+  setup:
+    - "CREATE TABLE jb (id INTEGER PRIMARY KEY, j jsonb, s TEXT)"
+    - "CREATE TABLE jb2 (id INTEGER PRIMARY KEY, k jsonb)"
+    - "INSERT INTO jb (id, j) VALUES (1, '{\"k\": 1, \"t\": [1, 2]}'), (2, '{\"k\": 2.0}'), (3, '{\"k\": \"x\"}'), (4, '{}'), (5, NULL)"
+    - "INSERT INTO jb2 VALUES (1, '1.0'), (2, '{\"k\": 2}'), (3, NULL), (4, '\"x\"')"
+  steps:
+    - sql: "SELECT id FROM jb WHERE j -> 'k' = $1::jsonb ORDER BY id"
+      params: ["1.00"]
+      expected: [[1]]
+    - sql: "SELECT id FROM jb WHERE j = $1 ORDER BY id"
+      params: ["{\"k\": 2}"]
+      expected: [[2]]
+    - sql: "SELECT id FROM jb WHERE j -> 'k' < $1 ORDER BY id"
+      params: ["2"]
+      expected: [[1], [3]]
+    - sql: "SELECT id FROM jb WHERE j = '{}'::jsonb"
+      expected: [[4]]
+    - sql: "SELECT jb.id, jb2.id FROM jb JOIN jb2 ON jb.j -> 'k' = jb2.k ORDER BY 1, 2"
+      expected: [[1, 1], [3, 4]]
+      ordered: true
+    - sql: "SELECT jb.id, jb2.id FROM jb JOIN jb2 ON jb.j = jb2.k ORDER BY 1, 2"
+      expected: [[2, 2]]
+      ordered: true
+    - sql: "SELECT id, j -> 'k' > '1', j -> 't' >= '[1, 2]' FROM jb ORDER BY id"
+      expected:
+        - [1, f, t]
+        - [2, t, null]
+        - [3, f, null]
+        - [4, null, null]
+        - [5, null, null]
+      ordered: true
+  teardown:
+    - "DROP TABLE jb2"
+    - "DROP TABLE jb"
+
+- name: "ORDER BY a jsonb expression, DESC and NULLS LAST"
+  features: [pg:jsonb]
+  setup:
+    - "CREATE TABLE jb (id INTEGER PRIMARY KEY, j jsonb, s TEXT)"
+    - "INSERT INTO jb (id, j) VALUES (1, '{\"k\": [1]}'), (2, '{\"k\": {}}'), (3, '{\"k\": -2}'), (4, '{}'), (5, '{\"k\": \"b\"}'), (6, '{\"k\": false}'), (7, '{\"k\": []}')"
+  steps:
+    - sql: "SELECT id FROM jb ORDER BY j -> 'k', id"
+      expected: [[7], [5], [3], [6], [1], [2], [4]]
+      ordered: true
+    - sql: "SELECT id FROM jb ORDER BY j -> 'k' DESC NULLS LAST, id"
+      expected: [[2], [1], [6], [3], [5], [7], [4]]
+      ordered: true
+    - sql: "SELECT id, j FROM jb ORDER BY j DESC LIMIT 3"
+      expected: [[2, "{\"k\": {}}"], [1, "{\"k\": [1]}"], [7, "{\"k\": []}"]]
+      ordered: true
+  teardown:
+    - "DROP TABLE jb"
+
+- name: "GROUP BY and DISTINCT of jsonb expressions, and set operations of jsonb"
+  features: [pg:jsonb]
+  setup:
+    - "CREATE TABLE jb (id INTEGER PRIMARY KEY, j jsonb, s TEXT)"
+    - "INSERT INTO jb (id, j) VALUES (1, '{\"k\": 1, \"n\": 1}'), (2, '{\"n\": 1, \"k\": 1.0}'), (3, '{\"k\": \"x\"}'), (4, '{}'), (5, '{\"k\": [1]}')"
+  steps:
+    - sql: "SELECT count(*) FROM jb GROUP BY j -> 'k' ORDER BY 1"
+      expected: [[1], [1], [1], [2]]
+      ordered: true
+    - sql: "SELECT j -> 'k', count(*) FROM jb WHERE id > 2 GROUP BY j -> 'k' ORDER BY j -> 'k'"
+      expected: [["\"x\"", 1], ["[1]", 1], [null, 1]]
+      ordered: true
+    - sql: "SELECT count(DISTINCT j), count(DISTINCT j -> 'k'), count(DISTINCT j -> 'n') FROM jb"
+      expected: [[4, 3, 1]]
+    - sql: "SELECT DISTINCT j -> 'n' FROM jb ORDER BY 1"
+      expected: [[1], [null]]
+      ordered: true
+    - sql: "SELECT j -> 'k' FROM jb WHERE id > 2 UNION SELECT j -> 'k' FROM jb WHERE id > 3 ORDER BY 1"
+      expected: [["\"x\""], ["[1]"], [null]]
+      ordered: true
+    - sql: "SELECT j -> 'k' FROM jb WHERE id > 2 INTERSECT SELECT '\"x\"'::jsonb"
+      expected: [["\"x\""]]
+    - sql: "SELECT j -> 'n' FROM jb EXCEPT SELECT '1'::jsonb"
+      expected: [[null]]
+  teardown:
+    - "DROP TABLE jb"
+
+- name: "a jsonb in a subquery: a scalar value, > ALL and <> ALL"
+  features: [pg:jsonb]
+  setup:
+    - "CREATE TABLE jb (id INTEGER PRIMARY KEY, j jsonb, s TEXT)"
+    - "INSERT INTO jb (id, j) VALUES (1, '[1, 2]'), (2, '\"a\"'), (3, '2'), (4, '{}')"
+  steps:
+    - sql: "SELECT (SELECT j FROM jb WHERE id = 1), (SELECT j FROM jb WHERE id = 3) < '10'"
+      expected: [["[1, 2]", t]]
+    - sql: "SELECT id FROM jb WHERE j > ALL (SELECT j FROM jb WHERE id IN (2, 3)) ORDER BY id"
+      expected: [[1], [4]]
+    - sql: "SELECT id FROM jb WHERE j <> ALL (SELECT j FROM jb WHERE id IN (2, 3)) ORDER BY id"
+      expected: [[1], [4]]
+    - sql: "SELECT id FROM jb WHERE j < ANY (SELECT j FROM jb WHERE id = 3) ORDER BY id"
+      expected: [[2]]
+  teardown:
+    - "DROP TABLE jb"
+
+- name: "a correlated subquery compares the outer row's jsonb: EXISTS, NOT EXISTS and IN"
+  features: [pg:jsonb]
+  setup:
+    - "CREATE TABLE jb (id INTEGER PRIMARY KEY, j jsonb, s TEXT)"
+    - "CREATE TABLE jc (id INTEGER PRIMARY KEY, j jsonb)"
+    - "INSERT INTO jb (id, j) VALUES (1, '{\"a\": 1, \"b\": 2}'), (2, '[1, 2]'), (3, '1.0'), (4, NULL), (5, '\"x\"')"
+    - "INSERT INTO jc VALUES (1, '{\"b\": 2, \"a\": 1}'), (2, '1'), (3, '[2, 1]'), (4, NULL)"
+  steps:
+    - sql: "SELECT id FROM jb WHERE EXISTS (SELECT 1 FROM jc WHERE jc.j = jb.j) ORDER BY id"
+      expected: [[1], [3]]
+    - sql: "SELECT id FROM jb WHERE NOT EXISTS (SELECT 1 FROM jc WHERE jc.j = jb.j) ORDER BY id"
+      expected: [[2], [4], [5]]
+    - sql: "SELECT id FROM jb WHERE EXISTS (SELECT 1 FROM jc WHERE jc.j > jb.j) ORDER BY id"
+      expected: [[2], [3], [5]]
+    - sql: "SELECT id FROM jb WHERE j IN (SELECT j FROM jc WHERE jc.id <> jb.id) ORDER BY id"
+      expected: [[3]]
+  teardown:
+    - "DROP TABLE jc"
+    - "DROP TABLE jb"
+
+- name: "jsonb compares only with jsonb; MIN and MAX of jsonb do not exist"
+  features: [pg:jsonb]
+  setup:
+    - "CREATE TABLE jb (id INTEGER PRIMARY KEY, j jsonb, s TEXT)"
+  steps:
+    - sql: "SELECT id FROM jb WHERE j = s"
+      error: "42883"
+    - sql: "SELECT '1'::jsonb < 'x'::text"
+      error: "42883"
+    - sql: "SELECT min(j) FROM jb"
+      error: "42883"
+    - sql: "SELECT j FROM jb UNION SELECT s FROM jb"
+      error: "42804"
+    - sql: "SELECT '1'::jsonb = 'nope'"
+      error: "22P02"
   teardown:
     - "DROP TABLE jb"
 

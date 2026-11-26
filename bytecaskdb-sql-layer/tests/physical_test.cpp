@@ -346,9 +346,9 @@ TEST_CASE("physical: a DOUBLE column is never read from a key, wherever codegen 
   count_e.fn = logical::Expr::Fn::Count;
   count_e.distinct = true;
   CHECK(refusal(plan(node(physical::Aggregate{node(scan({p(0)}, {})), count_e, true}))).empty());
-  auto count_j = count_e;
-  count_j.args[0].type = SqlType{SqlKind::Jsonb};
-  refused(plan(node(physical::Aggregate{node(scan({p(0)}, {})), count_j, true})), "DISTINCT values no sort key holds");
+  auto count_n = count_e;
+  count_n.args[0].type = SqlType{SqlKind::Numeric};
+  refused(plan(node(physical::Aggregate{node(scan({p(0)}, {})), count_n, true})), "DISTINCT values no sort key holds");
   auto count_c = count_e;
   count_c.args[0] = logical::expr(logical::Expr::Kind::Coalesce, SqlType{SqlKind::Char, 3});
   count_c.args[0].args = {col(kV, SqlKind::Char), col(kV, SqlKind::Char)};
@@ -709,10 +709,16 @@ TEST_CASE("physical: check takes an expression key in a structure only, read by 
   refused(grouped({lower}, false, {logical::group_key(1, text)}), "no key or aggregate of its groups");
   refused(grouped({lower}, false, {logical::group_key(0, SqlType{SqlKind::BigInt})}), "no key or aggregate of its groups");
   // A key a sort key holds and groups as PostgreSQL's, never random()'s.
+  // A NUMERIC is none; a jsonb is, by its jsonb sort key (jsonb stage 2).
+  auto numeric = logical::column({1, 3, PhysType::Num, true}, SqlType{SqlKind::Numeric});
+  auto either = logical::expr(Kind::Coalesce, SqlType{SqlKind::Numeric});
+  either.args = {numeric, numeric};
+  refused(grouped({either}, false, {count}), "an expression key of a type no sort key groups");
   auto jsonb = logical::column({1, 3, PhysType::Jsonb, true}, SqlType{SqlKind::Jsonb});
-  auto cast = logical::expr(Kind::Cast, SqlType{SqlKind::Jsonb});
-  cast.args.push_back(jsonb);
-  refused(grouped({cast}, false, {count}), "an expression key of a type no sort key groups");
+  auto field = logical::expr(Kind::Jsonb, SqlType{SqlKind::Jsonb});
+  field.jsonb = logical::Expr::Jsonb::Field;
+  field.args = {jsonb, logical::param(1, text)};
+  CHECK(refusal(grouped({field}, false, {logical::group_key(0, SqlType{SqlKind::Jsonb}), count})).empty());
   auto random = logical::binary(Kind::Random, p(0), p(1), SqlType{SqlKind::BigInt});
   refused(grouped({random}, false, {count}), "an expression key of random()");
   refused(grouped({logical::column(name, text)}, false, {count}), "an expression key that is a column");

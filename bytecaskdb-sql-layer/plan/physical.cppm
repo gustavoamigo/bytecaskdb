@@ -904,7 +904,7 @@ private:
   void argument(const Expr& a) const {
     if (a.args.size() > 1) broken("an aggregate call of more than one argument");
     if (a.args.empty()) return;
-    if (a.distinct && !keyable(a.args[0].phys())) broken("an aggregate of DISTINCT values no sort key holds");
+    if (a.distinct && !sortable(a.args[0].phys())) broken("an aggregate of DISTINCT values no sort key holds");
     if (a.distinct && a.args[0].kind != Expr::Kind::Column && a.args[0].type.kind == SqlKind::Char) {
       broken("an aggregate of DISTINCT values of a CHAR expression");
     }
@@ -1780,7 +1780,7 @@ private:
                 if (!known || (x != nullptr && x->expr.kind == Expr::Kind::Aggregate && x->expr.fn == Expr::Fn::Avg)) {
                   broken("a sort of groups by other than a key or an aggregate of them");
                 }
-                if (x != nullptr && !keyable(x->expr.phys())) broken("a sort of groups by a value no sort key holds");
+                if (x != nullptr && !sortable(x->expr.phys())) broken("a sort of groups by a value no sort key holds");
               }
               node(*op.input, &n);
               return;
@@ -1870,7 +1870,7 @@ private:
             if (op.streamed && !op.exprs.empty()) broken("a streamed GROUP BY key that is an expression");
             for (const auto& x : op.exprs) {
               if (x.kind == Expr::Kind::Column) broken("an expression key that is a column");
-              if (!keyable(x.phys()) || x.type.kind == SqlKind::Char) broken("an expression key of a type no sort key groups");
+              if (!sortable(x.phys()) || x.type.kind == SqlKind::Char) broken("an expression key of a type no sort key groups");
               std::function<bool(const Expr&)> random = [&](const Expr& e) {
                 return e.kind == Expr::Kind::Random || std::ranges::any_of(e.args, random);
               };

@@ -322,6 +322,23 @@ struct BuildArg {
 // composite one.
 [[nodiscard]] auto build_object(std::span<const BuildArg> args, Memory mem, Alloc out, ByteView& result) -> Outcome;
 
+// ------------------------------------------- comparison and order (stage 2)
+//
+// The jsonb sort key (*jsonb as a sort key and group key*): memcmp order on
+// two keys is PostgreSQL 17's jsonb_ops order in a C database, byte equality
+// its equality (1 = 1.0, key order irrelevant), and no key is a proper
+// prefix of another, so it concatenates with other sort key parts and a
+// DESC part inverts it. It is never decoded. `node` is the top-level value:
+// an empty array there sorts below every other value.
+
+// The most bytes a node's sort key takes: its length plus one.
+[[nodiscard]] constexpr auto sort_key_bound(ByteView node) -> std::size_t { return node.size() + 1; }
+// Writes the sort key into `out`, which sort_key_bound sized; `length` the
+// bytes written. A write past `out` is Corrupt, never a write outside it.
+[[nodiscard]] auto sort_key(ByteView node, Memory mem, std::span<std::byte> out, std::size_t& length) -> Outcome;
+// The sort key into a vector, uncharged: for constants folded by the binder.
+[[nodiscard]] auto sort_key_value(ByteView node, std::vector<std::byte>& out) -> Outcome;
+
 }  // namespace bytecask::sql::jsonb
 
 namespace bytecask::sql::jsonb {
@@ -3403,6 +3420,155 @@ auto build_object(std::span<const BuildArg> args, Memory mem, Alloc out, ByteVie
   }
   b.close();
   return b.finish(out, result);
+}
+
+// ------------------------------------------- comparison and order (stage 2)
+
+namespace {
+
+// The sort key's tags: the type order, the top-level empty array first.
+constexpr std::uint8_t kKeyEmptyTop = 0x01;
+constexpr std::uint8_t kKeyNull = 0x02;
+constexpr std::uint8_t kKeyString = 0x03;
+constexpr std::uint8_t kKeyNumber = 0x04;
+constexpr std::uint8_t kKeyBool = 0x05;
+constexpr std::uint8_t kKeyArray = 0x06;
+constexpr std::uint8_t kKeyObject = 0x07;
+
+// Writes a sort key into its buffer: false past its end, never a write past it.
+struct KeyWriter {
+  std::span<std::byte> out;
+  std::size_t at{0};
+
+  auto put(std::uint8_t b) -> bool {
+    if (at >= out.size()) return false;
+    out[at++] = std::byte{b};
+    return true;
+  }
+  // Big-endian, so memcmp orders it as a number.
+  auto put_u32(std::uint32_t v) -> bool {
+    for (int shift = 24; shift >= 0; shift -= 8) {
+      if (!put(static_cast<std::uint8_t>(v >> shift))) return false;
+    }
+    return true;
+  }
+  // A string's or key's bytes, then 0x00: prefix-free because the bytes hold
+  // no NUL, checked here (a damaged value is Corrupt, never a shared prefix).
+  auto put_text(ByteView s) -> Outcome {
+    if (std::ranges::find(s, std::byte{0}) != s.end()) return corrupt("a string that is not UTF-8 or holds a NUL byte");
+    if (out.size() - at < s.size() + 1) return corrupt("a sort key past its bound");
+    std::memcpy(out.data() + at, s.data(), s.size());
+    at += s.size();
+    out[at++] = std::byte{0};
+    return {};
+  }
+};
+
+// A scalar node's sort key. A number: its sign class (negative, zero,
+// positive), then for a non-zero one its weight (big-endian, sign bit
+// flipped) and its significant digits ended by 0x00, every byte after the
+// sign class inverted when negative. Scale is not in it: 1 = 1.0.
+auto key_scalar(ByteView v, KeyWriter& w) -> Outcome {
+  auto past = [] { return corrupt("a sort key past its bound"); };
+  auto tag = tag_of(v);
+  if (!tag) return corrupt("an empty node");
+  switch (*tag) {
+    case kTagNull:
+    case kTagFalse:
+    case kTagTrue:
+      if (v.size() != 1) return corrupt("a null or boolean longer than its tag");
+      if (*tag == kTagNull) return w.put(kKeyNull) ? Outcome{} : past();
+      return w.put(kKeyBool) && w.put(*tag == kTagTrue ? 1 : 0) ? Outcome{} : past();
+    case kTagString:
+      if (!w.put(kKeyString)) return past();
+      return w.put_text(v.subspan(1));
+    case kTagNumber: {
+      Number n;
+      if (auto r = read_number(v, 0, v.size(), n); !r.ok()) return r;
+      if (!w.put(kKeyNumber)) return past();
+      if (n.sign == 0) return w.put(0x02) ? Outcome{} : past();
+      auto negative = n.sign == 2;
+      if (!w.put(negative ? 0x01 : 0x03)) return past();
+      auto from = w.at;
+      if (!w.put_u32(static_cast<std::uint32_t>(n.weight) ^ 0x80000000U)) return past();
+      if (w.out.size() - w.at < n.k + 1) return past();
+      std::memcpy(w.out.data() + w.at, n.digits, n.k);
+      w.at += n.k;
+      w.out[w.at++] = std::byte{0};
+      if (negative) {
+        for (auto& b : w.out.subspan(from, w.at - from)) b = ~b;
+      }
+      return {};
+    }
+    default: return corrupt("an unknown tag");
+  }
+}
+
+}  // namespace
+
+auto sort_key(ByteView node, Memory mem, std::span<std::byte> out, std::size_t& length) -> Outcome {
+  length = 0;
+  KeyWriter w{out};
+  auto past = [] { return corrupt("a sort key past its bound"); };
+  auto tag = tag_of(node);
+  if (!tag) return corrupt("an empty node");
+  if (*tag == kTagArray) {
+    // PostgreSQL 17 compares a top-level array's count before its raw-scalar
+    // flag, so the empty one sorts below every scalar (compareJsonbContainers).
+    Container c;
+    if (auto r = open_container(node, c); !r.ok()) return r;
+    if (c.n == 0) {
+      if (!w.put(kKeyEmptyTop)) return past();
+      length = w.at;
+      return {};
+    }
+  }
+  struct Open {
+    ByteView v;
+    Container c;
+    std::uint32_t i{0};
+  };
+  Scratch<Open> stack{mem, Site::Stack};
+  // A scalar is written whole; a container writes its tag and count, its
+  // children following in storage order (an object's key before its value).
+  auto visit = [&](ByteView v) -> Outcome {
+    auto t = tag_of(v);
+    if (!t) return corrupt("an empty node");
+    if (!is_container_tag(*t)) return key_scalar(v, w);
+    if (stack.vec().size() >= kMaxDepth) return corrupt("a value nested past 10000 containers");
+    Container c;
+    if (auto r = open_container(v, c); !r.ok()) return r;
+    if (!w.put(c.object ? kKeyObject : kKeyArray) || !w.put_u32(c.n)) return past();
+    if (!stack.push({v, c, 0})) return refused();
+    return {};
+  };
+  if (auto r = visit(node); !r.ok()) return r;
+  auto& frames = stack.vec();
+  while (!frames.empty()) {
+    auto& f = frames.back();
+    if (f.i == f.c.n) {
+      frames.pop_back();
+      continue;
+    }
+    ByteView k;
+    ByteView v;
+    if (auto r = child_at(f.v, f.c, f.i++, f.c.object ? &k : nullptr, v); !r.ok()) return r;
+    if (f.c.object) {
+      if (auto r = w.put_text(k); !r.ok()) return r;
+    }
+    // visit may push a frame: f is not used after it.
+    if (auto r = visit(v); !r.ok()) return r;
+  }
+  length = w.at;
+  return {};
+}
+
+auto sort_key_value(ByteView node, std::vector<std::byte>& out) -> Outcome {
+  out.resize(sort_key_bound(node));
+  std::size_t length = 0;
+  auto r = sort_key(node, Memory{}, out, length);
+  out.resize(r.ok() ? length : 0);
+  return r;
 }
 
 }  // namespace bytecask::sql::jsonb

@@ -78,6 +78,11 @@ every rule, the invariants are checked.
   PostgreSQL orders them: every NaN equal to every other, and `-0.0` equal
   to `0.0`, so their ties form one run (`oracle.same_rows`). Text columns are `COLLATE "C"`
   in PostgreSQL, so its order is byte order, the order of the layer's keys.
+  jsonb takes no `COLLATE`: its strings and keys compare under the
+  database's default collation, so a test of jsonb's order takes the
+  `c_dsn` fixture, which runs the oracle in a C database (made from
+  `template0` when the oracle's own does not sort bytewise, as the
+  `postgres` image's en_US.utf8 does not).
   A REAL comes from PostgreSQL as the shortest text naming its float; the
   oracle packs it back to that float, which is what the layer stores. A
   lookup by a SMALLINT, INTEGER or REAL key casts `$n` to the column's type

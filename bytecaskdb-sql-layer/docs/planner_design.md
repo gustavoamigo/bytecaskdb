@@ -1560,7 +1560,7 @@ counts `jsonb_object_field_text`, and a call for a cast from jsonb to a
 number or BOOLEAN. A cast of an accessor's text, `WHERE (props->>'n')::int
 > 5`, is #904's stage C1 (a cast of any expression), built after stage 3:
 it is a filter once C1 is. Comparing two jsonb values (`Data->'k' = $1::jsonb`)
-still waits for stage 2. Stage 3's tests add a `WHERE` step to each
+is a filter too since stage 2, by `bc_jsonb_cmp`. Stage 3's tests add a `WHERE` step to each
 operator's functional case.
 
 #### Tests of stage P (planner and proof)

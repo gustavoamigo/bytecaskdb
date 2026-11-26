@@ -1176,11 +1176,9 @@ HINT; a cast to it of another type, or of it to `bytea`, a date or a time,
 42846; arithmetic of it but `-` with text, an integer or a `text[]`, and
 `MIN`, `MAX`, `SUM` and `AVG` of it, 42883; a comparison with another type,
 42883. A jsonb assigned to a string column is its text, and one with a
-typed text under `||` is text concatenation. Refused (0A000) until
-stage 2: a comparison of it, of constants too (a literal beside it read
-first, 22P02), `IN`,
-`ORDER BY`, `GROUP BY`, `DISTINCT`, `COUNT(DISTINCT …)`, `UNION`,
-`INTERSECT`, `EXCEPT`, and a subquery of it; until the next phase: a key,
+typed text under `||` is text concatenation. It compares, orders and
+groups as *jsonb's comparison and order* below says (stage 2). Refused
+(0A000) until the next phase: a key,
 `UNIQUE`, index or `FOREIGN KEY` column of it; jsonpath's operators (`@?`,
 `@@`, refused by the parser whatever the operands) and the JSON functions
 stages 3 and 4 do not build (named `jsonb_…` or `json_…`, `to_json`,
@@ -1228,10 +1226,9 @@ type integer` and the rest, the target's 22003 range error
 (`integer out of range`, `"1e400" is out of range for type double
 precision`). A cast to an integer rounds half away from zero. An accessor
 names its column `?column?`, a cast of one its type (`int4`), as
-PostgreSQL does. Not built with them: `UPDATE … SET` of an accessor and a
-`GROUP BY`, `DISTINCT` or `COUNT(DISTINCT …)` of one, the layer's limits
-for any expression (42601, 0A000); `ORDER BY` of a jsonb result (stage 2);
-`ARRAY[ARRAY[…]]` (42601). `MIN` and `MAX` of an accessor's text are built
+PostgreSQL does. Not built with them: `ARRAY[ARRAY[…]]` (42601).
+`ORDER BY`, `GROUP BY`, `DISTINCT` and `COUNT(DISTINCT …)` of a jsonb
+result are stage 2's (*jsonb's comparison and order*, below). `MIN` and `MAX` of an accessor's text are built
 (#904, stage M1).
 
 **jsonb's containment, existence, modification and construction**
@@ -1269,12 +1266,29 @@ cast from a literal (`to_jsonb(1.50::numeric)`) is taken there.
 `CHAR(n)`, whose padded text no value holds, is 0A000 there. Constants
 fold when the statement is prepared. The results and errors are PostgreSQL
 17's, byte for byte: `jsonb_design.md`, stage 4, lists them. Not built
-with them: `ORDER BY`, `GROUP BY` and `DISTINCT` of a jsonb result
-(stage 2), `json_build_array` and `json_build_object` (stage 1c), named
+with them: `json_build_array` and `json_build_object` (stage 1c), named
 arguments (`null_value_treatment => …`, 42601 naming the function) and
 `VARIADIC` (42601), and a cast
 to `text[]` of anything but a string literal or `$n` beside a jsonb
 operator or function (42601).
+
+**jsonb's comparison and order** (`jsonb_design.md`, stage 2). `= <> <
+<= > >=` of two jsonb values (a column, an accessor's or function's value,
+`$n` typed jsonb by its peer, `$n::jsonb`, a literal read by `jsonb_in`
+first), `IN` of a list, `BETWEEN`, `NULLIF`, a simple `CASE`, `= ANY`, `IN
+(SELECT …)`, the other operators of `ANY` and `ALL` over a subquery, a
+scalar subquery of jsonb, `ORDER BY` (`ASC` or `DESC`, `NULLS FIRST` or
+`LAST`), `GROUP BY` and `HAVING`, `DISTINCT`, `COUNT(DISTINCT …)`,
+`UNION`, `INTERSECT`, `EXCEPT`, a join's `ON` and a correlated subquery's
+comparison with an outer jsonb column, all in PostgreSQL 17's
+`jsonb_ops` order under a C collation: a top-level `[]` first, then null <
+string < number < boolean < array < object; arrays by length, objects by
+pair count, then element by element or pair by pair; numbers by value (`1`
+= `1.0`). A group, a `DISTINCT` value and a set operation's row print an
+input value, its first row's (`INTERSECT`: the right arm's). PostgreSQL's
+errors stay: a comparison with another type 42883, a set operation with
+another type 42804, `MIN` and `MAX` 42883. Not built with them: `GREATEST`
+and `LEAST` (42601, as for every type).
 
 **NAME.** `NAME` declares a column of PostgreSQL's identifier type
 (`types_design.md`, *NAME*): text of at most 63 bytes, a longer value cut
@@ -1347,7 +1361,7 @@ That includes:
   over keys or aggregates in an aggregated select list or the `ORDER BY`
   of a grouped or aggregated query (#685, #686, stage P3), `ORDER BY` of
   `AVG` in one, `ORDER BY random()` and `ORDER BY t.*`; a `GROUP BY` or
-  `DISTINCT` key of jsonb, NUMERIC of no precision (0A000) or CHAR type
+  `DISTINCT` key of NUMERIC of no precision (0A000) or CHAR type
   other than a column (0A000), or of `random()`, the time, a subquery or a
   grouped view's columns (42601) (*GROUP BY of an expression*, **What
   stays refused**);
@@ -1824,7 +1838,7 @@ Each refusal of a clause names the clause as PG 17 does.
 | A `CASE` or `COALESCE` arm that PG 17 drops without folding and whose fold raises (`CASE WHEN false THEN 1/0 …`, `COALESCE(1, 1/0)`) | 42601 `a branch of CASE (COALESCE) that raises an error and is not taken is not supported yet`, as in a select list today | *Constants and CASE arms* below |
 | `GREATEST`, `LEAST` | 42601 `expression not supported`, now with its position | no evaluator yet; Mattermost's `SET … = GREATEST(…)` is open question 6 |
 | `IS [NOT] DISTINCT FROM`, `= ANY($1)` of an array, `IN` of a row | 42601, now with the position | not a stage P form |
-| A jsonb or NUMERIC comparison | as today (`numeric_compared`, :4597-4602) | `jsonb_design.md` stage 2 |
+| A NUMERIC comparison | as today (`numeric_compared`, :4597-4602) | a jsonb's is built (`jsonb_design.md`, stage 2) |
 | A correlated subquery inside an expression | as today | #836 |
 | `UPDATE … SET col = expr` beyond `col ± x` | built by #904 stage S1 (*Expressions in UPDATE … SET*) | open question 6 |
 | `ORDER BY`, `GROUP BY` of an aggregated query's expression | as today | not a filter |
@@ -2817,8 +2831,7 @@ being bytewise-equal, shows exactly what every row of the group holds.
 
 | Key | SQLSTATE | Why |
 |---|---|---|
-| A jsonb expression (`GROUP BY props->'j'`) | 0A000 `GROUP BY of a jsonb value is not supported yet`, as a jsonb column's | jsonb equality (`1` = `1.0`) is `jsonb_design.md` stage 2 |
-| A NUMERIC of no precision | 0A000, as a column's (`refuse_uncompared`) | no sort key for it |
+| A NUMERIC of no precision | 0A000, as a column's (`refuse_numeric`) | no sort key for it |
 | A CHAR(n)-typed expression (`coalesce(ch, ch)`) | 0A000 | open question 9 |
 | `random()`, or anything holding it | 42601, as `ORDER BY random()` | a replay cursor reads the rows again |
 | A subquery (`GROUP BY (SELECT 1)`) | 42601 `a subquery in GROUP BY is not supported yet` | PG 17 runs it; not needed |
@@ -2848,9 +2861,9 @@ a*2)` 4.0000000000000000, `count(DISTINCT -d)` over `0.0`, `-0.0`, NaN,
 NaN, 1 is 3. The expression is evaluated once per row; a row where it is
 NULL is skipped; an error it raises is the statement's. `MIN` and `MAX`
 of `DISTINCT` are those of all values, as today. The refusals of the
-argument's type stay: an aggregate of jsonb (`count(DISTINCT props->'j')`
-is 2 in PG 17, 0A000 here until stage 2) and of NUMERIC of no precision
-are 0A000. The distinct values are held in the statement's memory; past
+argument's type stay: an aggregate of NUMERIC of no precision is 0A000.
+(`count(DISTINCT props->'j')`, 2 in PG 17, was 0A000 too until jsonb
+stage 2 built it.) The distinct values are held in the statement's memory; past
 its budget, 54000.
 
 **As built (G2).** As above, with these particulars:
