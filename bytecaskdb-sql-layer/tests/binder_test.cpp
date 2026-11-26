@@ -1850,6 +1850,57 @@ TEST_CASE("binder: GROUP BY and DISTINCT of expressions, matched as written (#90
       "42601 GROUP BY of an expression of a grouped view's columns"));
 }
 
+TEST_CASE("binder: COUNT, SUM and AVG of DISTINCT values of an expression (#904 G2)", "[sql][binder][group]") {
+  sql_test::Fixture f;
+  auto ddl = [&](std::string_view sql) { f.ddl(std::get<Ddl>(bind_sql(f.cat(), sql).stmt)); };
+  ddl("CREATE TABLE g2 (id BIGINT PRIMARY KEY, a INTEGER, b TEXT, j JSONB, ch CHAR(3), n NUMERIC)");
+  const auto& cat = f.cat();
+  using Kind = logical::Expr::Kind;
+  auto error_of = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what() + " @" + std::to_string(e.pos());
+    }
+    return "bound";
+  };
+  // The argument is bound as a select item's expression, the call typed by
+  // its type.
+  auto b = bind_sql(cat, "SELECT count(DISTINCT j->>'u'), sum(DISTINCT a + 1), avg(DISTINCT a + 1) FROM g2");
+  const auto& agg = get<logical::Aggregate>(b);
+  REQUIRE(agg.aggs.size() == 3);
+  CHECK(agg.aggs[0].expr.distinct);
+  CHECK(agg.aggs[0].expr.args[0].kind == Kind::Jsonb);
+  CHECK(agg.aggs[0].expr.type == SqlType{SqlKind::BigInt});
+  // Two calls over arguments written alike share one bound copy, its
+  // literal's parameter the first's.
+  CHECK(agg.aggs[1].expr.args[0].kind == Kind::Add);
+  CHECK(agg.aggs[1].expr.args[0] == agg.aggs[2].expr.args[0]);
+  auto two = bind_sql(cat, "SELECT sum(DISTINCT a + 1), sum(DISTINCT g2.a + 1), count(DISTINCT a + 2), count(a + 1) FROM g2");
+  const auto& calls = get<logical::Aggregate>(two).aggs;
+  REQUIRE(calls.size() == 4);
+  CHECK(calls[0].expr.args[0] == calls[1].expr.args[0]);
+  CHECK(calls[0].expr.args[0] != calls[2].expr.args[0]);
+  // One that draws random() is never shared: each call draws its own, as
+  // PostgreSQL shares no volatile aggregate.
+  auto drawn = bind_sql(cat, "SELECT sum(DISTINCT random(1, 9)), sum(DISTINCT random(1, 9)) FROM g2");
+  const auto& draws = get<logical::Aggregate>(drawn).aggs;
+  REQUIRE(draws.size() == 2);
+  CHECK(draws[0].expr.args[0].kind == Kind::Random);
+  CHECK(draws[0].expr.args[0] != draws[1].expr.args[0]);
+  CHECK(calls[0].expr.args[0] != calls[3].expr.args[0]);
+  CHECK(error_of("SELECT a % 2, count(DISTINCT lower(b)) FROM g2 GROUP BY 1") == "bound");
+  // Refused as PostgreSQL refuses them, or as the argument's type is.
+  CHECK(error_of("SELECT sum(DISTINCT lower(b)) FROM g2").starts_with("42883 function sum(text) does not exist"));
+  CHECK(error_of("SELECT count(DISTINCT j->'u') FROM g2").starts_with("0A000 COUNT of DISTINCT jsonb values"));
+  CHECK(error_of("SELECT count(DISTINCT coalesce(n, n)) FROM g2").starts_with("0A000 "));
+  CHECK(error_of("SELECT count(DISTINCT coalesce(ch, ch)) FROM g2") ==
+        "0A000 COUNT of DISTINCT values of a CHAR expression other than a column is not supported yet @7");
+  CHECK(error_of("SELECT count(DISTINCT ch) FROM g2") == "bound");
+  CHECK(error_of("SELECT sum(DISTINCT coalesce(ch, ch)) FROM g2").starts_with("42883 function sum(character) does not exist"));
+  CHECK(error_of("SELECT count(DISTINCT a + count(*)) FROM g2").starts_with("42803 aggregate function calls cannot be nested"));
+}
+
 TEST_CASE("binder: a GROUP BY name is an input column first, else an output name (#904 G0)", "[sql][binder][group]") {
   sql_test::Fixture f;
   auto ddl = [&](std::string_view sql) { f.ddl(std::get<Ddl>(bind_sql(f.cat(), sql).stmt)); };

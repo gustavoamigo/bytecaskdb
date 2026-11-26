@@ -2378,16 +2378,27 @@ private:
   }
 
   // The row in hand folded into the aggregate the loop keeps. NULLs are
-  // skipped. COUNT(DISTINCT) groups the value's key, from its row.
+  // skipped. COUNT(DISTINCT) groups the value's key: a column's from its
+  // row, an expression's from its value, evaluated before the key builder
+  // opens (a DOUBLE's -0.0 and NaN keyed as PostgreSQL's equality has them).
   void fold(const Expr& a) {
     if (a.args.empty()) {
       w_.line("++n;");  // COUNT(*)
       return;
     }
-    if (a.distinct) {
+    if (a.distinct && a.args[0].kind == Expr::Kind::Column) {
       const auto& arg = a.args[0].col;
       auto group = "bc_agg_group(cx, groups, bc_col_key(cx, " + row_of(arg) + ", " + w_.col(arg) + "));";
       w_.line(arg.nullable ? "if (!" + arg_of_row(arg).first + ") " + group : group);
+      return;
+    }
+    if (a.distinct) {
+      auto v = eval(a.args[0]);
+      if (!v.null.empty()) w_.open("if (" + is_not(v.null) + ")");
+      w_.line("bc_sort_key dvk = bc_sort_key_begin(cx);");
+      w_.line("bc_sort_key_" + key_suffix(v.type) + "(cx, dvk, " + v.value + ", BC_SORT_ASC, BC_SORT_NULLS_FIRST);");
+      w_.line("bc_agg_group(cx, groups, bc_sort_key_end(cx, dvk));");
+      if (!v.null.empty()) w_.close();
       return;
     }
     auto v = agg_arg(a, true);
@@ -2766,17 +2777,7 @@ private:
       for (const auto& line : structure_fold(g, j, gg, v.value)) w_.line(line);
       if (!v.null.empty()) w_.close();
     }
-    for (std::size_t m = 0; m < g.layout.distinct.size(); ++m) {
-      const auto& arg = g.layout.distinct[m];
-      std::vector<std::string> folds;
-      for (std::size_t j = 0; j < op.aggs.size(); ++j) {
-        if (!op.aggs[j].distinct || op.aggs[j].args[0].col != arg) continue;
-        for (auto& line : structure_fold(g, j, gg, read_col(arg))) folds.push_back(std::move(line));
-      }
-      if (arg.nullable) w_.open("if (!" + col_null(arg) + ")");
-      distinct_value(g, arg, gr, folds);
-      if (arg.nullable) w_.close();
-    }
+    fold_distinct(g, gr, [&](std::size_t j, const std::string& v) { return structure_fold(g, j, gg, v); });
   }
 
   // Whether the aggregate folds doubles: a SUM, AVG, MIN or MAX of a DOUBLE.
@@ -2817,21 +2818,50 @@ private:
     std::unreachable();
   }
 
-  // The aggregates of DISTINCT values over `arg` in the group in hand: its
-  // value, keyed in the argument's structure d<i>_<m>; in a structure after
-  // the group's key `group_key`, streamed alone, since the stream clears
-  // d<i>_<m> as each group ends. `folds` run when the value is new to the
-  // group, all the aggregates over `arg` at once. The structure grows by a
-  // key per distinct value per group and is charged to the statement's
-  // memory budget like a group: past it the statement fails with 54000.
-  void distinct_value(const Group& g, const ColumnRef& arg, const std::string& group_key,
+  // The row in hand's DISTINCT values, each argument of the group's layout
+  // once: evaluated once (an expression before any key builder opens, since
+  // eval prints statements), a NULL skipped, else keyed by distinct_value
+  // and, when new to the group, folded by `fold_of(j, value)` into each
+  // DISTINCT aggregate j over that argument.
+  void fold_distinct(const Group& g, const std::string& group_key,
+                     const std::function<std::vector<std::string>(std::size_t, const std::string&)>& fold_of) {
+    const auto& op = *g.op;
+    for (std::size_t m = 0; m < g.layout.distinct.size(); ++m) {
+      const auto& arg = g.layout.distinct[m];
+      auto v = eval(arg);
+      std::vector<std::string> folds;
+      for (std::size_t j = 0; j < op.aggs.size(); ++j) {
+        if (!op.aggs[j].distinct || op.aggs[j].args[0] != arg) continue;
+        for (auto& line : fold_of(j, v.value)) folds.push_back(std::move(line));
+      }
+      if (!v.null.empty()) w_.open("if (" + is_not(v.null) + ")");
+      distinct_value(g, m, v, group_key, folds);
+      if (!v.null.empty()) w_.close();
+    }
+  }
+
+  // The aggregates of DISTINCT values over argument m in the group in hand:
+  // its value `v`, keyed in the argument's structure d<i>_<m>, a column by
+  // its row's part, an expression by its value (bc_sort_key_f64 keys a
+  // DOUBLE's -0.0 and NaN as PostgreSQL's equality has them); in a
+  // structure after the group's key `group_key`, streamed alone, since the
+  // stream clears d<i>_<m> as each group ends. `folds` run when the value is
+  // new to the group, all the aggregates over the argument at once. The
+  // structure grows by a key per distinct value per group and is charged to
+  // the statement's memory budget like a group: past it the statement fails
+  // with 54000.
+  void distinct_value(const Group& g, std::size_t m, const Val& v, const std::string& group_key,
                       const std::vector<std::string>& folds) {
-    auto m = static_cast<std::size_t>(std::ranges::find(g.layout.distinct, arg) - g.layout.distinct.begin());
+    const auto& arg = g.layout.distinct[m];
     const auto dk = local("dk", g, m);
     const auto dg = local("dg", g, m);
     w_.line("bc_sort_key " + dk + " = bc_sort_key_begin(cx);");
     if (!group_key.empty()) w_.line("bc_sort_key_bytes(cx, " + dk + ", " + group_key + ", BC_SORT_ASC, BC_SORT_NULLS_FIRST);");
-    sort_key_part(dk, arg);
+    if (arg.kind == Expr::Kind::Column) {
+      sort_key_part(dk, arg.col);
+    } else {
+      w_.line("bc_sort_key_" + key_suffix(v.type) + "(cx, " + dk + ", " + v.value + ", BC_SORT_ASC, BC_SORT_NULLS_FIRST);");
+    }
     w_.line("bc_group " + dg + " = bc_agg_group(cx, " + local("d", g, m) + ", bc_sort_key_end(cx, " + dk + "));");
     w_.open("if (bc_agg_null(cx, " + dg + ", 0))");
     w_.line("bc_agg_count(cx, " + dg + ", 0);");
@@ -3045,17 +3075,7 @@ private:
       for (const auto& line : local_fold(g, j, v.value)) w_.line(line);
       if (!v.null.empty()) w_.close();
     }
-    for (std::size_t m = 0; m < g.layout.distinct.size(); ++m) {
-      const auto& arg = g.layout.distinct[m];
-      std::vector<std::string> folds;
-      for (std::size_t j = 0; j < op.aggs.size(); ++j) {
-        if (!op.aggs[j].distinct || op.aggs[j].args[0].col != arg) continue;
-        for (auto& line : local_fold(g, j, read_col(arg))) folds.push_back(std::move(line));
-      }
-      if (arg.nullable) w_.open("if (!" + col_null(arg) + ")");
-      distinct_value(g, arg, "", folds);
-      if (arg.nullable) w_.close();
-    }
+    fold_distinct(g, "", [&](std::size_t j, const std::string& v) { return local_fold(g, j, v); });
     keyed_ = nullptr;
   }
 

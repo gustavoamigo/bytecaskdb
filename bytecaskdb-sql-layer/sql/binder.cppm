@@ -4452,8 +4452,10 @@ public:
   // An aggregate call's argument, bound as a select item's expression is
   // (plain_output): a column, or an expression of the FROM columns evaluated
   // per row. none for COUNT(*). An aggregate inside it is 42803, as
-  // PostgreSQL refuses it; DISTINCT of other than a column is not taken yet
-  // (0A000).
+  // PostgreSQL refuses it. Of DISTINCT values any expression is taken, but
+  // COUNT of one of CHAR type other than a column (0A000, as GROUP BY's):
+  // CHAR's equality ignores trailing spaces, which an evaluated value's key
+  // does not.
   auto aggregate_arg(const ast::Expr& e, const Resolve& resolve) -> std::optional<logical::Expr> {
     if (e.star) return std::nullopt;
     const auto& a = e.args.at(0);
@@ -4485,7 +4487,28 @@ public:
       }
     }
     auto arg = plain_output(a, resolve).expr;
-    if (e.distinct && a.kind != ast::Expr::Kind::Column) not_supported("an aggregate of DISTINCT values of an expression", e.pos);
+    if (!e.distinct || e.fn == ast::Expr::Fn::Min || e.fn == ast::Expr::Fn::Max || arg.kind == logical::Expr::Kind::Column) {
+      return arg;
+    }
+    // SUM and AVG of one are PostgreSQL's 42883, raised by aggregate().
+    if (arg.type.kind == SqlKind::Char && e.fn == ast::Expr::Fn::Count) {
+      not_supported("COUNT of DISTINCT values of a CHAR expression other than a column", e.pos);
+    }
+    // Arguments written alike in one query are one bound copy, whose values
+    // the plan then keys once for all the calls over it (a literal binds to
+    // a parameter of its own each time it is written, so two bindings of
+    // `a + 1` differ). One that draws random() is never shared: each call
+    // draws its own values, as PostgreSQL shares no volatile aggregate.
+    std::function<bool(const logical::Expr&)> draws = [&](const logical::Expr& x) {
+      return x.kind == logical::Expr::Kind::Random || std::ranges::any_of(x.args, draws);
+    };
+    if (distinct_args_ != nullptr && !draws(arg)) {
+      auto same_ref = [&](const ast::Expr& x, const ast::Expr& y) { return resolve(x) == resolve(y); };
+      for (const auto& [written, bound] : *distinct_args_) {
+        if (ast::same_expr(written, a, same_ref)) return bound;
+      }
+      distinct_args_->emplace_back(ast::clone(a), arg);
+    }
     return arg;
   }
 
@@ -5581,6 +5604,15 @@ public:
   auto select(const ast::Select& s) -> logical::NodePtr {
     // Only this query's select list is assigned, not a subquery's.
     auto assign = std::exchange(assign_, std::nullopt);
+    // This query's arguments of DISTINCT values (aggregate_arg), not a
+    // subquery's, whose columns resolve in another scope.
+    struct DistinctArgs {
+      DistinctArgsSeen*& at;
+      DistinctArgsSeen* was;
+      DistinctArgsSeen mine{};
+      ~DistinctArgs() { at = was; }
+    } distinct_args{distinct_args_, distinct_args_};
+    distinct_args_ = &distinct_args.mine;
     if (s.set) {
       if (assign) not_supported("INSERT … SELECT of a set operation (UNION, INTERSECT, EXCEPT)", s.pos);
       return set_operation(s);
@@ -6842,6 +6874,10 @@ private:
   std::optional<Correlation> correlating_;
   bool in_where_{false};  // binding a one-table query's WHERE (where)
   bool in_set_{false};    // binding an UPDATE's SET value (value)
+  // The arguments of DISTINCT values bound in the query in hand, as written
+  // and as bound (aggregate_arg); null outside a SELECT.
+  using DistinctArgsSeen = std::vector<std::pair<ast::Expr, logical::Expr>>;
+  DistinctArgsSeen* distinct_args_{nullptr};
   // The assignment list being bound (AssignmentList), 0 for none; its
   // parameters used inside an expression; those PostgreSQL types before it.
   std::uint32_t list_{0};

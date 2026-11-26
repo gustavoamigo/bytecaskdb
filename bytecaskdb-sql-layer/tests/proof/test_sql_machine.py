@@ -1378,6 +1378,35 @@ class SqlMachine(Sides, RuleBasedStateMachine):
 
     @precondition(lambda self: self.tables)
     @rule(data=st.data())
+    def aggregate_of_distinct_expression(self, data):
+        # COUNT, SUM or AVG of the DISTINCT values of an expression of an
+        # integer column, or COUNT of a text one's (#904 stage G2), over one
+        # group of every row or per group of a column, under a key path's
+        # conjuncts: NULLs skipped, each value folded once per group.
+        t = self.tables[data.draw(st.sampled_from(sorted(self.tables)), label="table")]
+        ints = [c.name for c in t.columns if c.type.kind == "int"]
+        texts = [c.name for c in t.columns if c.type.kind == "text"]
+        if not ints and not texts:
+            return
+        kind = data.draw(st.sampled_from((["int"] if ints else []) + (["text"] if texts else [])), label="argument of")
+        e = draw_int_value(data, ints, data.draw(st.integers(0, 2), label="depth")) if kind == "int" else draw_text_value(data, texts)[1]
+        fns = ["count", "sum", "avg"] if kind == "int" else ["count"]
+        calls = [f"{fn}(DISTINCT {e})" for fn in data.draw(st.lists(st.sampled_from(fns), min_size=1, max_size=3), label="calls")]
+        where, _, _ = self.where_on_a_path(data, t)
+        conds = [compared(t, c, op, v, i + 1, False) for i, (c, op, v) in enumerate(where)]
+        pg_conds = [compared(t, c, op, v, i + 1, True) for i, (c, op, v) in enumerate(where)]
+        params = [param_value(v) for _, _, v in where]
+        types = [t.column(c).type for c, _, _ in where]
+        by = data.draw(st.none() | st.sampled_from(ints + texts), label="group by")
+        def text(cs):
+            w = f" WHERE {' AND '.join(cs)}" if cs else ""
+            if by is None:
+                return f"SELECT {', '.join(calls)} FROM {t.name}{w}"
+            return f"SELECT {by}, {', '.join(calls)} FROM {t.name}{w} GROUP BY {by} ORDER BY 1"
+        self.both(text(conds), params, text(pg_conds), types)
+
+    @precondition(lambda self: self.tables)
+    @rule(data=st.data())
     def cast_a_column(self, data):
         # A cast of a column, or of an expression over it, computed for one
         # row (#904 stage C1): integer, float, boolean, DECIMAL and bytes to

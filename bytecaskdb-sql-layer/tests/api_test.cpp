@@ -3696,8 +3696,8 @@ TEST_CASE("embedded API: an aggregate of an expression folds its value per row, 
   CHECK(state("SELECT SUM(DISTINCT NULL) FROM g") == "42725");
   CHECK(run("SELECT COUNT(NULL), COUNT('a') FROM g") == Grid{{i(0), i(5)}});
   CHECK(run("SELECT SUM(NULL::int) FROM g") == Grid{{Value{}}});
-  CHECK(state("SELECT SUM(DISTINCT v * 2) FROM g") == "0A000");
-  CHECK(state("SELECT COUNT(DISTINCT w) FROM gv") == "0A000");
+  CHECK(run("SELECT SUM(DISTINCT v * 2) FROM g") == Grid{{i(220)}});
+  CHECK(run("SELECT COUNT(DISTINCT w) FROM gv") == Grid{{i(4)}});
   CHECK(run("SELECT COUNT(DISTINCT v), SUM(DISTINCT v) FROM g") == Grid{{i(4), i(110)}});
 }
 
@@ -3819,6 +3819,10 @@ TEST_CASE("embedded API: the distinct values of an aggregate are held in the sta
   CHECK(state("SELECT SUM(DISTINCT x) FROM big") == "54000");
   CHECK(state("SELECT AVG(DISTINCT x) FROM big") == "54000");
   CHECK(state("SELECT SUM(DISTINCT x) FROM big WHERE id < 10") == "ran");
+  // An expression's distinct values are held as a column's (#904 G2).
+  CHECK(state("SELECT COUNT(DISTINCT x + 1) FROM big") == "54000");
+  CHECK(state("SELECT x % 2, COUNT(DISTINCT x::text) FROM big GROUP BY 1") == "54000");
+  CHECK(state("SELECT COUNT(DISTINCT x + 1) FROM big WHERE id < 10") == "ran");
   // MIN and MAX of the distinct values are those of all of them: nothing is held.
   CHECK(state("SELECT MIN(DISTINCT x), MAX(DISTINCT x) FROM big") == "ran");
 }
@@ -3932,6 +3936,75 @@ TEST_CASE("embedded API: GROUP BY and DISTINCT of expressions give PostgreSQL 17
   };
   CHECK(state("SELECT count(*) FROM ge GROUP BY a / (a - 2)") == "22012");
   CHECK(state("SELECT count(*) FROM ge GROUP BY (j->>'k')::int") == "22P02");
+}
+
+TEST_CASE("embedded API: COUNT, SUM and AVG of DISTINCT values of an expression give PostgreSQL 17's (#904 G2)",
+          "[sql][api][group]") {
+  sql_test::TempDir dir{"api_distinct_expr"};
+  auto db = Database::open(dir.path());
+  auto run = [&](std::string_view sql, const std::vector<Value>& params = {}) { return db->execute(sql, params).rows; };
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  (void)run("CREATE TABLE de (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, d DOUBLE PRECISION, j JSONB, n DECIMAL(10, 2))");
+  (void)run("CREATE TABLE du (id INTEGER PRIMARY KEY, tid INTEGER, w INTEGER)");
+  (void)run("INSERT INTO de VALUES (1, 1, 'A', 0.0, '{\"u\": \"x\"}', 1.5), (2, 2, 'a', -0.0, '{\"u\": \"X\"}', 1.50), "
+            "(3, 2, 'B', 'NaN', '{\"u\": \"x\"}', 2), (4, NULL, NULL, 'NaN', '{}', NULL), (5, 3, 'b', 1, '{\"u\": null}', 3)");
+  (void)run("INSERT INTO du VALUES (1, 1, 5), (2, 1, 5), (3, 2, 6), (4, 3, NULL)");
+  // One aggregate row, each value PostgreSQL 17's: NULLs skipped, -0.0 and
+  // 0.0 one value, every NaN one, text compared bytewise.
+  CHECK(run("SELECT count(DISTINCT lower(b)), count(DISTINCT j->>'u'), sum(DISTINCT a + 1), avg(DISTINCT a * 2), "
+            "count(DISTINCT -d) FROM de") == Grid{{i(2), i(2), i(9), bytes("4.0000000000000000"), i(3)}});
+  CHECK(run("SELECT sum(DISTINCT n * 2), avg(DISTINCT n) FROM de") == Grid{{i(1300), bytes("2.1666666666666667")}});  // a DECIMAL's scaled
+  CHECK(run("SELECT sum(DISTINCT -d), avg(DISTINCT -d) FROM de WHERE id <> 3 AND id <> 4") == Grid{{-1.0, -0.5}});
+  // Two calls over one argument see each value once; beside a column's.
+  CHECK(run("SELECT count(DISTINCT a + 1), count(DISTINCT a), sum(DISTINCT a), sum(DISTINCT a + 1), count(a + 1) FROM de") ==
+        Grid{{i(3), i(3), i(6), i(9), i(4)}});
+  auto source = db->prepare("SELECT a, sum(DISTINCT a + 1), count(DISTINCT a + 1) FROM de GROUP BY a").plan_source();
+  auto structures = 0;
+  for (auto at = source.find("DISTINCT values seen per group"); at != std::string::npos;
+       at = source.find("DISTINCT values seen per group", at + 1)) {
+    ++structures;
+  }
+  CHECK(structures == 1);
+  // Calls over random() are never shared: each draws its own values.
+  source = db->prepare("SELECT a, sum(DISTINCT random(1, 1000000000)), sum(DISTINCT random(1, 1000000000)) FROM de GROUP BY a")
+               .plan_source();
+  structures = 0;
+  for (auto at = source.find("DISTINCT values seen per group"); at != std::string::npos;
+       at = source.find("DISTINCT values seen per group", at + 1)) {
+    ++structures;
+  }
+  CHECK(structures == 2);
+  const auto drawn = run("SELECT sum(DISTINCT random(1, 1000000000)), sum(DISTINCT random(1, 1000000000)) FROM de");
+  CHECK(drawn[0][0] != drawn[0][1]);  // equal once in about 10^9 runs
+  // Over the row a key finds, over none, and with parameters.
+  CHECK(run("SELECT count(DISTINCT lower(b)), sum(DISTINCT a + 1) FROM de WHERE id = 2") == Grid{{i(1), i(3)}});
+  CHECK(run("SELECT count(DISTINCT lower(b)) FROM de WHERE id = 99") == Grid{{i(0)}});
+  CHECK(run("SELECT sum(DISTINCT a + 1), avg(DISTINCT a + 1) FROM de WHERE id > 99") == Grid{{kNull, kNull}});
+  CHECK(run("SELECT count(DISTINCT a + $1), sum(DISTINCT a * $1) FROM de", {i(3)}) == Grid{{i(3), i(18)}});
+  // Per group, in HAVING and in ORDER BY, over a join.
+  CHECK(run("SELECT a % 2, count(DISTINCT lower(b)), sum(DISTINCT a + 1), avg(DISTINCT id % 2) FROM de GROUP BY 1 ORDER BY 1") ==
+        Grid{{i(0), i(2), i(3), bytes("0.50000000000000000000")},
+             {i(1), i(2), i(6), bytes("1.00000000000000000000")},
+             {kNull, i(0), kNull, bytes("0.00000000000000000000")}});
+  CHECK(run("SELECT a FROM de GROUP BY a HAVING count(DISTINCT lower(b)) > $1", {i(1)}) == Grid{{i(2)}});
+  CHECK(run("SELECT a, count(DISTINCT lower(b)) FROM de GROUP BY a ORDER BY 2 DESC, 1") ==
+        Grid{{i(2), i(2)}, {i(1), i(1)}, {i(3), i(1)}, {kNull, i(0)}});
+  CHECK(run("SELECT count(DISTINCT t.a + u.w), sum(DISTINCT u.w * t.a) FROM de t JOIN du u ON t.id = u.tid") ==
+        Grid{{i(2), i(17)}});
+  // An error the argument raises is the statement's, on a row that meets it.
+  CHECK(state("SELECT count(DISTINCT a / 0) FROM de") == "22012");
+  CHECK(run("SELECT count(DISTINCT a / 0) FROM de WHERE a IS NULL") == Grid{{i(0)}});
+  // Refused as the argument's type is.
+  CHECK(state("SELECT count(DISTINCT j->'u') FROM de") == "0A000");
 }
 
 TEST_CASE("embedded API: ORDER BY an expression of the FROM columns sorts by its value per row", "[sql][api]") {
