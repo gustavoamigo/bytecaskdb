@@ -6232,6 +6232,378 @@ int64_t bc_temporal_cast(bc_ctx* cx, int64_t v, uint32_t from_type, uint32_t to_
   return 0;
 }
 
+// ------------------------------------------- jsonb modification (stage 4)
+
+extern "C++" {
+namespace {
+
+// A path view: one bc_jsonb_path_in or bc_jsonb_path_add made.
+auto path_arg(bc_ctx* cx, bc_view path) -> std::optional<BytesView> {
+  auto p = cx->resolve(path);
+  if (!p || !cx->ok()) return std::nullopt;
+  if (!jsonb::path_size(*p)) {
+    cx->fail(BC_E_HANDLE, "a view that is no jsonb path: a path comes from bc_jsonb_path_in or bc_jsonb_path_add");
+    return std::nullopt;
+  }
+  return p;
+}
+
+// A built node as a handle in the step's arena; the source's own handle
+// when the call left it unchanged.
+template <typename Build>
+auto built(bc_ctx* cx, bc_jsonb source, BytesView source_node, Build&& build) -> bc_jsonb {
+  ArenaOut out{cx, &cx->arena};
+  BytesView result;
+  auto r = build(jsonb_memory(cx), jsonb::Alloc{&out, ArenaOut::alloc}, result);
+  if (!r.ok()) {
+    fail_jsonb(cx, r);
+    return {};
+  }
+  if (result.data() == source_node.data() && result.size() == source_node.size()) return source;
+  return cx->make_jsonb(result.data(), result.size());
+}
+
+// A new node in the step's arena.
+template <typename Build>
+auto fresh(bc_ctx* cx, Build&& build) -> bc_jsonb {
+  ArenaOut out{cx, &cx->arena};
+  BytesView result;
+  auto r = build(jsonb_memory(cx), jsonb::Alloc{&out, ArenaOut::alloc}, result);
+  if (!r.ok()) {
+    fail_jsonb(cx, r);
+    return {};
+  }
+  return cx->make_jsonb(result.data(), result.size());
+}
+
+auto exists_some(bc_ctx* cx, bc_jsonb j, bc_view path, bool all) -> bool {
+  auto src = jsonb_arg(cx, j);
+  if (!src) return false;
+  auto p = path_arg(cx, path);
+  if (!p) return false;
+  auto v = false;
+  if (auto r = jsonb::exists_some(src->node, *p, all, v); !r.ok()) {
+    fail_jsonb(cx, r);
+    return false;
+  }
+  return v;
+}
+
+auto scalar_of(bc_ctx* cx, const sqlt::JsonbScalarText& s) -> bc_jsonb {
+  return fresh(cx, [&](jsonb::Memory mem, jsonb::Alloc out, BytesView& node) { return jsonb::scalar(s.kind, s.text, mem, out, node); });
+}
+
+// PostgreSQL's FUNC_MAX_ARGS: the most arguments a build call takes.
+constexpr std::uint32_t kMaxBuildArgs = 100;
+using BuildArgs = std::array<jsonb::BuildArg, kMaxBuildArgs>;
+
+// The arguments of a build call, resolved: a NULL one is not read.
+auto build_args(bc_ctx* cx, uint32_t n, const bc_jsonb* args, const bool* nulls, const bool* composite, BuildArgs& out) -> bool {
+  if (n > kMaxBuildArgs || (n > 0 && (args == nullptr || nulls == nullptr))) {
+    cx->fail(BC_E_HANDLE, "a jsonb build of more than 100 arguments, or without their arrays");
+    return false;
+  }
+  for (std::uint32_t i = 0; i < n; ++i) {
+    auto& a = out[i];
+    a = {};
+    a.null = nulls[i];
+    a.composite = composite != nullptr && composite[i];
+    if (!a.null) {
+      auto node = cx->resolve_jsonb(args[i]);
+      if (!node) return false;
+      a.node = *node;
+    }
+  }
+  return cx->ok();
+}
+
+}  // namespace
+}  // extern "C++"
+
+bool bc_jsonb_contains(bc_ctx* cx, bc_jsonb a, bc_jsonb b) {
+  BC_GUARD_BEGIN
+  auto x = jsonb_arg(cx, a);
+  if (!x) return false;
+  auto y = jsonb_arg(cx, b);
+  if (!y) return false;
+  auto v = false;
+  if (auto r = jsonb::contains(x->node, y->node, jsonb_memory(cx), v); !r.ok()) {
+    fail_jsonb(cx, r);
+    return false;
+  }
+  return v;
+  BC_GUARD_END(cx)
+  return false;
+}
+
+bool bc_jsonb_exists(bc_ctx* cx, bc_jsonb j, bc_view key) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src) return false;
+  auto k = cx->resolve(key);
+  if (!k || !cx->ok()) return false;
+  auto v = false;
+  if (auto r = jsonb::exists(src->node, text_of(*k), v); !r.ok()) {
+    fail_jsonb(cx, r);
+    return false;
+  }
+  return v;
+  BC_GUARD_END(cx)
+  return false;
+}
+
+bool bc_jsonb_exists_any(bc_ctx* cx, bc_jsonb j, bc_view path) {
+  BC_GUARD_BEGIN
+  return exists_some(cx, j, path, false);
+  BC_GUARD_END(cx)
+  return false;
+}
+
+bool bc_jsonb_exists_all(bc_ctx* cx, bc_jsonb j, bc_view path) {
+  BC_GUARD_BEGIN
+  return exists_some(cx, j, path, true);
+  BC_GUARD_END(cx)
+  return false;
+}
+
+bc_jsonb bc_jsonb_concat(bc_ctx* cx, bc_jsonb a, bc_jsonb b) {
+  BC_GUARD_BEGIN
+  auto x = jsonb_arg(cx, a);
+  if (!x) return {};
+  auto y = jsonb_arg(cx, b);
+  if (!y) return {};
+  return fresh(cx, [&](jsonb::Memory mem, jsonb::Alloc out, BytesView& r) { return jsonb::concat(x->node, y->node, mem, out, r); });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_jsonb bc_jsonb_delete_key(bc_ctx* cx, bc_jsonb j, bc_view key) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src) return {};
+  auto k = cx->resolve(key);
+  if (!k || !cx->ok()) return {};
+  return built(cx, j, src->node, [&](jsonb::Memory mem, jsonb::Alloc out, BytesView& r) {
+    return jsonb::delete_key(src->node, text_of(*k), mem, out, r);
+  });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_jsonb bc_jsonb_delete_index(bc_ctx* cx, bc_jsonb j, int64_t i) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src) return {};
+  return built(cx, j, src->node,
+               [&](jsonb::Memory mem, jsonb::Alloc out, BytesView& r) { return jsonb::delete_index(src->node, i, mem, out, r); });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_jsonb bc_jsonb_delete_keys(bc_ctx* cx, bc_jsonb j, bc_view path) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src) return {};
+  auto p = path_arg(cx, path);
+  if (!p) return {};
+  return built(cx, j, src->node,
+               [&](jsonb::Memory mem, jsonb::Alloc out, BytesView& r) { return jsonb::delete_keys(src->node, *p, mem, out, r); });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_jsonb bc_jsonb_delete_path(bc_ctx* cx, bc_jsonb j, bc_view path) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src) return {};
+  auto p = path_arg(cx, path);
+  if (!p) return {};
+  return built(cx, j, src->node,
+               [&](jsonb::Memory mem, jsonb::Alloc out, BytesView& r) { return jsonb::delete_path(src->node, *p, mem, out, r); });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_jsonb bc_jsonb_set(bc_ctx* cx, bc_jsonb j, bc_view path, bc_jsonb value, bool create) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src) return {};
+  auto p = path_arg(cx, path);
+  if (!p) return {};
+  auto v = jsonb_arg(cx, value);
+  if (!v) return {};
+  return built(cx, j, src->node, [&](jsonb::Memory mem, jsonb::Alloc out, BytesView& r) {
+    return jsonb::set(src->node, *p, v->node, create, mem, out, r);
+  });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_jsonb bc_jsonb_set_lax(bc_ctx* cx, bc_jsonb j, bc_view path, bc_jsonb value, bool value_null, bool create, bc_view treatment,
+                          bool treatment_null) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src) return {};
+  auto p = path_arg(cx, path);
+  if (!p) return {};
+  std::optional<std::string_view> how;
+  if (!treatment_null) {
+    auto t = cx->resolve(treatment);
+    if (!t || !cx->ok()) return {};
+    how = text_of(*t);
+  }
+  // PostgreSQL reads the treatment's NULL first, its text only for a NULL value.
+  jsonb::NullTreatment mode{};
+  if (treatment_null) {
+    fail_jsonb(cx, jsonb::null_treatment(std::nullopt, mode));
+    return {};
+  }
+  if (!value_null) {
+    auto v = jsonb_arg(cx, value);
+    if (!v) return {};
+    return built(cx, j, src->node, [&](jsonb::Memory mem, jsonb::Alloc out, BytesView& r) {
+      return jsonb::set(src->node, *p, v->node, create, mem, out, r);
+    });
+  }
+  if (auto r = jsonb::null_treatment(how, mode); !r.ok()) {
+    fail_jsonb(cx, r);
+    return {};
+  }
+  switch (mode) {
+    case jsonb::NullTreatment::RaiseException: {
+      auto e = jsonb::null_value_error();
+      cx->fail(BC_E_DATA, e.state, e.message, {e.detail, e.hint, e.context});
+      return {};
+    }
+    case jsonb::NullTreatment::UseJsonNull: {
+      static constexpr std::array<std::byte, 1> kNull{std::byte{0x01}};
+      return built(cx, j, src->node, [&](jsonb::Memory mem, jsonb::Alloc out, BytesView& r) {
+        return jsonb::set(src->node, *p, kNull, create, mem, out, r);
+      });
+    }
+    case jsonb::NullTreatment::DeleteKey:
+      return built(cx, j, src->node,
+                   [&](jsonb::Memory mem, jsonb::Alloc out, BytesView& r) { return jsonb::delete_path(src->node, *p, mem, out, r); });
+    case jsonb::NullTreatment::ReturnTarget: return j;
+  }
+  return {};
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_jsonb bc_jsonb_insert(bc_ctx* cx, bc_jsonb j, bc_view path, bc_jsonb value, bool after) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src) return {};
+  auto p = path_arg(cx, path);
+  if (!p) return {};
+  auto v = jsonb_arg(cx, value);
+  if (!v) return {};
+  return built(cx, j, src->node, [&](jsonb::Memory mem, jsonb::Alloc out, BytesView& r) {
+    return jsonb::insert(src->node, *p, v->node, after, mem, out, r);
+  });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_jsonb bc_jsonb_strip_nulls(bc_ctx* cx, bc_jsonb j) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src) return {};
+  return built(cx, j, src->node,
+               [&](jsonb::Memory mem, jsonb::Alloc out, BytesView& r) { return jsonb::strip_nulls(src->node, mem, out, r); });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_view bc_jsonb_pretty(bc_ctx* cx, bc_jsonb j) {
+  BC_GUARD_BEGIN
+  auto src = jsonb_arg(cx, j);
+  if (!src) return {};
+  ArenaOut out{cx, &cx->arena};
+  std::span<char> text;
+  if (auto r = jsonb::pretty(src->node, jsonb_memory(cx), {&out, ArenaOut::alloc}, text); !r.ok()) {
+    fail_jsonb(cx, r);
+    return {};
+  }
+  return cx->make_view(reinterpret_cast<const std::byte*>(text.data()), text.size());
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_jsonb bc_jsonb_of_i64(bc_ctx* cx, int64_t v, uint32_t sql_type, uint32_t scale) {
+  BC_GUARD_BEGIN
+  auto kind = sql_kind_of(sql_type);
+  auto ok_type = kind && (integer_kind(*kind) || temporal_kind(*kind) ||
+                          (*kind == sqlt::SqlKind::Decimal && scale <= sqlt::kMaxDecimalPrecision));
+  if (!ok_type || (*kind != sqlt::SqlKind::Decimal && scale != 0)) {
+    cx->fail(BC_E_HANDLE, "bc_jsonb_of_i64: not an integer, DECIMAL or date or time value");
+    return {};
+  }
+  sqlt::SqlType t{*kind, 0, sqlt::kMaxDecimalPrecision, static_cast<std::uint8_t>(scale)};
+  return scalar_of(cx, sqlt::jsonb_scalar_text(v, t, false));
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_jsonb bc_jsonb_of_f64(bc_ctx* cx, double v, bool real, bool key) {
+  BC_GUARD_BEGIN
+  return scalar_of(cx, sqlt::jsonb_scalar_text(v, sqlt::SqlType{real ? sqlt::SqlKind::Real : sqlt::SqlKind::Double}, key));
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_jsonb bc_jsonb_of_bool(bc_ctx* cx, bool v) {
+  BC_GUARD_BEGIN
+  return scalar_of(cx, {v ? jsonb::Scalar::True : jsonb::Scalar::False, {}});
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_jsonb bc_jsonb_of_text(bc_ctx* cx, bc_view text) {
+  BC_GUARD_BEGIN
+  auto t = cx->resolve(text);
+  if (!t || !cx->ok()) return {};
+  return fresh(cx, [&](jsonb::Memory mem, jsonb::Alloc out, BytesView& node) {
+    return jsonb::scalar(jsonb::Scalar::String, text_of(*t), mem, out, node);
+  });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_jsonb bc_jsonb_of_num(bc_ctx* cx, bc_view numeric_text) {
+  BC_GUARD_BEGIN
+  auto t = cx->resolve(numeric_text);
+  if (!t || !cx->ok()) return {};
+  return fresh(cx, [&](jsonb::Memory mem, jsonb::Alloc out, BytesView& node) {
+    return jsonb::scalar(jsonb::Scalar::Number, text_of(*t), mem, out, node);
+  });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_jsonb bc_jsonb_build_array(bc_ctx* cx, uint32_t n, const bc_jsonb* args, const bool* nulls) {
+  BC_GUARD_BEGIN
+  BuildArgs a;
+  if (!build_args(cx, n, args, nulls, nullptr, a)) return {};
+  return fresh(cx, [&](jsonb::Memory mem, jsonb::Alloc out, BytesView& r) {
+    return jsonb::build_array(std::span{a.data(), n}, mem, out, r);
+  });
+  BC_GUARD_END(cx)
+  return {};
+}
+
+bc_jsonb bc_jsonb_build_object(bc_ctx* cx, uint32_t n, const bc_jsonb* args, const bool* nulls, const bool* composite) {
+  BC_GUARD_BEGIN
+  BuildArgs a;
+  if (!build_args(cx, n, args, nulls, composite, a)) return {};
+  return fresh(cx, [&](jsonb::Memory mem, jsonb::Alloc out, BytesView& r) {
+    return jsonb::build_object(std::span{a.data(), n}, mem, out, r);
+  });
+  BC_GUARD_END(cx)
+  return {};
+}
+
 bc_view bc_num_quotient(bc_ctx* cx, int64_t sum, int64_t count, uint32_t scale) {
   BC_GUARD_BEGIN
   if (count < 1 || scale > 18) {

@@ -100,6 +100,8 @@ inline constexpr SqlState kUntranslatableCharacter{"22P05"};
 inline constexpr SqlState kProgramLimitExceeded{"54000"};
 inline constexpr SqlState kStatementTooComplex{"54001"};
 inline constexpr SqlState kArraySubscriptError{"2202E"};
+// A call of more than 100 arguments (FUNC_MAX_ARGS).
+inline constexpr SqlState kTooManyArguments{"54023"};
 
 // The five characters `packed` holds (SqlState::packed), or nullopt for 0,
 // for bits past the 30 it uses, and for a character outside 0-9 and A-Z,
@@ -125,7 +127,7 @@ inline constexpr SqlState kArraySubscriptError{"2202E"};
                  kInvalidRowCountInLimit, kInvalidRowCountInOffset, kReservedName, kInvalidGrantOperation,
                  kInvalidSavepointSpecification, kReadOnlySqlTransaction, kActiveSqlTransaction, kObjectInUse, kInvalidSchemaName,
                  kDuplicateSchema, kInvalidName, kInsufficientPrivilege, kInvalidSchemaDefinition, kWithCheckOptionViolation, kInternalError,
-                 kUntranslatableCharacter, kProgramLimitExceeded, kStatementTooComplex, kArraySubscriptError}) {
+                 kUntranslatableCharacter, kProgramLimitExceeded, kStatementTooComplex, kArraySubscriptError, kTooManyArguments}) {
     if (s.view() == code) return s;
   }
   return std::nullopt;

@@ -1173,23 +1173,21 @@ when it runs (`bc_jsonb_in`), and a jsonb cast to `text` or `varchar` of
 no length is its text (`bc_jsonb_text`). PostgreSQL's errors come first: a
 text value assigned to it, or a number or boolean `DEFAULT`, 42804 with its
 HINT; a cast to it of another type, or of it to `bytea`, a date or a time,
-42846; arithmetic of it but `-` with text or an integer, and `MIN`,
-`MAX`, `SUM` and `AVG` of it, 42883; a comparison with another type,
-42883. A jsonb constant assigned to a string column is its text, and one
-with a typed text under `||` is text concatenation. Refused (0A000) until
+42846; arithmetic of it but `-` with text, an integer or a `text[]`, and
+`MIN`, `MAX`, `SUM` and `AVG` of it, 42883; a comparison with another type,
+42883. A jsonb assigned to a string column is its text, and one with a
+typed text under `||` is text concatenation. Refused (0A000) until
 stage 2: a comparison of it, of constants too (a literal beside it read
 first, 22P02), `IN`,
 `ORDER BY`, `GROUP BY`, `DISTINCT`, `COUNT(DISTINCT …)`, `UNION`,
 `INTERSECT`, `EXCEPT`, and a subquery of it; until the next phase: a key,
-`UNIQUE`, index or `FOREIGN KEY` column of it; until stage 4: the
-operators PostgreSQL has for it but the accessors (`@>`, `<@`, `?`, `?|`,
-`?&`, `#-`, `@?`, `@@`, refused by the parser whatever the operands; `||`
-and `-` of a jsonb, by the binder) and the JSON functions but
-`jsonb_typeof` and `jsonb_array_length` (named `jsonb_…` or `json_…`,
-`to_json`, `to_jsonb`, `row_to_json`, `array_to_json`), its casts to
-`numeric(p, s)`, and to `varchar(n)`, `char` and `name`, which cut or pad; `json`
-(stage 1c), a domain, a procedure argument and a PL/pgSQL variable of
-jsonb. A form the parser takes for no type keeps its 42601 with jsonb:
+`UNIQUE`, index or `FOREIGN KEY` column of it; jsonpath's operators (`@?`,
+`@@`, refused by the parser whatever the operands) and the JSON functions
+stages 3 and 4 do not build (named `jsonb_…` or `json_…`, `to_json`,
+`row_to_json`, `array_to_json`; `json_build_array` and `json_build_object`
+wait for the `json` type), its casts to `numeric(p, s)`, and to
+`varchar(n)`, `char` and `name`, which cut or pad; `json` (stage 1c), a
+domain, a procedure argument and a PL/pgSQL variable of jsonb. A form the parser takes for no type keeps its 42601 with jsonb:
 `IN`, `BETWEEN`, `IS DISTINCT FROM` and `LIKE` in a select list, `COLLATE`
 (PostgreSQL's is 42804).
 
@@ -1233,8 +1231,50 @@ names its column `?column?`, a cast of one its type (`int4`), as
 PostgreSQL does. Not built with them: `UPDATE … SET` of an accessor and a
 `GROUP BY`, `DISTINCT` or `COUNT(DISTINCT …)` of one, the layer's limits
 for any expression (42601, 0A000); `ORDER BY` of a jsonb result (stage 2);
-`ARRAY[ARRAY[…]]` and a cast to `text[]` (42601). `MIN` and `MAX` of an
-accessor's text are built (#904, stage M1).
+`ARRAY[ARRAY[…]]` (42601). `MIN` and `MAX` of an accessor's text are built
+(#904, stage M1).
+
+**jsonb's containment, existence, modification and construction**
+(`jsonb_design.md`, stage 4). `a @> b`, `a <@ b`, `j ? k`, `j ?| p`, `j ?&
+p`, `a || b`, `j - k` (a text key), `j - i` (an integer index), `j - p` (a
+`text[]`), `j #- p`, `jsonb_set(j, p, v [, create_if_missing])`,
+`jsonb_set_lax(j, p, v [, create_if_missing [, null_value_treatment]])`,
+`jsonb_insert(j, p, v [, insert_after])`, `jsonb_strip_nulls(j)`,
+`jsonb_pretty(j)`, `to_jsonb(x)`, `jsonb_build_array(…)`,
+`jsonb_build_object(…)`, `jsonb_extract_path(j, k, …)` and
+`jsonb_extract_path_text(j, k, …)`, of columns, `$n` and constants, wherever
+the accessors go and in `UPDATE … SET` (`SET Props = jsonb_set(Props, $2,
+$3)`). `@>`, `<@`, `?`, `?|` and `?&` give a `boolean`, so they stand alone
+in a `WHERE` or `ON`, under `NOT`, `AND` and `OR`, and sort; `jsonb_pretty`
+and `jsonb_extract_path_text` give text; the rest jsonb. Operands resolve as
+PostgreSQL 17 resolves them: an unknown literal or `$n` beside a jsonb is
+the type the operator takes there (jsonb for `@>`, `<@`, `||`; text for
+`?` and `-`; `text[]` for `?|`, `?&`, `#-`), read by its input function
+when the statement is prepared; two of them under `@>`, `<@` or `?|` are
+42725, under `?`, `?&` and `#-` jsonb's operator; a `$n` an earlier use
+typed keeps its type; a typed operand of another type is 42883 (`jsonb -
+bigint`, `jsonb || integer`), and `||` of a jsonb and a typed string is
+text concatenation of its text. A path is any path `#>` takes, or a string
+literal or `$n` cast to `text[]` (`j - '{a}'::text[]` deletes the key `a`,
+where `j - '{a}'` deletes the key `{a}`). A function's `$n` is typed by its
+parameter (`jsonb_set`'s path `text[]`, its value jsonb, its flag
+`boolean`); a wrong type or count is 42883 with PostgreSQL's HINT;
+`to_jsonb` of an unknown literal or `$n` 42804, a build function's `$n`
+42P18, more than 100 arguments 54023. `to_jsonb` and the build functions
+convert each type as PostgreSQL's `datum_to_jsonb` does: numbers as numbers
+(a `NUMERIC`'s and a float's `NaN` and infinities as strings), dates and
+timestamps in ISO 8601 with a `T` (a timestamptz's offset `+00:00`),
+`bytea` and the time types as their text; a `NUMERIC` of no precision
+cast from a literal (`to_jsonb(1.50::numeric)`) is taken there.
+`CHAR(n)`, whose padded text no value holds, is 0A000 there. Constants
+fold when the statement is prepared. The results and errors are PostgreSQL
+17's, byte for byte: `jsonb_design.md`, stage 4, lists them. Not built
+with them: `ORDER BY`, `GROUP BY` and `DISTINCT` of a jsonb result
+(stage 2), `json_build_array` and `json_build_object` (stage 1c), named
+arguments (`null_value_treatment => …`, 42601 naming the function) and
+`VARIADIC` (42601), and a cast
+to `text[]` of anything but a string literal or `$n` beside a jsonb
+operator or function (42601).
 
 **NAME.** `NAME` declares a column of PostgreSQL's identifier type
 (`types_design.md`, *NAME*): text of at most 63 bytes, a longer value cut
@@ -1260,11 +1300,12 @@ That includes:
   computed, aggregated (but by `COUNT`), cast to other than text or
   `name`, or as a key (0A000,
   *NUMERIC without a precision*);
-- a jsonb value compared, ordered, grouped, `DISTINCT`, or as a key, every
-  operator and function of jsonb but its accessors, `jsonb_typeof` and
-  `jsonb_array_length`, its casts to `numeric(p, s)`, `varchar(n)`, `char`
-  and `name`, and the `json` type (0A000, *jsonb*, *jsonb's accessors and
-  casts out*; `jsonb_design.md`, *Stages of jsonb*);
+- a jsonb value compared, ordered, grouped, `DISTINCT`, or as a key,
+  jsonpath, SQL/JSON and the JSON functions stages 3 and 4 do not build
+  (`json_build_*` among them), its casts to `numeric(p, s)`, `varchar(n)`,
+  `char` and `name`, and the `json` type (0A000, *jsonb*, *jsonb's
+  containment, existence, modification and construction*;
+  `jsonb_design.md`, *Stages of jsonb*);
 - `IS DISTINCT FROM`, and a predicate or a constant in `HAVING`; a
   `NULL` constant under `NOT`; in a `WHERE` or `ON`, `random()` (42601), an
   aggregate (42803), `expr IN (SELECT …)` of an expression, and `CURRENT_DATE`

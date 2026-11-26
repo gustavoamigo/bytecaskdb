@@ -2264,6 +2264,58 @@ def test_the_jsonb_accessors_agree_with_postgresql_on_both_targets(dsn):
         m.teardown()
 
 
+def test_the_jsonb_operators_and_functions_agree_with_postgresql_on_both_targets(dsn):
+    """jsonb's containment, existence, modification and construction
+    (docs/jsonb_design.md, stage 4): @>, <@, ?, ?|, ?&, ||, -, #-, jsonb_set,
+    jsonb_set_lax, jsonb_insert, jsonb_strip_nulls, jsonb_pretty, to_jsonb,
+    the build functions and jsonb_extract_path, of columns, over values,
+    keys, indexes and paths drawn from a seeded generator, as parameters and
+    as literals; in the select list, in WHERE and in UPDATE ... SET. Each
+    result and each SQLSTATE is PostgreSQL 17's, embedded and over the
+    wire."""
+    import random
+
+    m = keyless_machine(dsn)()
+    try:
+        assert m.both("CREATE TABLE j4 (k BIGINT PRIMARY KEY, v jsonb, w jsonb, s TEXT)").error is None
+        docs = ['{"a": {"b": [1, "x", null, 2.50]}, "k": "v", "n": null, "": 0}', '[10, -20.5, [30], {"a": 1}, "a"]',
+                '"a"', "5", "null", "true", None, '{"a": [], "ab": {"a": "deep"}}', "[]", "{}", '[[1, 2], {"b": null}]']
+        for k, v in enumerate(docs):
+            w = docs[(k * 7 + 3) % len(docs)]
+            assert m.both("INSERT INTO j4 (k, v, w, s) VALUES ($1, $2, $3, $4)", [k, v, w, "a" if k % 2 else "k"]).error is None
+        rng = random.Random(20261126)
+        keys = ["a", "b", "k", "n", "", "ab", "zz"]
+        paths = ["{}", "{a}", "{a,b}", "{a,b,1}", "{a,b,-1}", "{ab,a}", "{0}", "{2,0}", "{3,a}", "{a,NULL}", "{{a},{b}}",
+                 "{-9}", "{9}", "{x}", "{1,b}"]
+        values = ['"new"', "1", "null", '{"z": [1]}', "[]"]
+        for _ in range(40):
+            key, i, p, val = rng.choice(keys), rng.randint(-6, 6), rng.choice(paths), rng.choice(values)
+            for sql, params in [
+                ("SELECT k, v @> w, v <@ w, v ? $1, v ?| $2, v ?& $2 FROM j4 ORDER BY k", [key, p]),
+                ("SELECT k, v || w, v || $1, v - $2 FROM j4 ORDER BY k", [val, key]),
+                (f"SELECT k, v - {i} FROM j4 ORDER BY k", []),
+                ("SELECT k, v #- $1, v - $1::text[] FROM j4 ORDER BY k", [p]),
+                ("SELECT k, jsonb_set(v, $1, $2), jsonb_set(v, $1, $2, false), jsonb_insert(v, $1, $2, true) FROM j4 ORDER BY k",
+                 [p, val]),
+                ("SELECT k, jsonb_set_lax(v, $1, NULL, true, $2) FROM j4 ORDER BY k",
+                 [p, rng.choice(["use_json_null", "delete_key", "return_target", "raise_exception", "x"])]),
+                ("SELECT k FROM j4 WHERE v @> $1 OR v ? $2 ORDER BY k", [val, key]),
+                ("SELECT k, jsonb_extract_path(v, $1, 'b'), jsonb_extract_path_text(v, $1) FROM j4 ORDER BY k", [key]),
+            ]:
+                m.both(sql, params)
+        for sql in ["SELECT k, jsonb_strip_nulls(v), jsonb_pretty(v), to_jsonb(s), to_jsonb(k) FROM j4 ORDER BY k",
+                    "SELECT k, jsonb_build_array(k, s, v, NULL), jsonb_build_object(s, v, 'k', k) FROM j4 ORDER BY k",
+                    "SELECT jsonb_build_object(v, 1) FROM j4", "SELECT v - 0 FROM j4", "SELECT $1 @> '{}'",
+                    "SELECT jsonb_build_array($1)"]:
+            m.both(sql, ["{}"] if "$1" in sql else [])
+        assert m.both("UPDATE j4 SET v = jsonb_set(v, $1, $2) WHERE k = 0", ["{a,b,0}", "true"]).error is None
+        assert m.both("UPDATE j4 SET v = v || $1 WHERE k = 1 AND NOT v ? $2", ['["u"]', "u"]).error is None
+        m.both("SELECT k, v FROM j4 ORDER BY k")
+        assert o.run_pg(m.pg.conn, "DROP TABLE j4").error is None
+    finally:
+        m.teardown()
+
+
 def test_a_table_without_a_primary_key_keeps_duplicates_across_a_reopen(dsn):
     """Row ids after a reopen start past the rows the data holds: an insert
     then adds a row, never collides with one (23505) or replaces it."""

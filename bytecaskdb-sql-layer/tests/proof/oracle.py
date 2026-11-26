@@ -73,10 +73,11 @@ BINDER_STATES = frozenset(
 # with 0A000 is the layer's rule, kind "refused", never compared. The
 # planner's refusal, also 0A000, is told by its class (run_layer: NO_PLAN).
 # The data errors a plan raises as PostgreSQL's executor does (BC_E_DATA,
-# run_layer) and the binder raises for a literal: jsonb_in's, array_in's
-# and the jsonb accessors' and casts' (docs/jsonb_design.md). PostgreSQL's
-# are compared with them.
-DATA_STATES = frozenset({"22P02", "22P05", "22021", "22023", "2202E", "54000", "54001"})
+# run_layer) and the binder raises for a literal: jsonb_in's, array_in's,
+# the jsonb accessors' and casts', and stage 4's operators' and functions'
+# (22004 for a NULL path element or jsonb_set_lax's raise_exception;
+# docs/jsonb_design.md). PostgreSQL's are compared with them.
+DATA_STATES = frozenset({"22P02", "22P05", "22021", "22023", "2202E", "22004", "54000", "54001", "54023"})
 
 
 def layer_only(state: str, sql: str) -> bool:

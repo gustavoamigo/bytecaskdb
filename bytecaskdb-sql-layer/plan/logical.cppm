@@ -78,7 +78,15 @@ struct Expr {
   // (Field) and by index (Element), #> and #>> (Path), jsonb_typeof,
   // jsonb_array_length; PathIn and PathArray make the path #> takes, from a
   // text[]'s text or from ARRAY[…]'s text elements, and are never a value.
-  enum class Jsonb { Field, FieldText, Element, ElementText, Path, PathText, Typeof, ArrayLength, PathIn, PathArray };
+  // Stage 4: @> (Contains; <@ its operands swapped), ?, ?| and ?& (Exists,
+  // ExistsAny, ExistsAll), || (Concat), - of a key, an index and a text[]
+  // (DeleteKey, DeleteIndex, DeleteKeys), #- (DeletePath), jsonb_set,
+  // jsonb_set_lax, jsonb_insert, jsonb_strip_nulls, jsonb_pretty, to_jsonb,
+  // jsonb_build_array and jsonb_build_object; jsonb_extract_path[_text] is
+  // Path (PathText) of a PathArray.
+  enum class Jsonb { Field, FieldText, Element, ElementText, Path, PathText, Typeof, ArrayLength, PathIn, PathArray,
+                     Contains, Exists, ExistsAny, ExistsAll, Concat, DeleteKey, DeleteIndex, DeleteKeys, DeletePath, Set,
+                     SetLax, Insert, StripNulls, Pretty, ToJsonb, BuildArray, BuildObject };
   Kind kind{Kind::Param};
   SqlType type{};
   ColumnRef col{};              // Column
@@ -106,8 +114,15 @@ struct Expr {
                                 // expression's type by a pair cast_kind (sql/text.cppm) has and the layer
                                 // takes; a relabel only over another Cast, whose type it keeps;
                                 // Jsonb: the jsonb, then the key (text), the index (an integer) or the path
-                                // (a PathIn of text or a PathArray of text elements, any NULL); Typeof and
-                                // ArrayLength: the jsonb alone; GroupKey: none
+                                // (a PathIn of text or a PathArray of text elements, any NULL); Typeof,
+                                // ArrayLength, StripNulls and Pretty: the jsonb alone; Contains and Concat:
+                                // two jsonb; Exists and DeleteKey: the jsonb and a text; DeleteIndex: the
+                                // jsonb and an integer; ExistsAny, ExistsAll, DeleteKeys and DeletePath: the
+                                // jsonb and a path; Set and Insert: the jsonb, the path, the new jsonb and,
+                                // if given, create_if_missing (insert_after), a BOOLEAN; SetLax: those four
+                                // and null_value_treatment, a text; ToJsonb: one value of any type but
+                                // CHAR(n); BuildArray, BuildObject: up to 100 such values, keys and values
+                                // alternating for BuildObject; GroupKey: none
 
   [[nodiscard]] auto phys() const -> PhysType { return phys_type(type); }
 

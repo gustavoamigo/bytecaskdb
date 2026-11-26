@@ -1,5 +1,6 @@
-# jsonb (docs/jsonb_design.md): stages 1 and 3 build the type, its accessors and casts out; the
-# cases of stages 2, 4 and 5 are marked unimplemented until their stage lands. Results recorded from PostgreSQL 17.
+# jsonb (docs/jsonb_design.md): stages 1, 3 and 4 build the type, its accessors and casts out, and
+# its containment, existence, modification and construction; the cases of stages 2 and 5 are
+# marked unimplemented until their stage lands. Results recorded from PostgreSQL 17.
 
 - name: "a jsonb column takes any JSON value and returns jsonb_out's text"
   features: [pg:jsonb]
@@ -340,8 +341,6 @@
 
 - name: "@>, <@, ?, ?| and ?&"
   features: [pg:jsonb]
-  # jsonb's containment, existence, modification and constructors are stage 4 of docs/jsonb_design.md (0A000)
-  unimplemented: true
   steps:
     - sql: "SELECT '{\"a\":[1,2],\"b\":1}'::jsonb @> '{\"a\":[2]}', '[1,2]'::jsonb <@ '[1,2,3]', '[1]'::jsonb @> '1'"
       expected: [[t, t, t]]
@@ -350,8 +349,6 @@
 
 - name: "||, - and #- modify a value"
   features: [pg:jsonb]
-  # jsonb's containment, existence, modification and constructors are stage 4 of docs/jsonb_design.md (0A000)
-  unimplemented: true
   steps:
     - sql: "SELECT '{\"a\":1}'::jsonb || '{\"b\":2}', '[1]'::jsonb || '2', '{\"a\":1,\"b\":2}'::jsonb - 'a', '[1,2,3]'::jsonb - 1, '{\"a\":{\"b\":1}}'::jsonb #- '{a,b}'"
       expected: [["{\"a\": 1, \"b\": 2}", "[1, 2]", "{\"b\": 2}", "[1, 3]", "{\"a\": {}}"]]
@@ -366,8 +363,6 @@
 
 - name: "jsonb_set, jsonb_insert and the builders"
   features: [pg:jsonb]
-  # jsonb's containment, existence, modification and constructors are stage 4 of docs/jsonb_design.md (0A000)
-  unimplemented: true
   steps:
     - sql: "SELECT jsonb_set('{\"a\":[1,2]}', '{a,0}', '9'), jsonb_insert('[1,2]', '{0}', '0'), jsonb_set('{}', '{a}', NULL)"
       expected: [["{\"a\": [9, 2]}", "[0, 1, 2]", null]]
@@ -375,6 +370,125 @@
       expected: [["{\"a\": 1, \"b\": \"x\"}", "[1, \"x\", null]", "1.50", "\"NaN\""]]
     - sql: "SELECT jsonb_build_array(1.5::numeric(10,2), 2::numeric(5,0)), jsonb_strip_nulls('{\"a\":null,\"b\":1}')"
       expected: [["[1.50, 2]", "{\"b\": 1}"]]
+
+- name: "containment: nested values, arrays of scalars, a top-level scalar, numbers by value"
+  features: [pg:jsonb]
+  steps:
+    - sql: "SELECT '[1,[2,3]]'::jsonb @> '[[3]]', '{\"a\":{\"b\":1,\"c\":2}}'::jsonb @> '{\"a\":{\"b\":1}}', '[1]'::jsonb @> '[1,1]', '1'::jsonb @> '[1]', '{\"a\":[1]}'::jsonb @> '{\"a\":1}', '1.0'::jsonb @> '1'"
+      expected: [[t, t, t, f, f, t]]
+    - sql: "SELECT '\"a\"'::jsonb ? 'a', '[\"a\",1]'::jsonb ? '1', '{\"a\":1}'::jsonb ?| '{b,NULL}', '{\"a\":1}'::jsonb ?& '{}', '{\"a\":1}'::jsonb ?| '{}'"
+      expected: [[t, f, f, t, f]]
+    - sql: "SELECT '{\"a\":1}' @> '{}'"
+      error: "42725"
+
+- name: "jsonb operators over columns in WHERE, the select list and UPDATE SET"
+  features: [pg:jsonb]
+  setup:
+    - "CREATE TABLE jb (id INTEGER PRIMARY KEY, j jsonb, s TEXT)"
+    - "INSERT INTO jb VALUES (1, '{\"a\":1,\"p\":[\"u1\"]}', 'a'), (2, '[\"a\",{\"b\":2}]', 'b'), (3, NULL, NULL)"
+  steps:
+    - sql: "SELECT id FROM jb WHERE j @> '{\"a\":1}' OR j @> '[{\"b\":2}]' ORDER BY id"
+      expected: [[1], [2]]
+      ordered: true
+    - sql: "SELECT id FROM jb WHERE NOT j ? s ORDER BY id"
+      expected: [[2]]
+      ordered: true
+    - sql: "UPDATE jb SET j = jsonb_set(j, '{p}', (j -> 'p') || '[\"u2\"]') WHERE id = 1 AND NOT j -> 'p' ? 'u2'"
+      rowcount: 1
+    - sql: "SELECT id, j - 'a', j #- '{1,b}', jsonb_strip_nulls(j), to_jsonb(s), jsonb_build_object(s, id) FROM jb WHERE id < 3 ORDER BY id"
+      expected:
+        - [1, "{\"p\": [\"u1\", \"u2\"]}", "{\"a\": 1, \"p\": [\"u1\", \"u2\"]}", "{\"a\": 1, \"p\": [\"u1\", \"u2\"]}", "\"a\"", "{\"a\": 1}"]
+        - [2, "[{\"b\": 2}]", "[\"a\", {}]", "[\"a\", {\"b\": 2}]", "\"b\"", "{\"b\": 2}"]
+      ordered: true
+    - sql: "SELECT j || s, jsonb_build_array(j, s), j @> '1' FROM jb WHERE id = 3"
+      expected: [[null, "[null, null]", null]]
+  teardown:
+    - "DROP TABLE jb"
+
+- name: "|| concatenates, merges objects and wraps scalars as PostgreSQL's jsonb_concat"
+  features: [pg:jsonb]
+  steps:
+    - sql: "SELECT '{\"a\":1}'::jsonb || '[2]', '[1]'::jsonb || '\"x\"', '\"a\"'::jsonb || '\"b\"', '{\"a\":1}'::jsonb || '{\"a\":2,\"b\":3}'"
+      expected: [["[{\"a\": 1}, 2]", "[1, \"x\"]", "[\"a\", \"b\"]", "{\"a\": 2, \"b\": 3}"]]
+    - sql: "SELECT '[1]'::jsonb || 1"
+      error: "42883"
+
+- name: "- of a key, an index and a text[], and its errors"
+  features: [pg:jsonb]
+  steps:
+    - sql: "SELECT '[1,2,3]'::jsonb - 1, '{\"a\":1,\"b\":2}'::jsonb - '{a}', '{\"a\":1,\"{a}\":2}'::jsonb - '{a}', '{\"a\":1,\"b\":2}'::jsonb - '{a}'::text[], '[\"a\",\"b\",\"a\"]'::jsonb - 'a'"
+      expected: [["[1, 3]", "{\"a\": 1, \"b\": 2}", "{\"a\": 1}", "{\"b\": 2}", "[\"b\"]"]]
+    - sql: "SELECT '{\"a\":1}'::jsonb - 0"
+      error: "22023"
+    - sql: "SELECT '[1,2]'::jsonb - 1::bigint"
+      error: "42883"
+
+- name: "jsonb_set, jsonb_insert and #- follow a path as setPath"
+  features: [pg:jsonb]
+  steps:
+    - sql: "SELECT jsonb_set('{\"a\":1}', '{a,b}', '2'), jsonb_set('[1,2]', '{-5}', '0'), jsonb_set('[1,2]', '{9}', '3'), jsonb_set('[1,2]', '{9}', '3', false)"
+      expected: [["{\"a\": 1}", "[0, 1, 2]", "[1, 2, 3]", "[1, 2]"]]
+    - sql: "SELECT jsonb_insert('[1,2]', '{1}', '9', true), jsonb_insert('{\"a\":1}', '{b}', '2'), '{\"a\":[1,2]}'::jsonb #- '{a,-1}'"
+      expected: [["[1, 2, 9]", "{\"a\": 1, \"b\": 2}", "{\"a\": [1]}"]]
+    - sql: "SELECT jsonb_insert('{\"a\":1}', '{a}', '2')"
+      error: "22023"
+    - sql: "SELECT '1'::jsonb #- '{a}'"
+      error: "22023"
+    - sql: "SELECT jsonb_set('1', '{a}', '2')"
+      error: "22023"
+    - sql: "SELECT jsonb_set('[1]', '{{0},{1}}', '2')"
+      error: "2202E"
+    - sql: "SELECT jsonb_set('{\"a\":1}', '{a,NULL}', '2')"
+      error: "22004"
+    - sql: "SELECT '[1,2]'::jsonb #- '{x}'"
+      error: "22P02"
+
+- name: "jsonb_set_lax's null_value_treatment"
+  features: [pg:jsonb]
+  steps:
+    - sql: "SELECT jsonb_set_lax('{\"a\":1}', '{a}', NULL), jsonb_set_lax('{\"a\":1}', '{a}', NULL, true, 'return_target'), jsonb_set_lax('{\"a\":1}', '{a}', NULL, true, 'delete_key')"
+      expected: [["{\"a\": null}", "{\"a\": 1}", "{}"]]
+    - sql: "SELECT jsonb_set_lax('{\"a\":1}', '{a}', NULL, true, 'raise_exception')"
+      error: "22004"
+    - sql: "SELECT jsonb_set_lax('{\"a\":1}', '{a}', NULL, true, 'bogus')"
+      error: "22023"
+
+- name: "named arguments and VARIADIC of the jsonb functions"
+  features: [pg:jsonb]
+  # named arguments and VARIADIC are not supported yet (42601; docs/frontend_design.md, *JSONB*)
+  unimplemented: true
+  steps:
+    - sql: "SELECT jsonb_set_lax('{\"a\":1}', '{a}', NULL, null_value_treatment => 'delete_key'), jsonb_build_array(VARIADIC ARRAY[1,2])"
+      expected: [["{}", "[1, 2]"]]
+
+- name: "to_jsonb of each type, and the build functions' key rules"
+  features: [pg:jsonb]
+  steps:
+    - sql: "SELECT to_jsonb('NaN'::numeric), to_jsonb('Infinity'::numeric), to_jsonb('-Infinity'::numeric), to_jsonb('-0.0'::numeric), to_jsonb(1.5::numeric(10,2)), to_jsonb('Infinity'::float8)"
+      expected: [["\"NaN\"", "\"Infinity\"", "\"-Infinity\"", "0.0", "1.50", "\"Infinity\""]]
+    - sql: "SELECT to_jsonb('2024-01-02 03:04:05'::timestamp), to_jsonb('2024-01-02 03:04:05.25+00'::timestamptz), to_jsonb('2024-01-02'::date), to_jsonb('03:04'::time)"
+      expected:
+        - ["\"2024-01-02T03:04:05\"", "\"2024-01-02T03:04:05.25+00:00\"", "\"2024-01-02\"", "\"03:04:00\""]
+    - sql: "SELECT jsonb_build_object(1, 'a', true, 2, 1.5, NULL), jsonb_build_object('a', 1, 'a', 2)"
+      expected: [["{\"1\": \"a\", \"1.5\": null, \"true\": 2}", "{\"a\": 2}"]]
+    - sql: "SELECT jsonb_build_object('a')"
+      error: "22023"
+    - sql: "SELECT jsonb_build_object(NULL, 1)"
+      error: "22023"
+    - sql: "SELECT jsonb_build_object('{}'::jsonb, 1)"
+      error: "22023"
+    - sql: "SELECT to_jsonb('a')"
+      error: "42804"
+
+- name: "jsonb_extract_path, jsonb_pretty and jsonb_strip_nulls"
+  features: [pg:jsonb]
+  steps:
+    - sql: "SELECT jsonb_extract_path('{\"a\":{\"b\":[1,2]}}', 'a', 'b', '1'), jsonb_extract_path_text('{\"a\":\"x\"}', 'a'), jsonb_extract_path('{\"a\":1}', 'a', NULL)"
+      expected: [[2, x, null]]
+    - sql: "SELECT jsonb_pretty('{\"a\":[1,{}],\"b\":\"x\"}')"
+      expected: [["{\n    \"a\": [\n        1,\n        {\n        }\n    ],\n    \"b\": \"x\"\n}"]]
+    - sql: "SELECT jsonb_strip_nulls('[null,{\"a\":null,\"b\":{\"c\":null}}]')"
+      expected: [["[null, {\"b\": {}}]"]]
 
 - name: "jsonb_agg and jsonb_object_agg"
   features: [pg:jsonb]

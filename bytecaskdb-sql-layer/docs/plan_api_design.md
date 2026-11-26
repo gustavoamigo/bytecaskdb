@@ -1,6 +1,14 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 24 (revision 24 with the cast helpers,
+Status: **built**, revision 25 (revision 25 with jsonb's containment,
+existence, modification and construction, `bc_jsonb_contains`,
+`bc_jsonb_exists`, `_exists_any`, `_exists_all`, `bc_jsonb_concat`,
+`bc_jsonb_delete_key`, `_delete_index`, `_delete_keys`, `_delete_path`,
+`bc_jsonb_set`, `bc_jsonb_set_lax`, `bc_jsonb_insert`,
+`bc_jsonb_strip_nulls`, `bc_jsonb_pretty`, the `bc_jsonb_of_*` calls and
+`bc_jsonb_build_array` and `_build_object` (`jsonb_design.md`, stage 4,
+*jsonb modification and construction in the plan API* below); revision 24
+with the cast helpers,
 `enum bc_sql_type`, `bc_text_in_i64`, `_f64`, `_bool` and `_bytes`,
 `bc_value_text` (which replaced `bc_number_text`), `bc_bytea_text`,
 `bc_f64_to_int`, `bc_decimal_rescale`, `bc_decimal_to_f64`,
@@ -682,6 +690,58 @@ bc_view  bc_jsonb_to_num(bc_ctx *, bc_jsonb j);
 Every text these make, and every path, is charged to the statement's budget
 before it is allocated (`BC_E_LIMIT` past it); a lookup allocates nothing
 but its handle.
+
+### jsonb modification and construction in the plan API
+
+Revision 25 (`jsonb_design.md`, stage 4). Each call is PostgreSQL 17's
+operator or function of the same meaning; its NULL rules are the plan's
+(strict, but for `bc_jsonb_set_lax`'s value and treatment and the build
+calls' arguments, which the call reads with their NULL marks). A value
+built is a new node in the step's storage: what it does not change is
+copied as byte ranges, its working buffers and its result are charged
+before they are allocated (`BC_E_LIMIT` past the budget), and its depth
+(past 10000, 54001) and size (past 2^28 - 1 bytes, 54000) are checked
+before it is written. A call that changes nothing returns its input's own
+handle. A path is one `bc_jsonb_path_in` or `bc_jsonb_path_add` made; any
+other view is `BC_E_HANDLE`. Errors are `BC_E_DATA` with PostgreSQL's
+SQLSTATE, message, DETAIL and HINT; a damaged value is `BC_E_CORRUPT`.
+
+```c
+bool     bc_jsonb_contains(bc_ctx *, bc_jsonb a, bc_jsonb b);
+bool     bc_jsonb_exists(bc_ctx *, bc_jsonb j, bc_view key);
+bool     bc_jsonb_exists_any(bc_ctx *, bc_jsonb j, bc_view path);
+bool     bc_jsonb_exists_all(bc_ctx *, bc_jsonb j, bc_view path);
+bc_jsonb bc_jsonb_concat(bc_ctx *, bc_jsonb a, bc_jsonb b);
+bc_jsonb bc_jsonb_delete_key(bc_ctx *, bc_jsonb j, bc_view key);
+bc_jsonb bc_jsonb_delete_index(bc_ctx *, bc_jsonb j, int64_t i);
+bc_jsonb bc_jsonb_delete_keys(bc_ctx *, bc_jsonb j, bc_view path);
+bc_jsonb bc_jsonb_delete_path(bc_ctx *, bc_jsonb j, bc_view path);
+bc_jsonb bc_jsonb_set(bc_ctx *, bc_jsonb j, bc_view path, bc_jsonb value, bool create);
+bc_jsonb bc_jsonb_set_lax(bc_ctx *, bc_jsonb j, bc_view path, bc_jsonb value, bool value_null, bool create, bc_view treatment,
+                          bool treatment_null);
+bc_jsonb bc_jsonb_insert(bc_ctx *, bc_jsonb j, bc_view path, bc_jsonb value, bool after);
+bc_jsonb bc_jsonb_strip_nulls(bc_ctx *, bc_jsonb j);
+bc_view  bc_jsonb_pretty(bc_ctx *, bc_jsonb j);
+bc_jsonb bc_jsonb_of_i64(bc_ctx *, int64_t v, uint32_t sql_type, uint32_t scale);
+bc_jsonb bc_jsonb_of_f64(bc_ctx *, double v, bool real, bool key);
+bc_jsonb bc_jsonb_of_bool(bc_ctx *, bool v);
+bc_jsonb bc_jsonb_of_text(bc_ctx *, bc_view text);
+bc_jsonb bc_jsonb_of_num(bc_ctx *, bc_view numeric_text);
+bc_jsonb bc_jsonb_build_array(bc_ctx *, uint32_t n, const bc_jsonb *args, const bool *nulls);
+bc_jsonb bc_jsonb_build_object(bc_ctx *, uint32_t n, const bc_jsonb *args, const bool *nulls, const bool *composite);
+```
+
+| Function | What it does |
+|---|---|
+| `bc_jsonb_contains` | `a @> b` (and `b <@ a`), `JsonbDeepContains` walked iteratively: an object's pairs, an array's elements in any order, nested values contained, numbers by value; a top-level scalar is an array of itself to an array, never containing one. |
+| `bc_jsonb_exists`, `_exists_any`, `_exists_all` | `?`, `?|`, `?&`: a top-level key or a string element; a path's NULL elements skipped. |
+| `bc_jsonb_concat` | `a || b`: objects merged (`b`'s keys win), arrays joined, anything else an array of both. |
+| `bc_jsonb_delete_key`, `_delete_index`, `_delete_keys`, `_delete_path` | `j - key`, `j - i`, `j - text[]`, `j #- path`; 22023 for a scalar or an object by index, 2202E for a path of two dimensions, 22004 for a NULL element the walk reaches, 22P02 for an array index that is no integer. |
+| `bc_jsonb_set`, `bc_jsonb_insert` | `jsonb_set(j, path, value, create)` and `jsonb_insert(j, path, value, after)`, as `setPath`; 22023 `cannot set path in scalar`, `cannot replace existing key` with its HINT. |
+| `bc_jsonb_set_lax` | `jsonb_set_lax`: with `value_null`, by the treatment (22023 for other text or `treatment_null`; 22004 with DETAIL and HINT for `raise_exception`). |
+| `bc_jsonb_strip_nulls`, `bc_jsonb_pretty` | Every object pair whose value is null dropped; `jsonb_pretty`'s text. |
+| `bc_jsonb_of_*` | `to_jsonb` of a value: an integer, DECIMAL (at `scale`), date, time, timetz, timestamp or timestamptz (`bc_sql_type`; ISO 8601 with a `T`); a float as a number, a string for NaN and the infinities, or, as an object's key, its `float8out` text; a boolean; text as a string; a NUMERIC's text as a number, a string for NaN and the infinities. |
+| `bc_jsonb_build_array`, `_build_object` | At most 100 arguments, each converted or NULL (`nulls[i]`, a JSON null); an object's keys alternate with its values, the last of equal keys kept, 22023 for an odd count, a NULL key or a jsonb one (`composite[i]`). |
 
 A plan's constants are ids, emitted by the compiler from the catalog
 (`Catalog::constants`) and named from ids too, so that no SQL name has to be

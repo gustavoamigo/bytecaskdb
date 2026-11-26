@@ -89,20 +89,31 @@ namespace {
   throw SqlError{what, pos, state};
 }
 
-// jsonb's operators and the JSON functions of stage 4 (docs/jsonb_design.md):
-// PostgreSQL has them, the layer not yet, so they are refused as a feature
-// it lacks (0A000) wherever they are written, before any operand is read.
-// The accessors (->, ->>, #>, #>>, jsonb_typeof, jsonb_array_length) are
-// stage 3's, built.
+// jsonpath's operators and the JSON functions the layer lacks
+// (docs/jsonb_design.md): PostgreSQL has them, the layer not yet, so they
+// are refused as a feature it lacks (0A000) wherever they are written,
+// before any operand is read. The jsonb operators and functions of stages
+// 3 and 4 are built; json_build_array and json_build_object wait for the
+// json type (stage 1c).
 void refuse_jsonb_operator(const std::string& op, std::int32_t pos) {
-  static constexpr std::array<std::string_view, 8> kJsonbOperators{"@>", "<@", "?", "?|", "?&", "#-", "@?", "@@"};
-  if (std::ranges::find(kJsonbOperators, op) != kJsonbOperators.end()) {
-    reject("operator " + op + " is not supported yet", pos, kFeatureNotSupported);
-  }
+  if (op == "@?" || op == "@@") reject("operator " + op + " is not supported yet", pos, kFeatureNotSupported);
 }
 
+// jsonb's operators of stages 3 and 4, the binder's to resolve
+// (docs/jsonb_design.md, *Operator resolution for jsonb, with unknown
+// literals and parameters*); jsonb's - is the parser's binary minus.
+auto is_jsonb_operator(std::string_view op) -> bool {
+  return op == "->" || op == "->>" || op == "#>" || op == "#>>" || op == "@>" || op == "<@" || op == "?" || op == "?|" ||
+         op == "?&" || op == "#-";
+}
+
+// The jsonb functions of stages 3 and 4, parsed as calls of plain arguments.
+constexpr std::array<std::string_view, 12> kJsonbFunctions{
+    "jsonb_typeof",      "jsonb_array_length", "jsonb_set",         "jsonb_set_lax", "jsonb_insert",       "jsonb_build_array",
+    "jsonb_build_object", "to_jsonb",          "jsonb_strip_nulls", "jsonb_pretty",  "jsonb_extract_path", "jsonb_extract_path_text"};
+
 void refuse_json_function(const std::string& name, std::int32_t pos) {
-  if (name == "jsonb_typeof" || name == "jsonb_array_length") return;
+  if (std::ranges::find(kJsonbFunctions, name) != kJsonbFunctions.end()) return;
   auto json = name.starts_with("jsonb_") || name.starts_with("json_") || name == "to_json" || name == "to_jsonb" ||
               name == "row_to_json" || name == "array_to_json";
   if (json) reject("function " + name + " is not supported yet", pos, kFeatureNotSupported);
@@ -339,7 +350,7 @@ auto expr(const PgQuery__Node* n) -> Expr {
     }
     // jsonb's accessors, the binder's to resolve (docs/jsonb_design.md,
     // *Operator resolution for jsonb, with unknown literals and parameters*).
-    if ((op == "||" || op == "%" || op == "->" || op == "->>" || op == "#>" || op == "#>>") && a->lexpr != nullptr) {
+    if ((op == "||" || op == "%" || is_jsonb_operator(op)) && a->lexpr != nullptr) {
       Expr e{Expr::Kind::Func, {}, 0, nullptr, nullptr, a->location};
       e.func = op;
       e.args.push_back(operand(a->lexpr));
@@ -373,9 +384,10 @@ auto expr(const PgQuery__Node* n) -> Expr {
     // (EXTRACT's unit a string constant first).
     static constexpr std::array kStringFunctions{"upper",        "lower",         "substring", "btrim",  "ltrim",  "rtrim",
                                                  "position",     "char_length",   "character_length", "octet_length", "overlay",
-                                                 "to_timestamp", "substr", "random", "abs", "extract",
-                                                 "jsonb_typeof", "jsonb_array_length"};
-    if (std::ranges::find(kStringFunctions, name) != kStringFunctions.end() &&
+                                                 "to_timestamp", "substr", "random", "abs", "extract"};
+    auto plain = std::ranges::find(kStringFunctions, name) != kStringFunctions.end() ||
+                 std::ranges::find(kJsonbFunctions, name) != kJsonbFunctions.end();
+    if (plain &&
         (f->n_funcname == 1 || (f->n_funcname == 2 && str(f->funcname[0]) == "pg_catalog"))) {
       if (f->agg_star || f->agg_distinct || f->n_agg_order != 0 || f->agg_filter != nullptr || f->over != nullptr ||
           f->agg_within_group || f->func_variadic) {
@@ -383,7 +395,12 @@ auto expr(const PgQuery__Node* n) -> Expr {
       }
       Expr e{Expr::Kind::Func, {}, 0, nullptr, nullptr, f->location};
       e.func = name;
-      for (std::size_t k = 0; k < f->n_args; ++k) e.args.push_back(operand(f->args[k]));
+      for (std::size_t k = 0; k < f->n_args; ++k) {
+        if (f->args[k]->node_case == PG_QUERY__NODE__NODE_NAMED_ARG_EXPR) {
+          reject("named arguments of function " + name + " are not supported yet", f->args[k]->named_arg_expr->location);
+        }
+        e.args.push_back(operand(f->args[k]));
+      }
       return e;
     }
     // now(), current_database() and current_schema() are CURRENT_TIMESTAMP,
@@ -512,6 +529,16 @@ auto expr(const PgQuery__Node* n) -> Expr {
   }
   if (n->node_case == PG_QUERY__NODE__NODE_TYPE_CAST) {
     const auto* c = n->type_cast;
+    // x::text[]: the binder takes one only as a jsonb path
+    // (docs/jsonb_design.md, *Path arguments*), as the cast type "text[]".
+    if (const auto* tn = c->type_name; tn != nullptr && tn->n_array_bounds == 1 && tn->n_typmods == 0 && !tn->setof &&
+                                       !tn->pct_type && str(tn->names[tn->n_names - 1]) == "text" &&
+                                       (tn->n_names == 1 || (tn->n_names == 2 && str(tn->names[0]) == "pg_catalog"))) {
+      Expr e{Expr::Kind::Cast, {}, 0, nullptr, nullptr, c->location};
+      e.cast_type = "text[]";
+      e.rhs = std::make_unique<Expr>(operand(c->arg));
+      return e;
+    }
     auto type = type_ast(c->type_name, "", c->location);
     Expr e{Expr::Kind::Cast, {}, 0, nullptr, nullptr, c->location};
     e.cast_type = std::move(type.type);

@@ -8,8 +8,11 @@ the jsonb column type with its text in and out, casts with text, `DEFAULT`,
 `IS [NOT] NULL`, `COUNT`, `CASE` and `COALESCE` (`sql/jsonb.cppm`, plan API
 revision 21); and the accessors `->`, `->>`, `#>`, `#>>`, `jsonb_typeof`,
 `jsonb_array_length` and the casts to `boolean` and the numbers (plan API
-revision 22). *Stages of jsonb* says what each built and how it differs
-from this design. Stages 1b, 1c, 2 and 4 to 6 are not built.
+revision 22). Stage 4 is built but for `json_build_array` and
+`json_build_object`, which wait for stage 1c: containment, existence,
+modification and construction (plan API revision 25). *Stages of jsonb*
+says what each built and how it differs from this design. Stages 1b, 1c, 2,
+5 and 6 are not built.
 
 This document covers PostgreSQL's `jsonb` type, and `json` where it is
 cheap: what the layer matches exactly, how a value is stored, the plan API
@@ -1200,10 +1203,12 @@ These remain after every stage, each a known difference in
   OIDs 25 and 1043 with 42804.
 - **`DISTINCT` inside the jsonb and json aggregates** is 0A000.
 - **Not built:** jsonpath, SQL/JSON, subscripting, operators on `json`,
-  a `json` column, `jsonb[]`, record functions, jsonb as a key, unique or
-  index column, expression and GIN indexes, `GREATEST` and `LEAST`, domains and
-  procedure arguments of jsonb, binary results, binary parameters of
-  other types.
+  a `json` column, `json_build_array` and `json_build_object` (until stage
+  1c), `jsonb[]`, record functions, jsonb as a key, unique or index column,
+  expression and GIN indexes, `GREATEST` and `LEAST`, domains and
+  procedure arguments of jsonb, `to_jsonb` and the build functions of a
+  `CHAR(n)` value, named arguments and `VARIADIC` of the jsonb functions,
+  binary results, binary parameters of other types.
 
 ## Guarantees and CONTRACT rows jsonb adds
 
@@ -1477,8 +1482,69 @@ estimates of changed lines, code and tests.
   path, and the builder writes binary). Containment walks both trees with
   no parse. Could split into 4a (operators) and 4b (functions) if the
   review prefers. Revision 24.
+  **As built.** Everything above but `json_build_array` and
+  `json_build_object`, which return `json`, a type stage 1c has not built
+  (0A000 still, a follow-up of stage 1c). Plan API revision 25 (24 went to
+  #904's casts). The choices the code made:
+  - One builder, `sql/jsonb.cppm`'s `Builder`, takes PostgreSQL's
+    `pushJsonbValue` tokens in document order (containers opened and
+    closed, a key before each member, leaves that are whole nodes) and
+    writes the result once: an object's members sorted into storage order,
+    the last of equal keys kept, every size summed bottom-up and checked
+    against 268435455 (54000) and every depth against 10000 (54001) before
+    the result is allocated. A leaf is a byte range of its source, copied
+    once, so only the containers on a modification's way are rebuilt. A
+    value nested anew (an inserted value, a build argument, an object
+    wrapped by `||`) has its depth measured by a full walk; the rest keep
+    their source's depth.
+  - `contains` is `JsonbDeepContains` run iteratively: a charged stack of
+    open pairs of containers, each frame the right side's member or element
+    it is matching and, for an array, the left side's candidate container
+    it is trying, so the backtracking search keeps nothing on the C++
+    stack. Numbers compare by sign, weight and digits, not scale.
+  - #-, `jsonb_set`, `jsonb_set_lax` and `jsonb_insert` are `setPath` walked
+    down once: the containers on the path are found first (each step's
+    errors as PostgreSQL raises them, a NULL element 22004 and an array
+    index that is no integer 22P02 only where the walk reaches them), and
+    the result is built only when the last step changes something; a call
+    that changes nothing returns its input, as do `-` of a missing key and
+    `jsonb_strip_nulls` of a scalar. `jsonb_set_lax` reads its treatment's
+    NULL first (22023), as PostgreSQL does, and its text only for a NULL
+    value.
+  - A path of two or more dimensions keeps that fact in its count's top
+    bit, so `#>`, `?|` and `?&` read it flat and the functions that take
+    it as a list raise 2202E at run time, as PostgreSQL does.
+  - `jsonb_pretty` is the output walk with four-space indentation, the same
+    counting and writing passes.
+  - `to_jsonb` and the builders: `bc_jsonb_of_i64`, `_f64`, `_bool`,
+    `_text` and `_num` make a scalar node from a value
+    (`sql/text.cppm`'s `jsonb_scalar_text`: a number's output text read by
+    the JSON grammar, a string for text that is no JSON number), and
+    `bc_jsonb_build_array` and `_build_object` take the converted arguments
+    as C arrays with their NULL marks (and, for an object's keys, whether
+    one is a jsonb), at most 100, PostgreSQL's FUNC_MAX_ARGS, instead of
+    the proposed open/add/close calls. A float key is its `float8out` text.
+    `CHAR(n)` arguments are 0A000: no value holds its padded text.
+  - The binder resolves every stage-4 operator and function in one place
+    (`jsonb_signature`), for constants folded at prepare and for values,
+    so their errors cannot drift apart. A `$n` an earlier use typed keeps
+    its type (`jsonb_set($1, $2, $3), $1 ?| $2`); `x::text[]` of a string
+    literal or `$n` is a path; `x::numeric` of a literal is a NUMERIC of
+    no precision as an argument of `to_jsonb` and the builders.
+  - `jsonb || text` and `text || jsonb` of columns is text concatenation
+    of the jsonb's text, which stage 1 left at 0A000.
+  - Tests: `jsonb_ops_test` (each operator and function against PostgreSQL
+    17's results, the depth and size bounds, damage, budget and
+    allocation sweeps asserting the buffers they fail),
+    `plan_api_jsonb_ops_test`, embedded API cases, a proof test drawing
+    values, keys, indexes and paths against PostgreSQL 17 on both targets,
+    a wire test of Describe's types, the fuzz properties widened to the
+    stage-4 walks, and functional cases recorded from PostgreSQL 17. The
+    54000 bound is reached through a build and through `||` and
+    `jsonb_set` of a 135 MB array, not `jsonb_agg` (stage 5). No benchmark:
+    no speed-up is claimed.
 - **Stage 5: aggregates, FILTER and ORDER BY in the call** (about 1,900
-  lines, up from 1,800: each builder encodes as it grows). Revision 25.
+  lines, up from 1,800: each builder encodes as it grows). Revision 26.
 - **Stage 6: set-returning functions** (design addendum first; about
   2,500 lines).
 
