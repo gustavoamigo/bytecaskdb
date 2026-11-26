@@ -186,6 +186,11 @@ enum class Type : std::uint8_t { Null, Boolean, Number, String, Array, Object };
 // element as a u32 length (kPathNull for a NULL element) and its bytes. The
 // empty view is the empty path too.
 inline constexpr std::uint32_t kPathNull = 0xFFFFFFFF;
+// The count's top bit: a text[] of more than one dimension, which #>, #>>,
+// ?| and ?& read flat and the functions that take the path as a list
+// refuse (2202E). A text[] holds at most 134217727 elements, so the count
+// never reaches it.
+inline constexpr std::uint32_t kPathMulti = 0x80000000;
 // array_in's reading of a text[]'s text, as a path: every dimension read
 // flat, in order. Errors as array_in's: 22P02 "malformed array literal" with
 // its DETAIL, 54000 past 6 dimensions, 2202E for an upper bound below its
@@ -226,6 +231,96 @@ enum class TextForm : std::uint8_t { Null, Bytes, Text };
 // "\"<text>\" is out of range for type double precision" (real) past the
 // type's range, or below it but zero. A real is its float's value.
 [[nodiscard]] auto to_float(ByteView node, bool real, Memory mem, Alloc out, double& v) -> Outcome;
+
+// ------------------- containment, existence, modification, construction
+//                                                               (stage 4)
+//
+// Each walk is iterative over a stack charged to Memory, so no input
+// reaches the C++ stack. A call that builds a value writes a new node into
+// what `out` gives, charged: the children it does not change are copied as
+// byte ranges, only the containers on its way are rebuilt, and the result's
+// depth (54001 past kMaxDepth) and size (54000 past kMaxBytes) are checked
+// before a byte is written. A result that is its input unchanged is the
+// input itself, with nothing allocated. Every read is bounds-checked, a
+// damaged value Corrupt.
+
+// Whether a path came from a text[] of more than one dimension.
+[[nodiscard]] auto path_multidimensional(ByteView path) -> bool;
+
+// a @> b, as JsonbDeepContains: an object contains an object whose every
+// pair it holds, a value contained by its own (a scalar equal, numbers by
+// value; a container contained, of the same kind); an array contains an
+// array each of whose scalars it holds and each of whose containers one of
+// its own containers contains, in any order, duplicates allowed. A
+// top-level scalar is an array of itself to an array, never containing one.
+[[nodiscard]] auto contains(ByteView a, ByteView b, Memory mem, bool& result) -> Outcome;
+// j ? key: a top-level key of an object, or a string element of an array
+// (a top-level string scalar is an array of itself).
+[[nodiscard]] auto exists(ByteView node, std::string_view key, bool& result) -> Outcome;
+// j ?| path (any) and j ?& path (all): its non-NULL elements, as ?.
+[[nodiscard]] auto exists_some(ByteView node, ByteView path, bool all, bool& result) -> Outcome;
+
+// a || b, as jsonb_concat: two objects merged (b's key wins), two arrays
+// joined, and anything else an array of both, a scalar as an array of
+// itself and an object as one element.
+[[nodiscard]] auto concat(ByteView a, ByteView b, Memory mem, Alloc out, ByteView& result) -> Outcome;
+// j - key: an object without the key, an array without its string elements
+// equal to it; 22023 "cannot delete from scalar".
+[[nodiscard]] auto delete_key(ByteView node, std::string_view key, Memory mem, Alloc out, ByteView& result) -> Outcome;
+// j - text[]: each non-NULL element deleted as by j - key; 2202E for a path
+// of more than one dimension.
+[[nodiscard]] auto delete_keys(ByteView node, ByteView path, Memory mem, Alloc out, ByteView& result) -> Outcome;
+// j - i: element i of an array, from the end when negative; 22023 for a
+// scalar or an object.
+[[nodiscard]] auto delete_index(ByteView node, std::int64_t i, Memory mem, Alloc out, ByteView& result) -> Outcome;
+// j #- path, as setPath deletes: 2202E, 22023 "cannot delete path in
+// scalar", 22004 for a NULL element reached, 22P02 for an element read as
+// an array index that is no integer.
+[[nodiscard]] auto delete_path(ByteView node, ByteView path, Memory mem, Alloc out, ByteView& result) -> Outcome;
+// jsonb_set(j, path, value, create): the value at path replaced, or with
+// `create` added where the last step is missing; errors as delete_path's,
+// 22023 "cannot set path in scalar".
+[[nodiscard]] auto set(ByteView node, ByteView path, ByteView value, bool create, Memory mem, Alloc out, ByteView& result)
+    -> Outcome;
+// jsonb_insert(j, path, value, after): the value inserted before (after)
+// the array element at path, or as a new key; 22023 "cannot replace
+// existing key" for a key the object holds.
+[[nodiscard]] auto insert(ByteView node, ByteView path, ByteView value, bool after, Memory mem, Alloc out, ByteView& result)
+    -> Outcome;
+
+// jsonb_set_lax's null_value_treatment, read as PostgreSQL compares it.
+enum class NullTreatment : std::uint8_t { RaiseException, UseJsonNull, DeleteKey, ReturnTarget };
+// 22023 for any other text, and for SQL NULL (nullopt).
+[[nodiscard]] auto null_treatment(std::optional<std::string_view> text, NullTreatment& t) -> Outcome;
+// jsonb_set_lax's error for a NULL value under raise_exception: 22004.
+[[nodiscard]] auto null_value_error() -> Error;
+
+// jsonb_strip_nulls: every object pair whose value is null dropped, at any
+// depth; a scalar unchanged.
+[[nodiscard]] auto strip_nulls(ByteView node, Memory mem, Alloc out, ByteView& result) -> Outcome;
+// jsonb_pretty's text, into what `out` gives; 54000 past kMaxText.
+[[nodiscard]] auto pretty(ByteView node, Memory mem, Alloc out, std::span<char>& text) -> Outcome;
+
+// to_jsonb's scalar of a SQL value (datum_to_jsonb), from its text: a
+// string; a number, or a string for text that is no JSON number ("NaN",
+// "Infinity"); true; false. 54000 for a string past kMaxBytes.
+enum class Scalar : std::uint8_t { String, Number, True, False };
+[[nodiscard]] auto scalar(Scalar kind, std::string_view text, Memory mem, Alloc out, ByteView& node) -> Outcome;
+
+// An argument of jsonb_build_array or jsonb_build_object: a node, SQL NULL,
+// or (a key) of a type that is no scalar, jsonb.
+struct BuildArg {
+  ByteView node;
+  bool null{false};
+  bool composite{false};
+};
+// jsonb_build_array: each argument an element, SQL NULL a JSON null.
+[[nodiscard]] auto build_array(std::span<const BuildArg> args, Memory mem, Alloc out, ByteView& result) -> Outcome;
+// jsonb_build_object: alternating keys and values, the last of equal keys
+// kept. A key is a string's bytes, a number's text, or true or false; 22023
+// for an odd count, a NULL key ("argument N: key must not be null") or a
+// composite one.
+[[nodiscard]] auto build_object(std::span<const BuildArg> args, Memory mem, Alloc out, ByteView& result) -> Outcome;
 
 }  // namespace bytecask::sql::jsonb
 
@@ -285,6 +380,7 @@ public:
     return true;
   }
   auto vec() -> std::vector<T>& { return v_; }
+  auto vec() const -> const std::vector<T>& { return v_; }
 
 private:
   Memory mem_;
@@ -1342,8 +1438,11 @@ auto emit_number(ByteView v, std::size_t b, std::size_t e, Sink& out) -> Outcome
 
 // The walk every read of a whole node takes: the output text into `out`,
 // every rule of *Decoding a stored jsonb value without overflow* and the
-// full check's key order and UTF-8 checked on the way.
-template <typename Sink>
+// full check's key order and UTF-8 checked on the way. kPretty writes
+// jsonb_pretty's text instead of jsonb_out's: each element and key on its
+// own line, four spaces a level, "," between them. A sink with a depth()
+// member is told the number of open containers each time one opens.
+template <bool kPretty = false, typename Sink>
 auto walk(ByteView v, Memory mem, Sink& out) -> Outcome {
   Scratch<Frame> stack{mem, Site::Stack};
   auto fail = [] { return corrupt("text past its length"); };
@@ -1385,6 +1484,7 @@ auto walk(ByteView v, Memory mem, Sink& out) -> Outcome {
           f.area = b + 5 + 4 * std::size_t{n};
         }
         if (!stack.push(f)) return refused();
+        if constexpr (requires { out.depth(std::size_t{}); }) out.depth(stack.vec().size());
         if (!out.put(object ? '{' : '[')) return fail();
         return {};
       }
@@ -1396,11 +1496,18 @@ auto walk(ByteView v, Memory mem, Sink& out) -> Outcome {
   while (!frames.empty()) {
     auto& f = frames.back();
     if (f.i == f.n) {
+      if constexpr (kPretty) {
+        if (!out.put('\n') || !out.repeat(' ', 4 * std::uint64_t{frames.size() - 1})) return fail();
+      }
       if (!out.put(f.object ? '}' : ']')) return fail();
       frames.pop_back();
       continue;
     }
-    if (f.i > 0 && !out.put(std::string_view{", "})) return fail();
+    if constexpr (kPretty) {
+      if ((f.i > 0 && !out.put(',')) || !out.put('\n') || !out.repeat(' ', 4 * std::uint64_t{frames.size()})) return fail();
+    } else if (f.i > 0 && !out.put(std::string_view{", "})) {
+      return fail();
+    }
     std::size_t cb = 0;
     std::size_t ce = 0;
     auto last = f.i + 1 == f.n;
@@ -1799,8 +1906,12 @@ public:
     while (p < s_.size() && s_[p] != '\0') {
       if (!is_space(s_[p++])) return malformed("Junk after closing right brace.");
     }
+    ndim_ = ndim;
     return {};
   }
+
+  // The dimensions the last read() found.
+  [[nodiscard]] auto ndim() const -> int { return ndim_; }
 
 private:
   enum class Tok : std::uint8_t { LevelStart, LevelEnd, Delim, Elem, ElemNull };
@@ -1932,6 +2043,7 @@ private:
   }
 
   std::string_view s_;
+  int ndim_{0};
 };
 
 // An element's bytes, its backslashes taken off: each quotes the next byte.
@@ -2031,7 +2143,9 @@ auto parse_path(std::string_view text, Alloc out, std::span<std::byte>& path) ->
   if (size > kMaxText) return data({kProgramLimitExceeded, "a path of more than 1073741823 bytes", "", "", ""});
   auto* p = out.fn(out.self, static_cast<std::size_t>(size));
   if (p == nullptr) return refused();
-  put_u32(p, static_cast<std::uint32_t>(count));
+  // array_in makes an array of no elements one of no dimensions.
+  auto multi = reader.ndim() > 1 && count > 0;
+  put_u32(p, static_cast<std::uint32_t>(count) | (multi ? kPathMulti : 0));
   std::size_t at = 4;
   (void)reader.read([&](std::size_t b, std::size_t e, bool null, bool) -> Outcome {
     if (null) {
@@ -2056,7 +2170,7 @@ auto parse_path(std::string_view text, Alloc out, std::span<std::byte>& path) ->
 auto path_size(ByteView path) -> std::optional<std::uint32_t> {
   if (path.empty()) return 0;
   if (path.size() < 4) return std::nullopt;
-  auto n = rd32(path, 0);
+  auto n = rd32(path, 0) & ~kPathMulti;
   std::size_t at = 4;
   for (std::uint32_t i = 0; i < n; ++i) {
     if (path.size() - at < 4) return std::nullopt;
@@ -2226,6 +2340,1069 @@ auto to_float(ByteView node, bool real, Memory mem, Alloc out, double& v) -> Out
   if (ec != std::errc{} || end != e) return corrupt("a number whose text is no float");
   v = d;
   return {};
+}
+
+// ------------------- containment, existence, modification, construction
+//                                                               (stage 4)
+
+namespace {
+
+// A walk's deepest nesting of containers.
+struct DepthSink : CountSink {
+  std::size_t max{0};
+  void depth(std::size_t d) { max = std::max(max, d); }
+};
+
+// The nesting of a node's containers (0 for a scalar), after the full
+// check its walk makes.
+auto node_depth(ByteView node, Memory mem, std::size_t& depth) -> Outcome {
+  DepthSink sink;
+  auto r = walk(node, mem, sink);
+  depth = sink.max;
+  return r;
+}
+
+auto is_container_tag(std::uint8_t tag) -> bool { return tag == kTagArray || tag == kTagObject; }
+
+// The index of `want` among an object's keys, by binary search in storage
+// order; nullopt for no such key.
+auto find_key(ByteView v, const Container& c, ByteView want, std::optional<std::uint32_t>& index) -> Outcome {
+  index.reset();
+  std::uint32_t lo = 0;
+  std::uint32_t hi = c.n;
+  while (lo < hi) {
+    auto mid = lo + (hi - lo) / 2;
+    ByteView k;
+    if (auto r = key_at(v, c, mid, k); !r.ok()) return r;
+    int cmp = 0;
+    if (k.size() != want.size()) {
+      cmp = k.size() < want.size() ? -1 : 1;
+    } else if (!k.empty()) {
+      cmp = std::memcmp(k.data(), want.data(), k.size());
+    }
+    if (cmp == 0) {
+      index = mid;
+      return {};
+    }
+    if (cmp < 0) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return {};
+}
+
+auto bytes_of(std::string_view s) -> ByteView { return std::as_bytes(std::span{s.data(), s.size()}); }
+
+// Child i of a container: an object's key (when `key` is given) and value,
+// or an array's element.
+auto child_at(ByteView v, const Container& c, std::uint32_t i, ByteView* key, ByteView& value) -> Outcome {
+  if (!c.object) return child(v, c, c.table, c.area, i, value);
+  if (key != nullptr) {
+    if (auto r = key_at(v, c, i, *key); !r.ok()) return r;
+  }
+  return child(v, c, c.table + 4 * std::size_t{c.n}, c.vals, i, value);
+}
+
+// Two scalars equal as JSON values: the same type, strings bytewise,
+// numbers by value (their digits and weight, not their scale).
+auto scalar_equal(ByteView a, ByteView b, bool& eq) -> Outcome {
+  eq = false;
+  auto ta = tag_of(a);
+  auto tb = tag_of(b);
+  if (!ta || !tb) return corrupt("an empty node");
+  if (*ta != *tb) return {};
+  switch (*ta) {
+    case kTagNull:
+    case kTagFalse:
+    case kTagTrue:
+      if (a.size() != 1 || b.size() != 1) return corrupt("a null or boolean longer than its tag");
+      eq = true;
+      return {};
+    case kTagString: eq = a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size()) == 0; return {};
+    case kTagNumber: {
+      Number x;
+      Number y;
+      if (auto r = read_number(a, 0, a.size(), x); !r.ok()) return r;
+      if (auto r = read_number(b, 0, b.size(), y); !r.ok()) return r;
+      eq = x.sign == y.sign && x.weight == y.weight && x.k == y.k && (x.k == 0 || std::memcmp(x.digits, y.digits, x.k) == 0);
+      return {};
+    }
+    default: return corrupt("an unknown tag");
+  }
+}
+
+constexpr std::array<std::byte, 1> kNullNode{std::byte{kTagNull}};
+
+// Builds a value from tokens in document order, as PostgreSQL's
+// pushJsonbValue does: containers opened and closed, a key before each
+// object member, leaves that are whole nodes copied as byte ranges. An
+// object's members are put in storage order at finish(), the last of equal
+// keys kept. Every buffer is charged; the result is written once, sized
+// first, its depth and size checked before a byte is written.
+class Builder {
+public:
+  explicit Builder(Memory mem)
+      : mem_{mem}, items_{mem, Site::Nodes}, open_{mem, Site::Stack}, order_{mem, Site::Keys}, pool_{mem, Site::Pool} {}
+
+  // Opens an array or an object as the next value.
+  auto open(bool object) -> Outcome {
+    if (open_.vec().size() >= kMaxDepth) return data(depth_error());
+    Item it;
+    it.kind = object ? kTagObject : kTagArray;
+    auto at = static_cast<std::uint32_t>(items_.vec().size());
+    if (auto r = place(it); !r.ok()) return r;
+    if (!open_.push(at)) return refused();
+    return {};
+  }
+
+  void close() {
+    auto& items = items_.vec();
+    items[open_.vec().back()].end = static_cast<std::uint32_t>(items.size());
+    open_.vec().pop_back();
+  }
+
+  // The next value's key, in an object: bytes that outlive finish().
+  void key(ByteView k) {
+    pending_ = {k.data(), 0, static_cast<std::uint32_t>(k.size())};
+    has_key_ = true;
+  }
+  // The text of a number node, copied, as the next key.
+  auto key_number(ByteView node) -> Outcome {
+    CountSink count;
+    if (auto r = walk(node, mem_, count); !r.ok()) return r;
+    auto off = pool_.vec().size();
+    if (!pool_.reserve(off + count.n)) return refused();
+    pool_.vec().resize(off + count.n);
+    WriteSink sink{{reinterpret_cast<char*>(pool_.vec().data() + off), static_cast<std::size_t>(count.n)}};
+    if (auto r = walk(node, mem_, sink); !r.ok()) return r;
+    pending_ = {nullptr, off, static_cast<std::uint32_t>(count.n)};
+    has_key_ = true;
+    return {};
+  }
+
+  // A whole node as the next value, its bytes outliving finish(). With
+  // `measure`, the node's own nesting counts toward the result's depth (a
+  // value nested anew); without, it was already at this depth.
+  auto leaf(ByteView node, bool measure) -> Outcome {
+    if (node.empty()) return corrupt("an empty node");
+    if (measure && is_container_tag(std::to_integer<std::uint8_t>(node[0]))) {
+      std::size_t d = 0;
+      if (auto r = node_depth(node, mem_, d); !r.ok()) return r;
+      if (d + open_.vec().size() > kMaxDepth) return data(depth_error());
+    }
+    Item it;
+    it.data = node.data();
+    it.len = static_cast<std::uint32_t>(node.size());
+    return place(it);
+  }
+  // The value built, into what `out` gives.
+  auto finish(Alloc out, ByteView& result) -> Outcome {
+    auto& items = items_.vec();
+    if (items.empty() || !open_.vec().empty()) return corrupt("an unbalanced jsonb build");
+    if (auto r = order_members(); !r.ok()) return r;
+    auto& order = order_.vec();
+    // Sizes, children (later in document order) before their parents.
+    for (auto i = items.size(); i-- > 0;) {
+      auto& it = items[i];
+      if (it.kind == 0) {
+        it.size = it.len;
+        continue;
+      }
+      std::size_t s = 5;
+      if (it.kind == kTagArray) {
+        it.kept = 0;
+        for (auto j = static_cast<std::uint32_t>(i) + 1; j < it.end; j = items[j].end) {
+          s += 4 + items[j].size;
+          ++it.kept;
+        }
+      } else {
+        for (std::uint32_t k = 0; k < it.kept; ++k) {
+          const auto& c = items[order[it.first + k]];
+          s += 8 + std::size_t{c.key_len} + c.size;
+        }
+      }
+      if (s > kMaxBytes) return data(size_error(it.kind));
+      it.size = s;
+    }
+    auto total = items[0].size;
+    auto* p = out.fn(out.self, total);
+    if (p == nullptr) return refused();
+    items[0].pos = 0;
+    for (std::uint32_t i = 0; i < items.size();) {
+      auto& it = items[i];
+      if (it.dropped) {
+        i = it.end;
+        continue;
+      }
+      auto* w = p + it.pos;
+      if (it.kind == 0) {
+        auto bytes = leaf_bytes(it);
+        std::memcpy(w, bytes.data(), bytes.size());
+        ++i;
+        continue;
+      }
+      w[0] = std::byte{it.kind};
+      put_u32(w + 1, it.kept);
+      std::size_t prev = 0;
+      if (it.kind == kTagArray) {
+        auto area = it.pos + 5 + 4 * std::size_t{it.kept};
+        std::uint32_t k = 0;
+        for (auto j = i + 1; j < it.end; j = items[j].end) {
+          items[j].pos = area + prev;
+          prev += items[j].size;
+          put_u32(w + 5 + 4 * std::size_t{k++}, static_cast<std::uint32_t>(prev));
+        }
+      } else {
+        auto keys = it.pos + 5 + 8 * std::size_t{it.kept};
+        std::size_t koff = 0;
+        for (std::uint32_t k = 0; k < it.kept; ++k) {
+          const auto& c = items[order[it.first + k]];
+          auto kb = key_bytes(c);
+          if (!kb.empty()) std::memcpy(p + keys + koff, kb.data(), kb.size());
+          koff += kb.size();
+          put_u32(w + 5 + 4 * std::size_t{k}, static_cast<std::uint32_t>(koff));
+        }
+        auto vals = keys + koff;
+        for (std::uint32_t k = 0; k < it.kept; ++k) {
+          auto& c = items[order[it.first + k]];
+          c.pos = vals + prev;
+          prev += c.size;
+          put_u32(w + 5 + 4 * std::size_t{it.kept} + 4 * std::size_t{k}, static_cast<std::uint32_t>(prev));
+        }
+      }
+      ++i;
+    }
+    result = {p, total};
+    return {};
+  }
+
+private:
+  struct Item {
+    std::size_t size{0};             // its encoded size
+    std::size_t pos{0};              // its position in the result, given by its parent
+    const std::byte* data{nullptr};  // a leaf's bytes
+    const std::byte* key{nullptr};   // its key in an object; nullptr: at `key_off` in the pool
+    std::uint64_t key_off{0};
+    std::uint32_t len{0};      // a leaf's bytes
+    std::uint32_t key_len{0};
+    std::uint32_t end{0};      // the index past its subtree
+    std::uint32_t first{0};    // an object: its kept members' start in order_
+    std::uint32_t kept{0};     // a container: its children kept
+    std::uint8_t kind{0};      // 0 a leaf, kTagArray or kTagObject
+    bool dropped{false};       // the value of a key a later member repeats
+  };
+  struct Key {
+    const std::byte* data{nullptr};
+    std::uint64_t off{0};
+    std::uint32_t len{0};
+  };
+
+  auto place(Item it) -> Outcome {
+    auto& items = items_.vec();
+    if (items.size() >= std::numeric_limits<std::uint32_t>::max() - 1) return data(size_error(kTagArray));
+    auto in_object = !open_.vec().empty() && items[open_.vec().back()].kind == kTagObject;
+    if (in_object != has_key_) return corrupt("a jsonb build with a key out of place");
+    if (has_key_) {
+      it.key = pending_.data;
+      it.key_off = pending_.off;
+      it.key_len = pending_.len;
+      has_key_ = false;
+    }
+    it.end = static_cast<std::uint32_t>(items.size()) + 1;
+    if (!items_.push(it)) return refused();
+    return {};
+  }
+
+  static auto leaf_bytes(const Item& it) -> ByteView { return {it.data, it.len}; }
+  auto key_bytes(const Item& it) const -> ByteView {
+    if (it.key != nullptr || it.key_len == 0) return {it.key, it.key_len};
+    return {pool_.vec().data() + it.key_off, it.key_len};
+  }
+
+  // Each object's members in storage order (length, then bytes), the last
+  // of equal keys kept and the others dropped.
+  auto order_members() -> Outcome {
+    auto& items = items_.vec();
+    for (std::uint32_t i = 0; i < items.size(); ++i) {
+      if (items[i].kind != kTagObject) continue;
+      auto first = order_.vec().size();
+      for (auto j = i + 1; j < items[i].end; j = items[j].end) {
+        if (!order_.push(j)) return refused();
+      }
+      auto& order = order_.vec();
+      auto b = order.begin() + static_cast<std::ptrdiff_t>(first);
+      auto e = order.end();
+      auto less = [&](std::uint32_t x, std::uint32_t y) {
+        auto kx = key_bytes(items[x]);
+        auto ky = key_bytes(items[y]);
+        if (kx.size() != ky.size()) return kx.size() < ky.size();
+        auto c = kx.empty() ? 0 : std::memcmp(kx.data(), ky.data(), kx.size());
+        return c != 0 ? c < 0 : x < y;
+      };
+      std::sort(b, e, less);
+      auto same = [&](std::uint32_t x, std::uint32_t y) {
+        auto kx = key_bytes(items[x]);
+        auto ky = key_bytes(items[y]);
+        return kx.size() == ky.size() && (kx.empty() || std::memcmp(kx.data(), ky.data(), kx.size()) == 0);
+      };
+      auto out = b;
+      for (auto it = b; it != e; ++it) {
+        auto next = it + 1;
+        if (next != e && same(*next, *it)) {
+          items[*it].dropped = true;
+          continue;
+        }
+        *out++ = *it;
+      }
+      items[i].first = static_cast<std::uint32_t>(first);
+      items[i].kept = static_cast<std::uint32_t>(out - b);
+      order.resize(first + items[i].kept);
+    }
+    return {};
+  }
+
+  Memory mem_;
+  Scratch<Item> items_;
+  Scratch<std::uint32_t> open_;
+  Scratch<std::uint32_t> order_;
+  Scratch<std::byte> pool_;
+  Key pending_;
+  bool has_key_{false};
+};
+
+// Children [from, to) of a container into the builder, `skip` left out.
+auto copy_children(Builder& b, ByteView v, const Container& c, std::uint32_t from, std::uint32_t to,
+                   std::uint32_t skip = std::numeric_limits<std::uint32_t>::max()) -> Outcome {
+  for (auto i = from; i < to; ++i) {
+    if (i == skip) continue;
+    ByteView k;
+    ByteView val;
+    if (auto r = child_at(v, c, i, &k, val); !r.ok()) return r;
+    if (c.object) b.key(k);
+    if (auto r = b.leaf(val, false); !r.ok()) return r;
+  }
+  return {};
+}
+
+auto invalid(std::string message, std::string hint = {}) -> Outcome {
+  return data({kInvalidParameterValue, std::move(message), "", std::move(hint), ""});
+}
+auto wrong_subscripts() -> Outcome { return data({kArraySubscriptError, "wrong number of array subscripts", "", "", ""}); }
+
+// An open container's header, for a node known to be one.
+auto container_of(ByteView node, Type& t, Container& c) -> Outcome {
+  if (auto r = type_of(node, t); !r.ok()) return r;
+  if (t != Type::Array && t != Type::Object) return {};
+  return open_container(node, c);
+}
+
+// One open pair of containers of a containment walk; a raw scalar is an
+// array of itself.
+struct Contain {
+  ByteView l;
+  ByteView r;
+  Container lc;
+  Container rc;
+  std::uint32_t ln{0};
+  std::uint32_t rn{0};
+  std::uint32_t i{0};  // the right side's member or element being matched
+  std::uint32_t j{0};  // the left side's candidate container for it
+  bool object{false};
+  bool lraw{false};
+  bool rraw{false};
+};
+
+auto contain_elem(ByteView v, const Container& c, bool raw, std::uint32_t i, ByteView& out) -> Outcome {
+  if (raw) {
+    out = v;
+    return {};
+  }
+  return child(v, c, c.table, c.area, i, out);
+}
+
+// A frame for l and r, both containers of the same kind (or raw scalars
+// in an array frame).
+auto contain_frame(ByteView l, ByteView r, bool object, bool lraw, bool rraw, Contain& f) -> Outcome {
+  f = {};
+  f.l = l;
+  f.r = r;
+  f.object = object;
+  f.lraw = lraw;
+  f.rraw = rraw;
+  if (!lraw) {
+    if (auto x = open_container(l, f.lc); !x.ok()) return x;
+  }
+  if (!rraw) {
+    if (auto x = open_container(r, f.rc); !x.ok()) return x;
+  }
+  f.ln = lraw ? 1 : f.lc.n;
+  f.rn = rraw ? 1 : f.rc.n;
+  return {};
+}
+
+// The kind of a path operation, as setPath's op_type.
+enum class PathOp : std::uint8_t { Create, Replace, Delete, InsertBefore, InsertAfter };
+
+auto creates(PathOp op) -> bool { return op == PathOp::Create || op == PathOp::InsertBefore || op == PathOp::InsertAfter; }
+
+// One container on the way down a path, and the child the path takes.
+struct Step {
+  ByteView node;
+  Container c;
+  std::uint32_t target{0};
+};
+
+// setPath, walked down iteratively: the containers on the path rebuilt,
+// everything else copied. `result` is `node` when nothing changes.
+auto modify_path(ByteView node, ByteView path, std::optional<ByteView> value, PathOp op, Memory mem, Alloc out, ByteView& result)
+    -> Outcome {
+  result = node;
+  auto n = path_size(path);
+  if (!n) return corrupt("a path that does not decode");
+  Scratch<Step> steps{mem, Site::Stack};
+  PathCursor cur{path};
+  auto here = node;
+  // The last level's change.
+  enum class Change : std::uint8_t { None, ReplaceAt, DropAt, BeforeAt, AfterAt, Prepend, Append, AddKey };
+  auto change = Change::None;
+  std::uint32_t at = 0;
+  std::string_view new_key;
+  Container last_c;
+  for (std::uint32_t level = 0; level < *n; ++level) {
+    auto elem = cur.next();
+    if (!elem) return data({kNullValueNotAllowed, "path element at position " + std::to_string(level + 1) + " is null", "", "", ""});
+    Type t{};
+    Container c;
+    if (auto r = container_of(here, t, c); !r.ok()) return r;
+    if (t != Type::Array && t != Type::Object) return {};  // a scalar: pushed as it is
+    auto last = level + 1 == *n;
+    if (t == Type::Object) {
+      std::optional<std::uint32_t> idx;
+      if (auto r = find_key(here, c, bytes_of(*elem), idx); !r.ok()) return r;
+      if (!last) {
+        if (!idx) return {};
+        if (!steps.push({here, c, *idx})) return refused();
+        ByteView v;
+        if (auto r = child_at(here, c, *idx, nullptr, v); !r.ok()) return r;
+        here = v;
+        continue;
+      }
+      if (idx) {
+        if (op == PathOp::InsertBefore || op == PathOp::InsertAfter) {
+          return invalid("cannot replace existing key", "Try using the function jsonb_set to replace key value.");
+        }
+        change = op == PathOp::Delete ? Change::DropAt : Change::ReplaceAt;
+        at = *idx;
+      } else if (creates(op)) {
+        change = Change::AddKey;
+        new_key = *elem;
+      } else {
+        return {};
+      }
+      last_c = c;
+      break;
+    }
+    auto index = path_index(*elem);
+    if (!index) {
+      return data({kInvalidTextRepresentation,
+                   "path element at position " + std::to_string(level + 1) + " is not an integer: \"" + std::string{*elem} + "\"", "",
+                   "", ""});
+    }
+    auto count = std::int64_t{c.n};
+    auto idx = std::int64_t{*index};
+    auto before_all = false;
+    if (idx < 0) {
+      if (-idx > count) {
+        before_all = true;
+      } else {
+        idx += count;
+      }
+    }
+    if (idx > count) idx = count;
+    if (!last) {
+      if (before_all || idx >= count) return {};
+      if (!steps.push({here, c, static_cast<std::uint32_t>(idx)})) return refused();
+      ByteView v;
+      if (auto r = child_at(here, c, static_cast<std::uint32_t>(idx), nullptr, v); !r.ok()) return r;
+      here = v;
+      continue;
+    }
+    if ((before_all || count == 0) && creates(op)) {
+      change = Change::Prepend;
+    } else if (!before_all && idx < count) {
+      at = static_cast<std::uint32_t>(idx);
+      switch (op) {
+        case PathOp::Create:
+        case PathOp::Replace: change = Change::ReplaceAt; break;
+        case PathOp::Delete: change = Change::DropAt; break;
+        case PathOp::InsertBefore: change = Change::BeforeAt; break;
+        case PathOp::InsertAfter: change = Change::AfterAt; break;
+      }
+    } else if (creates(op)) {
+      change = Change::Append;
+    } else {
+      return {};
+    }
+    last_c = c;
+    break;
+  }
+  if (change == Change::None) return {};
+  Builder b{mem};
+  auto& path_steps = steps.vec();
+  for (const auto& s : path_steps) {
+    if (auto r = b.open(s.c.object); !r.ok()) return r;
+    if (s.c.object) {
+      if (auto r = copy_children(b, s.node, s.c, 0, s.c.n, s.target); !r.ok()) return r;
+      ByteView k;
+      if (auto r = key_at(s.node, s.c, s.target, k); !r.ok()) return r;
+      b.key(k);
+    } else if (auto r = copy_children(b, s.node, s.c, 0, s.target); !r.ok()) {
+      return r;
+    }
+  }
+  auto put_value = [&]() -> Outcome { return b.leaf(*value, true); };
+  if (auto r = b.open(last_c.object); !r.ok()) return r;
+  switch (change) {
+    case Change::None: break;
+    case Change::DropAt:
+      if (auto r = copy_children(b, here, last_c, 0, last_c.n, at); !r.ok()) return r;
+      break;
+    case Change::ReplaceAt:
+      if (auto r = copy_children(b, here, last_c, 0, at); !r.ok()) return r;
+      if (last_c.object) {
+        ByteView k;
+        if (auto r = key_at(here, last_c, at, k); !r.ok()) return r;
+        b.key(k);
+      }
+      if (auto r = put_value(); !r.ok()) return r;
+      if (auto r = copy_children(b, here, last_c, at + 1, last_c.n); !r.ok()) return r;
+      break;
+    case Change::BeforeAt:
+    case Change::AfterAt: {
+      if (auto r = copy_children(b, here, last_c, 0, at); !r.ok()) return r;
+      if (change == Change::BeforeAt) {
+        if (auto r = put_value(); !r.ok()) return r;
+      }
+      if (auto r = copy_children(b, here, last_c, at, at + 1); !r.ok()) return r;
+      if (change == Change::AfterAt) {
+        if (auto r = put_value(); !r.ok()) return r;
+      }
+      if (auto r = copy_children(b, here, last_c, at + 1, last_c.n); !r.ok()) return r;
+      break;
+    }
+    case Change::Prepend:
+      if (auto r = put_value(); !r.ok()) return r;
+      if (auto r = copy_children(b, here, last_c, 0, last_c.n); !r.ok()) return r;
+      break;
+    case Change::Append:
+      if (auto r = copy_children(b, here, last_c, 0, last_c.n); !r.ok()) return r;
+      if (auto r = put_value(); !r.ok()) return r;
+      break;
+    case Change::AddKey:
+      if (auto r = copy_children(b, here, last_c, 0, last_c.n); !r.ok()) return r;
+      b.key(bytes_of(new_key));
+      if (auto r = put_value(); !r.ok()) return r;
+      break;
+  }
+  b.close();
+  for (auto k = path_steps.size(); k-- > 0;) {
+    const auto& s = path_steps[k];
+    if (!s.c.object) {
+      if (auto r = copy_children(b, s.node, s.c, s.target + 1, s.c.n); !r.ok()) return r;
+    }
+    b.close();
+  }
+  return b.finish(out, result);
+}
+
+// The common head of jsonb_set, jsonb_insert and #-: a path of one
+// dimension, a container.
+auto path_target(ByteView node, ByteView path, const char* scalar_message, Type& t, Container& c) -> Outcome {
+  if (!path_size(path)) return corrupt("a path that does not decode");
+  if (path_multidimensional(path)) return wrong_subscripts();
+  if (auto r = container_of(node, t, c); !r.ok()) return r;
+  if (t != Type::Array && t != Type::Object) return invalid(scalar_message);
+  return {};
+}
+
+}  // namespace
+
+auto path_multidimensional(ByteView path) -> bool { return path.size() >= 4 && (rd32(path, 0) & kPathMulti) != 0; }
+
+auto contains(ByteView a, ByteView b, Memory mem, bool& result) -> Outcome {
+  result = false;
+  Type ta{};
+  Type tb{};
+  if (auto r = type_of(a, ta); !r.ok()) return r;
+  if (auto r = type_of(b, tb); !r.ok()) return r;
+  if ((ta == Type::Object) != (tb == Type::Object)) return {};
+  auto lraw = ta != Type::Object && ta != Type::Array;
+  auto rraw = tb != Type::Object && tb != Type::Array;
+  if (lraw && !rraw) return {};
+  Scratch<Contain> stack{mem, Site::Stack};
+  Contain top;
+  if (auto r = contain_frame(a, b, ta == Type::Object, lraw, rraw, top); !r.ok()) return r;
+  if (!stack.push(top)) return refused();
+  auto& frames = stack.vec();
+  auto last = true;      // the result of the frame last popped
+  auto returned = false;  // whether a frame was just popped onto the one below
+  auto finish = [&](bool v) {
+    last = v;
+    returned = true;
+    frames.pop_back();
+  };
+  while (!frames.empty()) {
+    auto& f = frames.back();
+    if (returned) {
+      returned = false;
+      if (f.object) {
+        if (!last) {
+          finish(false);
+          continue;
+        }
+        ++f.i;
+      } else if (last) {
+        ++f.i;
+        f.j = 0;
+      } else {
+        ++f.j;
+      }
+    }
+    if (f.i == f.rn) {
+      finish(true);
+      continue;
+    }
+    if (f.object) {
+      if (f.ln < f.rn) {
+        finish(false);
+        continue;
+      }
+      ByteView k;
+      ByteView rv;
+      if (auto r = child_at(f.r, f.rc, f.i, &k, rv); !r.ok()) return r;
+      std::optional<std::uint32_t> idx;
+      if (auto r = find_key(f.l, f.lc, k, idx); !r.ok()) return r;
+      if (!idx) {
+        finish(false);
+        continue;
+      }
+      ByteView lv;
+      if (auto r = child_at(f.l, f.lc, *idx, nullptr, lv); !r.ok()) return r;
+      auto lt = tag_of(lv);
+      auto rt = tag_of(rv);
+      if (!lt || !rt) return corrupt("an empty node");
+      if (!is_container_tag(*lt) || !is_container_tag(*rt)) {
+        auto eq = false;
+        if (is_container_tag(*lt) != is_container_tag(*rt)) {
+          finish(false);
+          continue;
+        }
+        if (auto r = scalar_equal(lv, rv, eq); !r.ok()) return r;
+        if (!eq) {
+          finish(false);
+          continue;
+        }
+        ++f.i;
+        continue;
+      }
+      if (*lt != *rt) {
+        finish(false);
+        continue;
+      }
+      Contain next;
+      if (auto r = contain_frame(lv, rv, *lt == kTagObject, false, false, next); !r.ok()) return r;
+      if (!stack.push(next)) return refused();
+      continue;
+    }
+    ByteView re;
+    if (auto r = contain_elem(f.r, f.rc, f.rraw, f.i, re); !r.ok()) return r;
+    auto rt = tag_of(re);
+    if (!rt) return corrupt("an empty node");
+    if (!is_container_tag(*rt)) {
+      auto found = false;
+      for (std::uint32_t j = 0; j < f.ln && !found; ++j) {
+        ByteView le;
+        if (auto r = contain_elem(f.l, f.lc, f.lraw, j, le); !r.ok()) return r;
+        if (auto r = scalar_equal(le, re, found); !r.ok()) return r;
+      }
+      if (!found) {
+        finish(false);
+        continue;
+      }
+      ++f.i;
+      continue;
+    }
+    // A container: the next of the left's containers of its kind to try.
+    ByteView candidate;
+    auto have = false;
+    for (; f.j < f.ln; ++f.j) {
+      if (auto r = contain_elem(f.l, f.lc, f.lraw, f.j, candidate); !r.ok()) return r;
+      auto lt = tag_of(candidate);
+      if (!lt) return corrupt("an empty node");
+      if (*lt == *rt) {
+        have = true;
+        break;
+      }
+    }
+    if (!have) {
+      finish(false);
+      continue;
+    }
+    Contain next;
+    if (auto r = contain_frame(candidate, re, *rt == kTagObject, false, false, next); !r.ok()) return r;
+    if (!stack.push(next)) return refused();
+  }
+  result = last;
+  return {};
+}
+
+auto exists(ByteView node, std::string_view key, bool& result) -> Outcome {
+  result = false;
+  Type t{};
+  Container c;
+  if (auto r = container_of(node, t, c); !r.ok()) return r;
+  auto want = bytes_of(key);
+  auto string_equal = [&](ByteView v) {
+    return v.size() == want.size() + 1 && std::to_integer<std::uint8_t>(v[0]) == kTagString &&
+           (want.empty() || std::memcmp(v.data() + 1, want.data(), want.size()) == 0);
+  };
+  switch (t) {
+    case Type::Object: {
+      std::optional<std::uint32_t> idx;
+      if (auto r = find_key(node, c, want, idx); !r.ok()) return r;
+      result = idx.has_value();
+      return {};
+    }
+    case Type::Array:
+      for (std::uint32_t i = 0; i < c.n && !result; ++i) {
+        ByteView v;
+        if (auto r = child_at(node, c, i, nullptr, v); !r.ok()) return r;
+        result = string_equal(v);
+      }
+      return {};
+    case Type::String: result = string_equal(node); return {};
+    case Type::Null:
+    case Type::Boolean:
+    case Type::Number: return {};
+  }
+  return {};
+}
+
+auto exists_some(ByteView node, ByteView path, bool all, bool& result) -> Outcome {
+  auto n = path_size(path);
+  if (!n) return corrupt("a path that does not decode");
+  result = all;
+  PathCursor cur{path};
+  for (std::uint32_t i = 0; i < *n; ++i) {
+    auto key = cur.next();
+    if (!key) continue;
+    auto found = false;
+    if (auto r = exists(node, *key, found); !r.ok()) return r;
+    if (found != all) {
+      result = found;
+      return {};
+    }
+  }
+  return {};
+}
+
+auto concat(ByteView a, ByteView b, Memory mem, Alloc out, ByteView& result) -> Outcome {
+  Type ta{};
+  Type tb{};
+  Container ca;
+  Container cb;
+  if (auto r = container_of(a, ta, ca); !r.ok()) return r;
+  if (auto r = container_of(b, tb, cb); !r.ok()) return r;
+  Builder bd{mem};
+  auto objects = ta == Type::Object && tb == Type::Object;
+  if (auto r = bd.open(objects); !r.ok()) return r;
+  auto side = [&](ByteView v, Type t, const Container& c) -> Outcome {
+    if (objects || t == Type::Array) return copy_children(bd, v, c, 0, c.n);
+    return bd.leaf(v, t == Type::Object);  // an object nested, or a scalar as an element of its own
+  };
+  if (auto r = side(a, ta, ca); !r.ok()) return r;
+  if (auto r = side(b, tb, cb); !r.ok()) return r;
+  bd.close();
+  return bd.finish(out, result);
+}
+
+auto delete_key(ByteView node, std::string_view key, Memory mem, Alloc out, ByteView& result) -> Outcome {
+  result = node;
+  Type t{};
+  Container c;
+  if (auto r = container_of(node, t, c); !r.ok()) return r;
+  if (t != Type::Array && t != Type::Object) return invalid("cannot delete from scalar");
+  if (c.n == 0) return {};
+  Builder b{mem};
+  if (auto r = b.open(c.object); !r.ok()) return r;
+  if (c.object) {
+    std::optional<std::uint32_t> idx;
+    if (auto r = find_key(node, c, bytes_of(key), idx); !r.ok()) return r;
+    if (!idx) return {};
+    if (auto r = copy_children(b, node, c, 0, c.n, *idx); !r.ok()) return r;
+  } else {
+    for (std::uint32_t i = 0; i < c.n; ++i) {
+      ByteView v;
+      if (auto r = child_at(node, c, i, nullptr, v); !r.ok()) return r;
+      auto drop = v.size() == key.size() + 1 && std::to_integer<std::uint8_t>(v[0]) == kTagString &&
+                  (key.empty() || std::memcmp(v.data() + 1, key.data(), key.size()) == 0);
+      if (drop) continue;
+      if (auto r = b.leaf(v, false); !r.ok()) return r;
+    }
+  }
+  b.close();
+  return b.finish(out, result);
+}
+
+auto delete_keys(ByteView node, ByteView path, Memory mem, Alloc out, ByteView& result) -> Outcome {
+  result = node;
+  auto n = path_size(path);
+  if (!n) return corrupt("a path that does not decode");
+  if (path_multidimensional(path)) return wrong_subscripts();
+  Type t{};
+  Container c;
+  if (auto r = container_of(node, t, c); !r.ok()) return r;
+  if (t != Type::Array && t != Type::Object) return invalid("cannot delete from scalar");
+  if (c.n == 0 || *n == 0) return {};
+  // The keys, sorted for a binary search per member.
+  Scratch<std::string_view> keys{mem, Site::Keys};
+  PathCursor cur{path};
+  for (std::uint32_t i = 0; i < *n; ++i) {
+    auto k = cur.next();
+    if (k && !keys.push(*k)) return refused();
+  }
+  auto& sorted = keys.vec();
+  std::ranges::sort(sorted);
+  auto listed = [&](ByteView bytes) {
+    return std::ranges::binary_search(sorted, std::string_view{reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+  };
+  Builder b{mem};
+  if (auto r = b.open(c.object); !r.ok()) return r;
+  for (std::uint32_t i = 0; i < c.n; ++i) {
+    ByteView k;
+    ByteView v;
+    if (auto r = child_at(node, c, i, &k, v); !r.ok()) return r;
+    if (c.object) {
+      if (listed(k)) continue;
+      b.key(k);
+    } else if (std::to_integer<std::uint8_t>(v[0]) == kTagString && listed(v.subspan(1))) {
+      continue;
+    }
+    if (auto r = b.leaf(v, false); !r.ok()) return r;
+  }
+  b.close();
+  return b.finish(out, result);
+}
+
+auto delete_index(ByteView node, std::int64_t i, Memory mem, Alloc out, ByteView& result) -> Outcome {
+  result = node;
+  Type t{};
+  Container c;
+  if (auto r = container_of(node, t, c); !r.ok()) return r;
+  if (t == Type::Object) return invalid("cannot delete from object using integer index");
+  if (t != Type::Array) return invalid("cannot delete from scalar");
+  auto n = std::int64_t{c.n};
+  if (n == 0) return {};
+  if (i < 0) {
+    if (i < -n) return {};
+    i += n;
+  }
+  if (i >= n) return {};
+  Builder b{mem};
+  if (auto r = b.open(false); !r.ok()) return r;
+  if (auto r = copy_children(b, node, c, 0, c.n, static_cast<std::uint32_t>(i)); !r.ok()) return r;
+  b.close();
+  return b.finish(out, result);
+}
+
+auto delete_path(ByteView node, ByteView path, Memory mem, Alloc out, ByteView& result) -> Outcome {
+  result = node;
+  Type t{};
+  Container c;
+  if (auto r = path_target(node, path, "cannot delete path in scalar", t, c); !r.ok()) return r;
+  if (c.n == 0) return {};
+  return modify_path(node, path, std::nullopt, PathOp::Delete, mem, out, result);
+}
+
+auto set(ByteView node, ByteView path, ByteView value, bool create, Memory mem, Alloc out, ByteView& result) -> Outcome {
+  result = node;
+  Type t{};
+  Container c;
+  if (auto r = path_target(node, path, "cannot set path in scalar", t, c); !r.ok()) return r;
+  if (c.n == 0 && !create) return {};
+  return modify_path(node, path, value, create ? PathOp::Create : PathOp::Replace, mem, out, result);
+}
+
+auto insert(ByteView node, ByteView path, ByteView value, bool after, Memory mem, Alloc out, ByteView& result) -> Outcome {
+  result = node;
+  Type t{};
+  Container c;
+  if (auto r = path_target(node, path, "cannot set path in scalar", t, c); !r.ok()) return r;
+  return modify_path(node, path, value, after ? PathOp::InsertAfter : PathOp::InsertBefore, mem, out, result);
+}
+
+auto null_treatment(std::optional<std::string_view> text, NullTreatment& t) -> Outcome {
+  if (text == "raise_exception") {
+    t = NullTreatment::RaiseException;
+  } else if (text == "use_json_null") {
+    t = NullTreatment::UseJsonNull;
+  } else if (text == "delete_key") {
+    t = NullTreatment::DeleteKey;
+  } else if (text == "return_target") {
+    t = NullTreatment::ReturnTarget;
+  } else {
+    return invalid(R"(null_value_treatment must be "delete_key", "return_target", "use_json_null", or "raise_exception")");
+  }
+  return {};
+}
+
+auto null_value_error() -> Error {
+  return {kNullValueNotAllowed, "JSON value must not be null",
+          R"(Exception was raised because null_value_treatment is "raise_exception".)",
+          "To avoid, either change the null_value_treatment argument or ensure that an SQL NULL is not passed.", ""};
+}
+
+auto strip_nulls(ByteView node, Memory mem, Alloc out, ByteView& result) -> Outcome {
+  result = node;
+  Type t{};
+  Container root;
+  if (auto r = container_of(node, t, root); !r.ok()) return r;
+  if (t != Type::Array && t != Type::Object) return {};
+  struct Open {
+    ByteView v;
+    Container c;
+    std::uint32_t i{0};
+  };
+  Scratch<Open> stack{mem, Site::Stack};
+  Builder b{mem};
+  if (auto r = b.open(root.object); !r.ok()) return r;
+  if (!stack.push({node, root, 0})) return refused();
+  auto& frames = stack.vec();
+  while (!frames.empty()) {
+    auto& f = frames.back();
+    if (f.i == f.c.n) {
+      b.close();
+      frames.pop_back();
+      continue;
+    }
+    ByteView k;
+    ByteView v;
+    if (auto r = child_at(f.v, f.c, f.i++, &k, v); !r.ok()) return r;
+    auto tag = tag_of(v);
+    if (!tag) return corrupt("an empty node");
+    if (f.c.object) {
+      if (*tag == kTagNull) continue;
+      b.key(k);
+    }
+    if (!is_container_tag(*tag)) {
+      if (auto r = b.leaf(v, false); !r.ok()) return r;
+      continue;
+    }
+    Container c;
+    if (auto r = open_container(v, c); !r.ok()) return r;
+    if (auto r = b.open(c.object); !r.ok()) return r;
+    // f is not used after the push.
+    if (!stack.push({v, c, 0})) return refused();
+  }
+  return b.finish(out, result);
+}
+
+auto pretty(ByteView node, Memory mem, Alloc out, std::span<char>& text) -> Outcome {
+  CountSink count;
+  if (auto r = walk<true>(node, mem, count); !r.ok()) return r;
+  if (count.n > kMaxText) {
+    return data({kProgramLimitExceeded, "the text of a jsonb value would exceed 1073741823 bytes", "", "", ""});
+  }
+  auto* p = out.fn(out.self, static_cast<std::size_t>(count.n));
+  if (p == nullptr) return refused();
+  text = {reinterpret_cast<char*>(p), static_cast<std::size_t>(count.n)};
+  WriteSink sink{text};
+  auto r = walk<true>(node, mem, sink);
+  if (r.ok() && sink.at != text.size()) return corrupt("text shorter than its length");
+  return r;
+}
+
+auto scalar(Scalar kind, std::string_view text, Memory mem, Alloc out, ByteView& node) -> Outcome {
+  auto one = [&](std::uint8_t tag) -> Outcome {
+    auto* p = out.fn(out.self, 1);
+    if (p == nullptr) return refused();
+    p[0] = std::byte{tag};
+    node = {p, 1};
+    return {};
+  };
+  switch (kind) {
+    case Scalar::True: return one(kTagTrue);
+    case Scalar::False: return one(kTagFalse);
+    case Scalar::Number: {
+      // numeric_to_jsonb: a number when the text is a JSON number (numeric
+      // and float output always is, but for NaN and the infinities).
+      std::span<std::byte> value;
+      auto r = parse(text, mem, out, value);
+      if (r.ok()) {
+        auto n = node_of(value);
+        if (n && std::to_integer<std::uint8_t>((*n)[0]) == kTagNumber) {
+          node = *n;
+          return {};
+        }
+      } else if (r.status != Status::Data || r.error->state.view() != kInvalidTextRepresentation.view()) {
+        return r;
+      }
+      break;
+    }
+    case Scalar::String: break;
+  }
+  if (!utf8_valid(reinterpret_cast<const unsigned char*>(text.data()), text.size())) {
+    return data({kCharacterNotInRepertoire, "invalid byte sequence for encoding \"UTF8\"", "", "", ""});
+  }
+  if (text.size() >= kMaxBytes) return data(size_error(kTagString));
+  auto* p = out.fn(out.self, text.size() + 1);
+  if (p == nullptr) return refused();
+  p[0] = std::byte{kTagString};
+  if (!text.empty()) std::memcpy(p + 1, text.data(), text.size());
+  node = {p, text.size() + 1};
+  return {};
+}
+
+auto build_array(std::span<const BuildArg> args, Memory mem, Alloc out, ByteView& result) -> Outcome {
+  Builder b{mem};
+  if (auto r = b.open(false); !r.ok()) return r;
+  for (const auto& a : args) {
+    if (auto r = a.null ? b.leaf(kNullNode, false) : b.leaf(a.node, true); !r.ok()) return r;
+  }
+  b.close();
+  return b.finish(out, result);
+}
+
+auto build_object(std::span<const BuildArg> args, Memory mem, Alloc out, ByteView& result) -> Outcome {
+  if (args.size() % 2 != 0) {
+    return invalid("argument list must have even number of elements",
+                   "The arguments of jsonb_build_object() must consist of alternating keys and values.");
+  }
+  Builder b{mem};
+  if (auto r = b.open(true); !r.ok()) return r;
+  for (std::size_t i = 0; i < args.size(); i += 2) {
+    const auto& k = args[i];
+    if (k.null) return invalid("argument " + std::to_string(i + 1) + ": key must not be null");
+    if (k.composite) return invalid("key value must be scalar, not array, composite, or json");
+    auto tag = tag_of(k.node);
+    if (!tag) return corrupt("an empty node");
+    if (is_container_tag(*tag) || *tag == kTagNull) return invalid("key value must be scalar, not array, composite, or json");
+    switch (*tag) {
+      case kTagString: b.key(k.node.subspan(1)); break;
+      case kTagTrue: b.key(bytes_of("true")); break;
+      case kTagFalse: b.key(bytes_of("false")); break;
+      case kTagNumber:
+        if (auto r = b.key_number(k.node); !r.ok()) return r;
+        break;
+      default: return corrupt("an unknown tag");
+    }
+    const auto& v = args[i + 1];
+    if (auto r = v.null ? b.leaf(kNullNode, false) : b.leaf(v.node, true); !r.ok()) return r;
+  }
+  b.close();
+  return b.finish(out, result);
 }
 
 }  // namespace bytecask::sql::jsonb

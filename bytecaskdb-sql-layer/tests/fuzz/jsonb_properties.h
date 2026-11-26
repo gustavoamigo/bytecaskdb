@@ -9,7 +9,10 @@
 // - decode: any bytes, as a stored value and as a node, through the full
 //   check and the output writer, give a result or Corrupt, never undefined
 //   behaviour (run under ASan and UBSan); a value the full check accepts
-//   prints text that parses back to the same bytes.
+//   prints text that parses back to the same bytes; the walks of stage 4
+//   (containment, concatenation, a path's deletion, strip_nulls and
+//   jsonb_pretty) over the node give a result, a user error or Corrupt,
+//   and a node the full check accepts contains itself.
 // - parse: any text gives a value or one of jsonb_in's errors; the value
 //   passes the full check, and its text parses back to the same value.
 // Each returns false where a property breaks; the fuzz targets abort on it.
@@ -17,6 +20,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -36,6 +40,29 @@ inline auto round_trips(std::span<const std::byte> value) -> bool {
   return std::ranges::equal(again, value);
 }
 
+// A walk's outcome: a result, a user error (a depth or size bound, a
+// scalar refused) or Corrupt; never a refused charge, as nothing is charged.
+inline auto settled(const jb::Outcome& r) -> bool { return r.status != jb::Status::Refused; }
+
+// `valid`: the node passed the full check, and so contains itself.
+inline auto stage4_holds(std::span<const std::byte> node, bool valid, bool small) -> bool {
+  std::vector<std::byte> out;
+  std::span<const std::byte> r;
+  auto v = false;
+  static constexpr std::array<std::byte, 14> kPath{std::byte{2}, {}, {}, {}, std::byte{1}, {}, {}, {}, std::byte{'0'},
+                                                   std::byte{1}, {}, {}, {}, std::byte{'a'}};  // {0,a}
+  auto contained = jb::contains(node, node, {}, v);
+  if (!settled(contained) || (valid && !(contained.ok() && v))) return false;
+  if (!settled(jb::concat(node, node, {}, jb::vector_out(out), r))) return false;
+  if (!settled(jb::delete_path(node, kPath, {}, jb::vector_out(out), r))) return false;
+  if (!settled(jb::strip_nulls(node, {}, jb::vector_out(out), r))) return false;
+  if (small) {
+    std::span<char> text;
+    if (!settled(jb::pretty(node, {}, jb::vector_out(out), text))) return false;
+  }
+  return true;
+}
+
 inline auto decode_holds(std::span<const std::byte> bytes) -> bool {
   auto checked = jb::check_value(bytes, {});
   if (checked.status != jb::Status::Ok && checked.status != jb::Status::Corrupt) return false;
@@ -50,7 +77,7 @@ inline auto decode_holds(std::span<const std::byte> bytes) -> bool {
     std::string out(static_cast<std::size_t>(length), '\0');
     if (!jb::write_text(bytes, {}, std::span{out.data(), out.size()}).ok()) return false;
   }
-  return true;
+  return stage4_holds(bytes, counted.ok(), counted.ok() && length < (std::uint64_t{1} << 20));
 }
 
 inline auto parse_holds(std::string_view text) -> bool {

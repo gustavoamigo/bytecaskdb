@@ -508,6 +508,30 @@ def test_the_jsonb_accessors_describe_as_postgresql_17(server):
     assert states(run(c, "SELECT (v -> 'a')::int FROM jw")) == ["22023"]
 
 
+def test_the_jsonb_operators_and_functions_describe_as_postgresql_17(server):
+    """jsonb's stage-4 operators and functions (docs/jsonb_design.md):
+    jsonb_set's path $n is text[] (1009) and its value jsonb (3802), @>'s
+    right jsonb, ?'s text, ?|'s text[], -'s text; the results jsonb, boolean
+    or text, named by the function or ?column?, as PostgreSQL 17 describes
+    them; a runtime error sends its HINT."""
+    c = connect(server)
+    c.send(query("CREATE TABLE jw4 (k INTEGER PRIMARY KEY, v jsonb)"))
+    c.until_ready()
+    sql = ("SELECT jsonb_set(v, $1, $2), v @> $3, v ? $4, v ?| $5, v - $6, to_jsonb(k), jsonb_pretty(v), "
+           "jsonb_build_object('k', k) FROM jw4 WHERE v #- $1 IS NOT NULL")
+    c.send(parse(sql, "q"), describe("S", "q"), SYNC)
+    out = c.until_ready()
+    assert kinds(out) == b"1tTZ"
+    assert struct.unpack("!hiiiiii", out[1][1]) == (6, 1009, 3802, 3802, 25, 1009, 25)
+    assert row_description(out[2][1]) == [("jsonb_set", 3802), ("?column?", 16), ("?column?", 16), ("?column?", 16),
+                                          ("?column?", 3802), ("to_jsonb", 3802), ("jsonb_pretty", 25),
+                                          ("jsonb_build_object", 3802)]
+    assert states(run(c, "INSERT INTO jw4 VALUES (1, '{\"a\": [1, 2]}')")) == []
+    assert data(run(c, sql, ["{a,0}", "9", '{"a": [2]}', "a", "{b}", "a"])) == [
+        ['{"a": [9, 2]}', "t", "t", "f", "{}", "1", '{\n    "a": [\n        1,\n        2\n    ]\n}', '{"k": 1}']]
+    assert states(run(c, "SELECT jsonb_insert(v, '{a}', '1') FROM jw4")) == ["22023"]
+
+
 def test_a_cast_of_an_expression_is_described_and_named_as_postgresql_17(server):
     """A cast of any expression (#904 stage C1): described as its target
     type, numeric(5,2) with its typmod; $1::text::int describes $1 as text

@@ -152,25 +152,34 @@ TEST_CASE("embedded API jsonb: what stage 1 refuses, each with PostgreSQL's SQLS
            Refusal{"CREATE TABLE k1 (v jsonb PRIMARY KEY)", "0A000"},
            Refusal{"CREATE TABLE k2 (id INTEGER PRIMARY KEY, v jsonb UNIQUE)", "0A000"},
            Refusal{"CREATE INDEX j_v ON j (v)", "0A000"},
-           // Operators and functions: stage 4; json: stage 1c; a cast to a
-           // DECIMAL(p, s).
+           // jsonpath and SQL/JSON, json_build_*: json is stage 1c; a cast to
+           // a DECIMAL(p, s).
            Refusal{"SELECT v::numeric(10,2) FROM j", "0A000"},
            Refusal{"SELECT '1'::jsonb::numeric(10,2)", "0A000"},
-           Refusal{"SELECT v - 'a' FROM j", "0A000"},
-           Refusal{"SELECT v || '[1]' FROM j", "0A000"},
-           Refusal{"SELECT '[1]'::jsonb || '[2]'", "0A000"},
-           Refusal{"SELECT '[1]' || '{}'::jsonb", "0A000"},
-           Refusal{"SELECT '1'::jsonb || '2'::jsonb", "0A000"},
-           Refusal{"SELECT coalesce('[1]'::jsonb || '2', '0')", "0A000"},
            Refusal{"SELECT '\"a\"'::jsonb || 'b'", "22P02"},
-           Refusal{"SELECT '[1,2]'::jsonb - 1", "0A000"},
-           Refusal{"SELECT '[1,2]'::jsonb - 1::smallint", "0A000"},
-           Refusal{"SELECT '1'::jsonb - 'a'", "0A000"},
-           Refusal{"SELECT '1'::jsonb - 'a'::text", "0A000"},
-           Refusal{"SELECT id FROM j WHERE v @> '{}'", "0A000"},
-           Refusal{"SELECT id FROM j WHERE v ? 'a'", "0A000"},
-           Refusal{"SELECT to_jsonb(1)", "0A000"},
+           Refusal{"SELECT id FROM j WHERE v @? '$.a'", "0A000"},
+           Refusal{"SELECT id FROM j WHERE v @@ '$.a == 1'", "0A000"},
+           Refusal{"SELECT json_build_array(1)", "0A000"},
+           Refusal{"SELECT jsonb_path_query(v, '$') FROM j", "0A000"},
+           // Stage 4's own errors, as PostgreSQL's (docs/jsonb_design.md).
+           Refusal{"SELECT '1'::jsonb - 'a'", "22023"},
+           Refusal{"SELECT '1'::jsonb - 'a'::text", "22023"},
+           Refusal{"SELECT '{}' @> '{}'", "42725"},
+           Refusal{"SELECT '{}' ?| '{a}'", "42725"},
+           Refusal{"SELECT v @> 1 FROM j", "42883"},
+           Refusal{"SELECT v ? 1 FROM j", "42883"},
+           Refusal{"SELECT v ?& 'a'::text FROM j", "42883"},
+           Refusal{"SELECT jsonb_set(v, '{a}', 1) FROM j", "42883"},
+           Refusal{"SELECT to_jsonb('a')", "42804"},
+           Refusal{"SELECT to_jsonb($1)", "42804"},
+           Refusal{"SELECT jsonb_build_array($1)", "42P18"},
+           Refusal{"SELECT jsonb_build_object(1)", "22023"},
+           Refusal{"SELECT jsonb_set('{}', '{{a},{b}}', '1')", "2202E"},
+           Refusal{"SELECT jsonb_set('{\"a\":1}', '{a,NULL}', '1')", "22004"},
+           Refusal{"SELECT jsonb_insert('{\"a\":1}', '{a}', '1')", "22023"},
            Refusal{"SELECT v::varchar(3) FROM j", "42601"},
+           Refusal{"SELECT jsonb_set_lax(v, '{a}', NULL, null_value_treatment => 'delete_key') FROM j", "42601"},
+           Refusal{"SELECT jsonb_build_array(VARIADIC ARRAY[1,2])", "42601"},
            Refusal{"CREATE TABLE k3 (v json)", "0A000"},
            Refusal{"SELECT '1'::json", "0A000"},
            Refusal{"CREATE DOMAIN d AS jsonb", "0A000"},
@@ -284,4 +293,45 @@ TEST_CASE("embedded API jsonb: the accessors and casts out of columns, parameter
         Grid{{t("2"), t("5"), i(2)}});
   CHECK(state_of(*db, "SELECT (v -> 'a')::integer FROM j") == "22023");
   CHECK(state_of(*db, "SELECT v #> $1 FROM j", {t("a")}) == "22P02");
+}
+
+TEST_CASE("embedded API jsonb: containment, existence, modification and construction (stage 4)", "[sql][api][jsonb]") {
+  sql_test::TempDir dir{"api_jsonb_stage4"};
+  auto db = Database::open(dir.path());
+  db->execute("CREATE TABLE j (id INTEGER PRIMARY KEY, v jsonb, s TEXT, n INTEGER)");
+  db->execute(R"(INSERT INTO j VALUES (1, '{"a": 1, "b": [1, 2], "n": null}', 'a', 1), (2, '["a", 1, [2]]', 'b', 0), (3, NULL, NULL, NULL))");
+  // In WHERE and ON, evaluated filters; $n typed jsonb, text and text[].
+  const auto& q = db->prepare("SELECT id FROM j WHERE v @> $1 OR v ? $2 OR v ?& $3 ORDER BY id");
+  CHECK(q.param_types() == std::vector<PhysType>{PhysType::Jsonb, PhysType::Bytes, PhysType::Bytes});
+  CHECK(q.params()[2].path);
+  CHECK(db->execute(q, {t(R"({"b": [2]})"), t("z"), t("{z}")}).rows == Grid{{i(1)}});
+  CHECK(db->execute(q, {t("[[2]]"), t("a"), t("{}")}).rows == Grid{{i(1)}, {i(2)}});
+  CHECK(db->execute("SELECT x.id FROM j x JOIN j y ON x.v <@ y.v WHERE x.id <> y.id").rows.empty());
+  CHECK(db->execute("SELECT id FROM j WHERE NOT v ? s ORDER BY id").rows == Grid{{i(2)}});
+  // Modification of columns: what is not changed is copied.
+  CHECK(db->execute(R"(SELECT v || '{"c": 3}', v - 'a', v #- '{b,0}' FROM j WHERE id = 1)").rows ==
+        Grid{{t(R"({"a": 1, "b": [1, 2], "c": 3, "n": null})"), t(R"({"b": [1, 2], "n": null})"), t(R"({"a": 1, "b": [2], "n": null})")}});
+  CHECK(state_of(*db, "SELECT v - n FROM j WHERE id = 1") == "22023");
+  CHECK(db->execute("SELECT v - n, v - s FROM j WHERE id = 2").rows == Grid{{t(R"([1, [2]])"), t(R"(["a", 1, [2]])")}});
+  CHECK(db->execute("SELECT jsonb_set(v, '{b,-1}', to_jsonb(s)), jsonb_insert(v, '{b,0}', '0'), jsonb_strip_nulls(v) FROM j WHERE id = 1")
+            .rows == Grid{{t(R"({"a": 1, "b": [1, "a"], "n": null})"), t(R"({"a": 1, "b": [0, 1, 2], "n": null})"),
+                           t(R"({"a": 1, "b": [1, 2]})")}});
+  // UPDATE … SET of a function of the row, as Mattermost writes it.
+  db->execute("UPDATE j SET v = jsonb_set(v, $2, $3) WHERE id = $1", {i(1), t("{b,5}"), t("true")});
+  CHECK(db->execute("SELECT v FROM j WHERE id = 1").rows == Grid{{t(R"({"a": 1, "b": [1, 2, true], "n": null})")}});
+  db->execute("UPDATE j SET v = v || $2 WHERE id = $1 AND NOT v ? $3", {i(2), t(R"(["c"])"), t("c")});
+  db->execute("UPDATE j SET v = v || $2 WHERE id = $1 AND NOT v ? $3", {i(2), t(R"(["c"])"), t("c")});
+  CHECK(db->execute("SELECT v FROM j WHERE id = 2").rows == Grid{{t(R"(["a", 1, [2], "c"])")}});
+  // Construction: to_jsonb of each argument, SQL NULL a JSON null in a build.
+  CHECK(db->execute("SELECT jsonb_build_object(s, n, 'v', v), jsonb_build_array(n, s, NULL), to_jsonb(n) FROM j WHERE id < 3 ORDER BY id")
+            .rows == Grid{{t(R"({"a": 1, "v": {"a": 1, "b": [1, 2, true], "n": null}})"), t(R"([1, "a", null])"), t("1")},
+                          {t(R"({"b": 0, "v": ["a", 1, [2], "c"]})"), t(R"([0, "b", null])"), t("0")}});
+  CHECK(db->execute("SELECT jsonb_build_array(n, s), to_jsonb(n), jsonb_set(v, '{a}', '1') FROM j WHERE id = 3").rows ==
+        Grid{{t("[null, null]"), kNull, kNull}});
+  CHECK(state_of(*db, "SELECT jsonb_build_object(s, 1) FROM j") == "22023");
+  CHECK(db->execute("SELECT jsonb_pretty(v) FROM j WHERE id = 2").rows == Grid{{t("[\n    \"a\",\n    1,\n    [\n        2\n    ],\n    \"c\"\n]")}});
+  // Constants are folded at prepare, their errors the statement's.
+  CHECK(db->execute(R"(SELECT '{"a":1}'::jsonb @> '{}', '["x"]'::jsonb ? 'x', '{"a":1}' || '[2]'::jsonb, jsonb_build_object(1.5, true))").rows ==
+        Grid{{true, true, t(R"([{"a": 1}, 2])"), t(R"({"1.5": true})")}});
+  CHECK(state_of(*db, R"(SELECT jsonb_set_lax('{"a":1}', '{a}', NULL, true, 'raise_exception'))") == "22004");
 }

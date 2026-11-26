@@ -1082,36 +1082,84 @@ private:
   // A jsonb accessor or function: its operands as codegen prints them.
   void jsonb_value(const Expr& e) const {
     using J = Expr::Jsonb;
-    auto first_jsonb = !e.args.empty() && e.args[0].phys() == PhysType::Jsonb;
+    auto n = e.args.size();
+    auto is = [&](std::size_t i, PhysType t) { return n > i && e.args[i].phys() == t; };
+    // A path: a folded one's parameter, or PathIn or PathArray.
+    auto path = [&](std::size_t i) {
+      if (!is(i, PhysType::Bytes)) return false;
+      const auto& p = e.args[i];
+      return p.kind == Expr::Kind::Param || (p.kind == Expr::Kind::Jsonb && (p.jsonb == J::PathIn || p.jsonb == J::PathArray));
+    };
+    // A value to_jsonb converts: any type but CHAR(n), whose padded text no
+    // value holds.
+    auto convertible = [](const Expr& a) { return a.type.kind != SqlKind::Char; };
     auto ok = false;
+    auto result = PhysType::Jsonb;
     switch (e.jsonb) {
       case J::Field:
-      case J::FieldText:
-        ok = e.args.size() == 2 && first_jsonb && e.args[1].phys() == PhysType::Bytes;
-        break;
+      case J::FieldText: ok = n == 2 && is(0, PhysType::Jsonb) && is(1, PhysType::Bytes); break;
       case J::Element:
-      case J::ElementText:
-        ok = e.args.size() == 2 && first_jsonb && e.args[1].phys() == PhysType::I64;
-        break;
+      case J::ElementText: ok = n == 2 && is(0, PhysType::Jsonb) && is(1, PhysType::I64); break;
       case J::Path:
-      case J::PathText: {
-        // A path: a folded one's parameter, or PathIn or PathArray.
-        const auto& p = e.args.size() == 2 ? e.args[1] : e.args[0];
-        ok = e.args.size() == 2 && first_jsonb && p.phys() == PhysType::Bytes &&
-             (p.kind == Expr::Kind::Param || (p.kind == Expr::Kind::Jsonb && (p.jsonb == J::PathIn || p.jsonb == J::PathArray)));
-        break;
-      }
+      case J::PathText: ok = n == 2 && is(0, PhysType::Jsonb) && path(1); break;
       case J::Typeof:
-      case J::ArrayLength: ok = e.args.size() == 1 && first_jsonb; break;
-      case J::PathIn: ok = e.args.size() == 1 && e.args[0].phys() == PhysType::Bytes; break;
+      case J::ArrayLength:
+      case J::StripNulls:
+      case J::Pretty: ok = n == 1 && is(0, PhysType::Jsonb); break;
+      case J::PathIn: ok = n == 1 && is(0, PhysType::Bytes); break;
       case J::PathArray:
-        ok = !e.args.empty() && std::ranges::all_of(e.args, [](const Expr& a) { return a.phys() == PhysType::Bytes; });
+        ok = n > 0 && std::ranges::all_of(e.args, [](const Expr& a) { return a.phys() == PhysType::Bytes; });
         break;
+      case J::Contains:
+      case J::Concat: ok = n == 2 && is(0, PhysType::Jsonb) && is(1, PhysType::Jsonb); break;
+      case J::Exists:
+      case J::DeleteKey: ok = n == 2 && is(0, PhysType::Jsonb) && is(1, PhysType::Bytes); break;
+      case J::DeleteIndex: ok = n == 2 && is(0, PhysType::Jsonb) && is(1, PhysType::I64); break;
+      case J::ExistsAny:
+      case J::ExistsAll:
+      case J::DeleteKeys:
+      case J::DeletePath: ok = n == 2 && is(0, PhysType::Jsonb) && path(1); break;
+      case J::Set:
+      case J::Insert:
+        ok = (n == 3 || (n == 4 && is(3, PhysType::Bool))) && is(0, PhysType::Jsonb) && path(1) && is(2, PhysType::Jsonb);
+        break;
+      case J::SetLax:
+        ok = n == 5 && is(0, PhysType::Jsonb) && path(1) && is(2, PhysType::Jsonb) && is(3, PhysType::Bool) && is(4, PhysType::Bytes);
+        break;
+      case J::ToJsonb: ok = n == 1 && convertible(e.args[0]); break;
+      case J::BuildArray:
+      case J::BuildObject: ok = n <= 100 && std::ranges::all_of(e.args, convertible); break;
     }
-    auto text = e.jsonb == J::FieldText || e.jsonb == J::ElementText || e.jsonb == J::PathText || e.jsonb == J::Typeof ||
-                e.jsonb == J::PathIn || e.jsonb == J::PathArray;
-    auto type_ok = e.jsonb == J::ArrayLength ? e.phys() == PhysType::I64 : text ? e.phys() == PhysType::Bytes : e.phys() == PhysType::Jsonb;
-    if (!ok || !type_ok) broken("a jsonb accessor of operands codegen does not print");
+    switch (e.jsonb) {
+      case J::FieldText:
+      case J::ElementText:
+      case J::PathText:
+      case J::Typeof:
+      case J::PathIn:
+      case J::PathArray:
+      case J::Pretty: result = PhysType::Bytes; break;
+      case J::ArrayLength: result = PhysType::I64; break;
+      case J::Contains:
+      case J::Exists:
+      case J::ExistsAny:
+      case J::ExistsAll: result = PhysType::Bool; break;
+      case J::Field:
+      case J::Element:
+      case J::Path:
+      case J::Concat:
+      case J::DeleteKey:
+      case J::DeleteIndex:
+      case J::DeleteKeys:
+      case J::DeletePath:
+      case J::Set:
+      case J::SetLax:
+      case J::Insert:
+      case J::StripNulls:
+      case J::ToJsonb:
+      case J::BuildArray:
+      case J::BuildObject: result = PhysType::Jsonb; break;
+    }
+    if (!ok || e.phys() != result) broken("a jsonb accessor or function of operands codegen does not print");
   }
 
   // IN of a subquery: of a column of its subquery's set's type.

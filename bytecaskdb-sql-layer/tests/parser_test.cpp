@@ -1121,3 +1121,17 @@ TEST_CASE("parser: a qualified type name other than pg_catalog's is refused", "[
   auto s = std::get<Select>(parse("SELECT 1::pg_catalog.int8"));
   CHECK(s.targets[0].cast_type == "int8");
 }
+
+TEST_CASE("parser: a named argument of a plain function is refused by name (42601)", "[sql][parser][jsonb]") {
+  auto error_of = [](const char* sql) {
+    try {
+      (void)parse(sql);
+    } catch (const SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what();
+    }
+    return std::string{"parsed"};
+  };
+  CHECK(error_of("SELECT jsonb_set_lax(j, '{a}', NULL, null_value_treatment => 'delete_key') FROM t") ==
+        "42601 named arguments of function jsonb_set_lax are not supported yet");
+  CHECK(error_of("SELECT jsonb_build_array(VARIADIC ARRAY[1,2])") == "42601 function jsonb_build_array takes plain arguments");
+}

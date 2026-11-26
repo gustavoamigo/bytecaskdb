@@ -320,6 +320,7 @@ auto sql_type(const ast::ColumnDefAst& c) -> SqlType {
 
 // A cast's type, as a column definition names one.
 auto cast_def(const ast::Expr& e) -> ast::ColumnDefAst {
+  if (e.cast_type == "text[]") throw SqlError{"a text[] other than as a jsonb path is not supported yet", e.pos};
   ast::ColumnDefAst c{"", e.cast_type, e.cast_typmods, false, false, std::nullopt, e.pos, {}};
   c.type_schema = e.cast_schema;
   return c;
@@ -1012,17 +1013,10 @@ auto operand_type_name(const Constant& c) -> std::string { return c.unknown ? "u
 // as PostgreSQL resolves it.
 auto arithmetic(const Constant& x, const Constant& y, Arith op, std::int32_t pos) -> Constant {
   auto text = std::string{arith_text(op)};
-  // PostgreSQL's one arithmetic operator of jsonb is jsonb - text and jsonb
-  // - integer (an unknown literal resolved as text, a smallint widened):
-  // not built until stage 3. Every other pair has no operator (42883).
-  if (is_jsonb(x) || is_jsonb(y)) {
-    auto key = [](const Constant& c) {
-      return c.unknown || c.type.kind == SqlKind::Integer || c.type.kind == SqlKind::SmallInt ||
-             type_class(c.type.kind) == TypeClass::String;
-    };
-    if (op == Arith::Sub && is_jsonb(x) && key(y)) refuse_uncompared(SqlKind::Jsonb, "- of a jsonb", pos);
-    no_operator(x, text, y, pos);
-  }
+  // PostgreSQL's one arithmetic operator of jsonb is jsonb - text, integer
+  // or text[], which fold() takes before this. Every other pair has no
+  // operator (42883).
+  if (is_jsonb(x) || is_jsonb(y)) no_operator(x, text, y, pos);
   auto null_untyped = [](const Constant& c) { return c.unknown && std::holds_alternative<std::monostate>(c.value); };
   if (null_untyped(x) && null_untyped(y)) not_yet("NULL " + text + " NULL", pos);
   // Two string literals: every operator of the name takes them (j -> 'a' -
@@ -1705,14 +1699,18 @@ auto int_of(const Constant& c) -> std::int32_t { return static_cast<std::int32_t
 // a || b: text with text, or with any other type through its text (so 'a' ||
 // 1 is 'a1'); bytea with bytea. Two values neither of which is a string
 // match no operator.
+auto fold_jsonb_concat(const Constant& a, const Constant& b, std::int32_t pos) -> Constant;
+
 auto fold_concat(const Constant& a, const Constant& b, std::int32_t pos) -> Constant {
   // jsonb || jsonb, an unknown literal beside a jsonb read as one (its 22P02
-  // first, as PostgreSQL): jsonb's operator, not built until stage 3. A
-  // jsonb with a typed string is text concatenation, below.
+  // first, as PostgreSQL): jsonb's concatenation (stage 4). A jsonb with a
+  // typed string is text concatenation, below; with anything else, 42883.
   if (is_jsonb(a) || is_jsonb(b)) {
     const auto& other = is_jsonb(a) ? b : a;
-    if (other.unknown) (void)resolved(other, SqlType{SqlKind::Jsonb});
-    if (other.unknown || is_jsonb(other)) refuse_uncompared(SqlKind::Jsonb, "|| of a jsonb", pos);
+    if (other.unknown || is_jsonb(other)) {
+      return fold_jsonb_concat(a, b, pos);
+    }
+    if (!is_string(other.type)) no_operator(a, "||", b, pos);
   }
   auto is_bytea = [](const Constant& c) { return !c.unknown && c.type.kind == SqlKind::Bytea; };
   if (is_bytea(a) && is_bytea(b)) {
@@ -2082,10 +2080,398 @@ auto cast_jsonb_out(const Constant& arg, SqlType t, std::int32_t pos) -> std::op
   return result(Bytes(text.begin(), text.end()));
 }
 
+// ------------------------- jsonb operators and functions of stage 4
+//
+// docs/jsonb_design.md, stage 4. One resolution, jsonb_signature, reads the
+// operands as PostgreSQL's operator and function resolution does and names
+// what each is read as; constants fold here through sql/jsonb.cppm, and a
+// value only run time gives is bound by the Binder's jsonb_call.
+
+auto is_jsonb_operator4(std::string_view op) -> bool {
+  return op == "@>" || op == "<@" || op == "?" || op == "?|" || op == "?&" || op == "#-";
+}
+
+auto is_jsonb_function4(std::string_view name) -> bool {
+  return name == "jsonb_set" || name == "jsonb_set_lax" || name == "jsonb_insert" || name == "jsonb_strip_nulls" ||
+         name == "jsonb_pretty" || name == "to_jsonb" || name == "jsonb_build_array" || name == "jsonb_build_object" ||
+         name == "jsonb_extract_path" || name == "jsonb_extract_path_text";
+}
+
+// An operator's name in an expression: its column is ?column?.
+auto is_operator_name(std::string_view f) -> bool { return f == "||" || f == "%" || is_jsonb_accessor(f) || is_jsonb_operator4(f); }
+
+// What an argument is read as: a jsonb, a text, a path (text[]), a
+// BOOLEAN, an integer, or any type to_jsonb converts.
+enum class JKind : std::uint8_t { Jsonb, Text, Path, Bool, Int, Any };
+
+// An argument as resolution sees it: a $n or an unknown literal is
+// untyped; ARRAY[…] a text[] when its elements are text.
+struct JArg {
+  bool untyped{false};
+  bool param{false};
+  bool array{false};
+  bool array_text{false};
+  SqlType type{};
+  std::string name;  // its type's name in a message: "unknown" untyped, "text[]" for ARRAY of text
+  std::uint32_t number{0};  // a $n's number
+};
+
+struct JSig {
+  std::vector<JKind> kinds;
+  logical::Expr::Jsonb fn{logical::Expr::Jsonb::Contains};
+  SqlType result{};
+  bool swap{false};  // <@: @> of the operands swapped
+};
+
+auto jarg_of(const Constant& c) -> JArg {
+  JArg a;
+  a.untyped = c.unknown;
+  a.type = c.type;
+  a.name = operand_type_name(c);
+  return a;
+}
+
+// The resolution of a stage-4 operator (`op`) or function over its
+// arguments, as PostgreSQL 17 resolves it: 42725 for two untyped operands
+// of an operator with other candidates, 42883 for types it has no operator
+// or function for, 42804 for to_jsonb of an unknown, 42P18 for a $n of a
+// build function, 54023 past 100 arguments.
+auto jsonb_signature(const std::string& name, bool op, const std::vector<JArg>& a, std::int32_t pos) -> JSig {
+  using J = logical::Expr::Jsonb;
+  auto n = a.size();
+  auto typed = [&](std::size_t i, SqlKind k) { return !a[i].untyped && !a[i].array && a[i].type.kind == k; };
+  auto jsonb_ok = [&](std::size_t i) { return a[i].untyped || typed(i, SqlKind::Jsonb); };
+  auto text_ok = [&](std::size_t i) { return a[i].untyped || (!a[i].array && holds_string(a[i].type)); };
+  auto path_ok = [&](std::size_t i) { return a[i].untyped || (a[i].array && a[i].array_text); };
+  auto bool_ok = [&](std::size_t i) { return a[i].untyped || typed(i, SqlKind::Boolean); };
+  auto boolean = SqlType{SqlKind::Boolean};
+  auto jsonb = SqlType{SqlKind::Jsonb};
+  if (op) {
+    auto missing = [&] [[noreturn]] { missing_operator(a[0].name, name, a[1].name, pos); };
+    auto both_untyped = a[0].untyped && a[1].untyped;
+    if (name == "@>" || name == "<@") {
+      if (both_untyped) ambiguous_operator(a[0].name, name, a[1].name, pos);
+      if (!jsonb_ok(0) || !jsonb_ok(1)) missing();
+      return {{JKind::Jsonb, JKind::Jsonb}, J::Contains, boolean, name == "<@"};
+    }
+    if (name == "?") {
+      if (!jsonb_ok(0) || !text_ok(1)) missing();
+      return {{JKind::Jsonb, JKind::Text}, J::Exists, boolean, false};
+    }
+    if (name == "?|" || name == "?&") {
+      if (name == "?|" && both_untyped) ambiguous_operator(a[0].name, name, a[1].name, pos);
+      if (!jsonb_ok(0) || !path_ok(1)) missing();
+      return {{JKind::Jsonb, JKind::Path}, name == "?|" ? J::ExistsAny : J::ExistsAll, boolean, false};
+    }
+    if (name == "#-") {
+      if (!jsonb_ok(0) || !path_ok(1)) missing();
+      return {{JKind::Jsonb, JKind::Path}, J::DeletePath, jsonb, false};
+    }
+    if (name == "-") {
+      if (!typed(0, SqlKind::Jsonb)) missing();
+      if (a[1].array) {
+        if (!a[1].array_text) missing();
+        return {{JKind::Jsonb, JKind::Path}, J::DeleteKeys, jsonb, false};
+      }
+      if (text_ok(1)) return {{JKind::Jsonb, JKind::Text}, J::DeleteKey, jsonb, false};
+      if (typed(1, SqlKind::SmallInt) || typed(1, SqlKind::Integer)) return {{JKind::Jsonb, JKind::Int}, J::DeleteIndex, jsonb, false};
+      missing();
+    }
+    // ||: jsonb's when neither side is typed other than jsonb.
+    if (!jsonb_ok(0) || !jsonb_ok(1)) missing();
+    return {{JKind::Jsonb, JKind::Jsonb}, J::Concat, jsonb, false};
+  }
+  auto missing = [&] [[noreturn]] {
+    std::string list;
+    for (const auto& x : a) list += (list.empty() ? "" : ", ") + x.name;
+    throw SqlError{"function " + name + "(" + list + ") does not exist", pos, kUndefinedFunction}.with_notes(
+        "", "No function matches the given name and argument types. You might need to add explicit type casts.");
+  };
+  if (n > 100) throw SqlError{"cannot pass more than 100 arguments to a function", pos, kTooManyArguments};
+  if (name == "jsonb_set" || name == "jsonb_insert" || name == "jsonb_set_lax") {
+    auto most = name == "jsonb_set_lax" ? std::size_t{5} : std::size_t{4};
+    if (n < 3 || n > most || !jsonb_ok(0) || !path_ok(1) || !jsonb_ok(2) || (n > 3 && !bool_ok(3)) || (n > 4 && !text_ok(4))) missing();
+    std::vector<JKind> kinds{JKind::Jsonb, JKind::Path, JKind::Jsonb, JKind::Bool, JKind::Text};
+    kinds.resize(n);
+    return {kinds, name == "jsonb_set" ? J::Set : name == "jsonb_insert" ? J::Insert : J::SetLax, jsonb, false};
+  }
+  if (name == "jsonb_strip_nulls" || name == "jsonb_pretty") {
+    if (n != 1 || !jsonb_ok(0)) missing();
+    if (name == "jsonb_pretty") return {{JKind::Jsonb}, J::Pretty, SqlType{SqlKind::Text}, false};
+    return {{JKind::Jsonb}, J::StripNulls, jsonb, false};
+  }
+  if (name == "jsonb_extract_path" || name == "jsonb_extract_path_text") {
+    if (n < 2 || !jsonb_ok(0)) missing();
+    std::vector<JKind> kinds{JKind::Jsonb};
+    for (std::size_t i = 1; i < n; ++i) {
+      if (!text_ok(i)) missing();
+      kinds.push_back(JKind::Text);
+    }
+    auto as_text = name == "jsonb_extract_path_text";
+    return {kinds, as_text ? J::PathText : J::Path, SqlType{as_text ? SqlKind::Text : SqlKind::Jsonb}, false};
+  }
+  // to_jsonb and the build functions: any type to_jsonb converts.
+  std::vector<JKind> kinds;
+  for (const auto& x : a) {
+    if (x.array) not_yet("an ARRAY other than as a jsonb path", pos);
+    if (name == "to_jsonb" && x.untyped) {
+      throw SqlError{"could not determine polymorphic type because input has type unknown", pos, kDatatypeMismatch};
+    }
+    if (x.param) throw SqlError{"could not determine data type of parameter $" + std::to_string(x.number + 1), pos, kIndeterminateDatatype};
+    if (!x.untyped && x.type.kind == SqlKind::Char) not_supported(name + " of a character(n) value", pos);
+    kinds.push_back(x.untyped ? JKind::Text : JKind::Any);
+  }
+  if (name == "to_jsonb") {
+    if (n != 1) missing();
+    return {kinds, J::ToJsonb, jsonb, false};
+  }
+  return {kinds, name == "jsonb_build_array" ? J::BuildArray : J::BuildObject, jsonb, false};
+}
+
+// One argument of a folded call: its constant, or ARRAY[…]'s path.
+struct FoldArg {
+  JArg desc;
+  Constant c;
+  std::optional<Bytes> path;
+};
+
+// x::text[] of a string literal or NULL: a path, as array_in reads it.
+auto is_text_array_cast(const ast::Expr& a) -> bool { return a.kind == ast::Expr::Kind::Cast && a.cast_type == "text[]"; }
+
+// x::numeric of a number or a string literal, as an argument of a jsonb
+// function: a NUMERIC of no precision, which no other place casts to yet
+// (to_jsonb(1.50::numeric) is 1.50, to_jsonb('NaN'::numeric) "NaN").
+auto numeric_cast_constant(const ast::Expr& a) -> std::optional<Constant> {
+  if (a.kind != ast::Expr::Kind::Cast || a.cast_type != "numeric" || !a.cast_typmods.empty() || !a.cast_schema.empty() ||
+      !is_constant(*a.rhs)) {
+    return std::nullopt;
+  }
+  auto c = fold(*a.rhs);
+  if (is_null(c)) return null_constant(SqlKind::Numeric, a.pos);
+  if (!c.unknown && !is_number(c.type)) return std::nullopt;
+  return Constant{numeric_bytes(c.unknown ? c.text : text_of(c), a.pos), SqlType{SqlKind::Numeric}, false, {}, a.pos};
+}
+
+auto fold_arg(const ast::Expr& a) -> FoldArg {
+  if (is_text_array_cast(a)) {
+    auto inner = fold(*a.rhs);
+    if (!inner.unknown) not_yet("a cast of a typed value to text[]", a.pos);
+    FoldArg f;
+    f.desc.array = true;
+    f.desc.array_text = true;
+    f.desc.name = "text[]";
+    f.c = inner;
+    if (!is_null(inner)) f.path = path_literal(inner);
+    return f;
+  }
+  if (a.kind == ast::Expr::Kind::Func && a.func == "array") {
+    if (a.args.empty()) empty_array(a.pos);
+    std::string bad;
+    FoldArg f;
+    f.path = path_of_array(a, bad);
+    f.desc.array = true;
+    f.desc.array_text = f.path.has_value();
+    f.desc.name = f.path ? "text[]" : bad;
+    f.c = null_constant(SqlKind::Text, a.pos);
+    return f;
+  }
+  auto numeric = numeric_cast_constant(a);
+  auto c = numeric ? *numeric : fold(a);
+  return {jarg_of(c), c, std::nullopt};
+}
+
+// A built or modified node as its constant: its canonical text.
+auto jsonb_result(jsonb::ByteView node, std::int32_t pos) -> Constant {
+  std::string text;
+  if (auto r = jsonb::node_text(node, text); !r.ok()) throw jsonb_error(r, pos);
+  return {bytes_of(text), SqlType{SqlKind::Jsonb}, false, {}, pos};
+}
+
+// to_jsonb's node of a constant, not NULL, into `store`; `key`: an object's.
+auto jsonb_node_of(const Constant& c, bool key, std::vector<std::byte>& store) -> jsonb::ByteView {
+  if (c.type.kind == SqlKind::Jsonb) return jsonb_value_of(c, store);
+  jsonb::ByteView node;
+  jsonb::Outcome r;
+  if (holds_string(c.type)) {
+    r = jsonb::scalar(jsonb::Scalar::String, text_of(c), {}, jsonb::vector_out(store), node);
+  } else {
+    auto s = jsonb_scalar_text(c.value, c.type, key);
+    r = jsonb::scalar(s.kind, s.text, {}, jsonb::vector_out(store), node);
+  }
+  if (!r.ok()) throw jsonb_error(r, c.pos);
+  return node;
+}
+
+// A stage-4 call of constants, folded at prepare as PostgreSQL's planner
+// folds it: its errors are the statement's.
+auto fold_jsonb_call(const std::string& name, bool op, std::vector<FoldArg> args, std::int32_t pos) -> Constant {
+  using J = logical::Expr::Jsonb;
+  std::vector<JArg> descs;
+  for (const auto& a : args) descs.push_back(a.desc);
+  auto sig = jsonb_signature(name, op, descs, pos);
+  if (sig.swap) std::swap(args[0], args[1]);
+  auto n = args.size();
+  // Each argument read as its kind; a path as its bytes.
+  std::vector<std::optional<Bytes>> paths(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    auto& c = args[i].c;
+    auto null = is_null(c);
+    switch (sig.kinds[i]) {
+      case JKind::Jsonb:
+        if (c.unknown) c = resolved(c, SqlType{SqlKind::Jsonb});
+        break;
+      case JKind::Text:
+        if (c.unknown) c = null ? null_constant(SqlKind::Text, c.pos) : resolved(c, SqlType{SqlKind::Text});
+        break;
+      case JKind::Bool:
+        if (c.unknown) c = resolved(c, SqlType{SqlKind::Boolean});
+        break;
+      case JKind::Path:
+        if (args[i].path) {
+          paths[i] = args[i].path;
+          c = {Datum{*args[i].path}, SqlType{SqlKind::Text}, false, {}, c.pos};
+        } else if (!null) {
+          paths[i] = path_literal(c);
+          c = {Datum{*paths[i]}, SqlType{SqlKind::Text}, false, {}, c.pos};
+        }
+        break;
+      case JKind::Int:
+      case JKind::Any: break;
+    }
+  }
+  auto result_null = [&] { return null_constant(sig.result.kind, pos); };
+  std::vector<std::vector<std::byte>> store(n);
+  auto node = [&](std::size_t i) { return jsonb_value_of(args[i].c, store[i]); };
+  auto path = [&](std::size_t i) { return jsonb::ByteView{*paths[i]}; };
+  auto text = [&](std::size_t i) { return text_of(args[i].c); };
+  std::vector<std::byte> out;
+  jsonb::ByteView result;
+  auto check = [&](const jsonb::Outcome& r) {
+    if (!r.ok()) throw jsonb_error(r, pos);
+  };
+  auto boolean = [&](bool v) -> Constant { return {v, SqlType{SqlKind::Boolean}, false, {}, pos}; };
+  auto strict = sig.fn != J::SetLax && sig.fn != J::BuildArray && sig.fn != J::BuildObject;
+  if (strict && std::ranges::any_of(args, [](const FoldArg& a) { return is_null(a.c); })) return result_null();
+  switch (sig.fn) {
+    case J::Contains: {
+      auto v = false;
+      check(jsonb::contains(node(0), node(1), {}, v));
+      return boolean(v);
+    }
+    case J::Exists: {
+      auto v = false;
+      check(jsonb::exists(node(0), text(1), v));
+      return boolean(v);
+    }
+    case J::ExistsAny:
+    case J::ExistsAll: {
+      auto v = false;
+      check(jsonb::exists_some(node(0), path(1), sig.fn == J::ExistsAll, v));
+      return boolean(v);
+    }
+    case J::Concat: check(jsonb::concat(node(0), node(1), {}, jsonb::vector_out(out), result)); break;
+    case J::DeleteKey: check(jsonb::delete_key(node(0), text(1), {}, jsonb::vector_out(out), result)); break;
+    case J::DeleteIndex:
+      check(jsonb::delete_index(node(0), std::get<std::int64_t>(args[1].c.value), {}, jsonb::vector_out(out), result));
+      break;
+    case J::DeleteKeys: check(jsonb::delete_keys(node(0), path(1), {}, jsonb::vector_out(out), result)); break;
+    case J::DeletePath: check(jsonb::delete_path(node(0), path(1), {}, jsonb::vector_out(out), result)); break;
+    case J::Set:
+    case J::Insert: {
+      auto flag = n > 3 ? std::get<bool>(args[3].c.value) : sig.fn == J::Set;
+      if (sig.fn == J::Set) {
+        check(jsonb::set(node(0), path(1), node(2), flag, {}, jsonb::vector_out(out), result));
+      } else {
+        check(jsonb::insert(node(0), path(1), node(2), flag, {}, jsonb::vector_out(out), result));
+      }
+      break;
+    }
+    case J::SetLax: {
+      auto create = n > 3 ? args[3].c : Constant{true, SqlType{SqlKind::Boolean}, false, {}, pos};
+      if (is_null(args[0].c) || is_null(args[1].c) || is_null(create)) return result_null();
+      std::optional<std::string> how = n > 4 ? (is_null(args[4].c) ? std::nullopt : std::optional{text(4)}) : std::optional{std::string{"use_json_null"}};
+      jsonb::NullTreatment mode{};
+      if (!how) check(jsonb::null_treatment(std::nullopt, mode));
+      if (!is_null(args[2].c)) {
+        check(jsonb::set(node(0), path(1), node(2), std::get<bool>(create.value), {}, jsonb::vector_out(out), result));
+        break;
+      }
+      check(jsonb::null_treatment(*how, mode));
+      switch (mode) {
+        case jsonb::NullTreatment::RaiseException: {
+          auto e = jsonb::null_value_error();
+          throw SqlError{e.message, pos, e.state}.with_notes(e.detail, e.hint);
+        }
+        case jsonb::NullTreatment::UseJsonNull: {
+          static constexpr std::array<std::byte, 1> kNull{std::byte{0x01}};
+          check(jsonb::set(node(0), path(1), kNull, std::get<bool>(create.value), {}, jsonb::vector_out(out), result));
+          break;
+        }
+        case jsonb::NullTreatment::DeleteKey: check(jsonb::delete_path(node(0), path(1), {}, jsonb::vector_out(out), result)); break;
+        case jsonb::NullTreatment::ReturnTarget: return args[0].c;
+      }
+      break;
+    }
+    case J::StripNulls: check(jsonb::strip_nulls(node(0), {}, jsonb::vector_out(out), result)); break;
+    case J::Pretty: {
+      std::span<char> t;
+      check(jsonb::pretty(node(0), {}, jsonb::vector_out(out), t));
+      return text_constant(std::string{t.data(), t.size()}, pos);
+    }
+    case J::Path:
+    case J::PathText: {
+      Bytes p;
+      for (std::size_t i = 1; i < n; ++i) path_append(p, is_null(args[i].c) ? std::nullopt : std::optional{text(i)});
+      std::optional<jsonb::ByteView> found;
+      check(jsonb::at_path(node(0), p, found));
+      return jsonb_found(found, sig.fn == J::PathText, pos);
+    }
+    case J::ToJsonb: return jsonb_result(jsonb_node_of(args[0].c, false, store[0]), pos);
+    case J::BuildArray:
+    case J::BuildObject: {
+      std::vector<jsonb::BuildArg> built(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        built[i].null = is_null(args[i].c);
+        auto key = sig.fn == J::BuildObject && i % 2 == 0;
+        built[i].composite = key && args[i].c.type.kind == SqlKind::Jsonb;
+        if (!built[i].null && !built[i].composite) built[i].node = jsonb_node_of(args[i].c, key, store[i]);
+      }
+      if (sig.fn == J::BuildArray) {
+        check(jsonb::build_array(built, {}, jsonb::vector_out(out), result));
+      } else {
+        check(jsonb::build_object(built, {}, jsonb::vector_out(out), result));
+      }
+      break;
+    }
+    case J::Field:
+    case J::FieldText:
+    case J::Element:
+    case J::ElementText:
+    case J::Typeof:
+    case J::ArrayLength:
+    case J::PathIn:
+    case J::PathArray: throw std::logic_error{"a stage-4 jsonb call of an accessor's kind"};
+  }
+  return jsonb_result(result, pos);
+}
+
+// a || b of jsonb constants (or an unknown literal beside one).
+auto fold_jsonb_concat(const Constant& a, const Constant& b, std::int32_t pos) -> Constant {
+  std::vector<FoldArg> args;
+  args.push_back({jarg_of(a), a, std::nullopt});
+  args.push_back({jarg_of(b), b, std::nullopt});
+  return fold_jsonb_call("||", true, std::move(args), pos);
+}
+
 auto fold_function(const ast::Expr& e) -> Constant {
   if (is_jsonb_accessor(e.func)) return fold_jsonb_accessor(e);
   if (e.func == "jsonb_typeof" || e.func == "jsonb_array_length") return fold_jsonb_function(e);
-  if (e.func == "array") not_yet("an ARRAY other than as the path of #> or #>>", e.pos);
+  if (is_jsonb_operator4(e.func) || is_jsonb_function4(e.func)) {
+    std::vector<FoldArg> args;
+    for (const auto& a : e.args) args.push_back(fold_arg(a));
+    return fold_jsonb_call(e.func, is_jsonb_operator4(e.func), std::move(args), e.pos);
+  }
+  if (e.func == "array") not_yet("an ARRAY other than as a jsonb path", e.pos);
   std::vector<Constant> given;
   for (const auto& a : e.args) given.push_back(fold(a));
   // substr is substring's function-call form, its arguments in the same order.
@@ -2208,7 +2594,17 @@ auto fold(const ast::Expr& e) -> Constant {
       return c;
     }
     case K::Add: return arithmetic(fold(*e.lhs), fold(*e.rhs), Arith::Add, e.pos);
-    case K::Sub: return arithmetic(fold(*e.lhs), fold(*e.rhs), Arith::Sub, e.pos);
+    case K::Sub: {
+      // jsonb - text, integer or text[] (docs/jsonb_design.md, stage 4).
+      auto x = fold(*e.lhs);
+      if (is_jsonb(x)) {
+        std::vector<FoldArg> args;
+        args.push_back({jarg_of(x), x, std::nullopt});
+        args.push_back(fold_arg(*e.rhs));
+        return fold_jsonb_call("-", true, std::move(args), e.pos);
+      }
+      return arithmetic(x, fold(*e.rhs), Arith::Sub, e.pos);
+    }
     case K::Mul: return arithmetic(fold(*e.lhs), fold(*e.rhs), Arith::Mul, e.pos);
     case K::Div: return arithmetic(fold(*e.lhs), fold(*e.rhs), Arith::Div, e.pos);
     case K::Compare: return compare_constants(fold(*e.lhs), fold(*e.rhs), e.cmp, e.pos);
@@ -3248,7 +3644,11 @@ public:
         case K::TextFn:
         case K::Extract:
         case K::Cast: return true;
-        case K::Jsonb: return x.jsonb != logical::Expr::Jsonb::PathArray;  // a NULL element is the path's
+        // A NULL element is the path's; jsonb_set_lax and the build
+        // functions read their NULL arguments.
+        case K::Jsonb:
+          return x.jsonb != logical::Expr::Jsonb::PathArray && x.jsonb != logical::Expr::Jsonb::SetLax &&
+                 x.jsonb != logical::Expr::Jsonb::BuildArray && x.jsonb != logical::Expr::Jsonb::BuildObject;
         case K::Column:
         case K::Param:
         case K::Const:
@@ -3409,7 +3809,12 @@ public:
   auto function_value(const ast::Expr& e, const Resolve& resolve) -> logical::Expr {
     if (is_jsonb_accessor(e.func)) return jsonb_accessor(e, resolve);
     if (e.func == "jsonb_typeof" || e.func == "jsonb_array_length") return jsonb_function(e, resolve);
-    if (e.func == "array") not_yet("an ARRAY other than as the path of #> or #>>", e.pos);
+    if (is_jsonb_operator4(e.func) || is_jsonb_function4(e.func)) {
+      std::vector<JsonbArg> args;
+      for (const auto& a : e.args) args.push_back(jsonb_arg(a, resolve));
+      return jsonb_call(e.func, is_jsonb_operator4(e.func), std::move(args), e.pos);
+    }
+    if (e.func == "array") not_yet("an ARRAY other than as a jsonb path", e.pos);
     auto texty = [](SqlType t) { return holds_string(t); };
     auto exact = [](SqlType t) {
       return t.kind == SqlKind::SmallInt || t.kind == SqlKind::Integer || t.kind == SqlKind::BigInt || t.kind == SqlKind::Decimal;
@@ -3458,6 +3863,7 @@ public:
       return out;
     }
     if (e.func == "||") {
+      if (jsonb_operand(e.args[0], resolve) || jsonb_operand(e.args[1], resolve)) return jsonb_concat_value(e, resolve);
       auto a = arg(e.args[0], SqlType{SqlKind::Text});
       auto b = arg(e.args[1], SqlType{SqlKind::Text});
       for (const auto* x : {&a, &b}) {
@@ -3738,9 +4144,228 @@ public:
   // Whether x is a jsonb value: a column of jsonb, a cast to jsonb, or ->
   // or #> (whose own binding refuses a left operand that is no jsonb).
   auto jsonb_operand(const ast::Expr& x, const Resolve& resolve) -> bool {
-    if (x.kind == ast::Expr::Kind::Column) return resolve(x).second->sql.kind == SqlKind::Jsonb;
-    if (x.kind == ast::Expr::Kind::Func) return x.func == "->" || x.func == "#>";
-    return x.kind == ast::Expr::Kind::Cast && x.cast_type == "jsonb" && x.cast_schema.empty();
+    using K = ast::Expr::Kind;
+    switch (x.kind) {
+      case K::Column: return resolve(x).second->sql.kind == SqlKind::Jsonb;
+      case K::Cast: return x.cast_type == "jsonb" && x.cast_schema.empty();
+      case K::Sub: return jsonb_operand(*x.lhs, resolve);
+      case K::Func:
+        if (x.func == "||") return std::ranges::any_of(x.args, [&](const ast::Expr& a) { return jsonb_operand(a, resolve); });
+        return x.func == "->" || x.func == "#>" || x.func == "#-" ||
+               (is_jsonb_function4(x.func) && x.func != "jsonb_pretty" && x.func != "jsonb_extract_path_text");
+      case K::Const:
+      case K::Literal:
+      case K::Plus:
+      case K::Neg:
+      case K::Add:
+      case K::Mul:
+      case K::Div:
+      case K::Compare:
+      case K::IsNull:
+      case K::NullIf:
+      case K::Coalesce:
+      case K::Not:
+      case K::And:
+      case K::Or:
+      case K::Case:
+      case K::Param:
+      case K::Aggregate:
+      case K::Star:
+      case K::Clock:
+      case K::Subquery:
+      case K::Default: return false;
+    }
+    return false;
+  }
+
+  // An argument of a stage-4 jsonb call, bound once: a $n (typed by what
+  // the call reads it as), a constant, ARRAY[…] as a path, or a value.
+  struct JsonbArg {
+    JArg desc;
+    const ast::Expr* ast{nullptr};
+    std::optional<Constant> c;
+    std::optional<logical::Expr> v;  // a value, or ARRAY[…]'s path
+  };
+
+  auto jsonb_arg(const ast::Expr& a, const Resolve& resolve) -> JsonbArg {
+    JsonbArg r;
+    r.ast = &a;
+    if (is_text_array_cast(a)) {
+      r.desc.array = true;
+      r.desc.array_text = true;
+      r.desc.name = "text[]";
+      if (a.rhs->kind == ast::Expr::Kind::Param) {
+        path_params_.push_back(a.rhs->param);
+        auto in = logical::expr(logical::Expr::Kind::Jsonb, SqlType{SqlKind::Text});
+        in.jsonb = logical::Expr::Jsonb::PathIn;
+        in.args.push_back(typed_param(*a.rhs, SqlType{SqlKind::Text}, Use::Operand));
+        r.v = std::move(in);
+        return r;
+      }
+      if (!is_constant(*a.rhs)) not_yet("a cast of a value to text[]", a.pos);
+      auto inner = fold(*a.rhs);
+      if (!inner.unknown) not_yet("a cast of a typed value to text[]", a.pos);
+      r.v = is_null(inner) ? constant_value(bound::null_constant(SqlKind::Text, a.pos)) : fixed(path_literal(inner), SqlType{SqlKind::Text});
+      return r;
+    }
+    if (a.kind == ast::Expr::Kind::Func && a.func == "array") {
+      if (a.args.empty()) empty_array(a.pos);
+      r.desc.array = true;
+      std::string bad;
+      if (is_constant(a)) {
+        auto p = path_of_array(a, bad);
+        r.desc.array_text = p.has_value();
+        r.desc.name = p ? "text[]" : bad;
+        if (p) r.v = fixed(std::move(*p), SqlType{SqlKind::Text});
+        return r;
+      }
+      auto arr = logical::expr(logical::Expr::Kind::Jsonb, SqlType{SqlKind::Text});
+      arr.jsonb = logical::Expr::Jsonb::PathArray;
+      for (const auto& x : a.args) {
+        auto v = path_element(x, resolve, bad);
+        if (!v) {
+          r.desc.name = bad;
+          return r;
+        }
+        arr.args.push_back(std::move(*v));
+      }
+      r.desc.array_text = true;
+      r.desc.name = "text[]";
+      r.v = std::move(arr);
+      return r;
+    }
+    if (a.kind == ast::Expr::Kind::Param) {
+      // A $n an earlier use typed is of that type, as PostgreSQL's.
+      if (a.param < params_.size() && params_[a.param].first) {
+        auto t = params_[a.param].first->col->sql;
+        if (std::ranges::contains(path_params_, a.param)) {
+          r.desc.array = true;
+          r.desc.array_text = true;
+          r.desc.name = "text[]";
+          auto in = logical::expr(logical::Expr::Kind::Jsonb, SqlType{SqlKind::Text});
+          in.jsonb = logical::Expr::Jsonb::PathIn;
+          in.args.push_back(typed_param(a, t, Use::Operand));
+          r.v = std::move(in);
+          return r;
+        }
+        r.desc.type = t;
+        r.desc.name = pg_type_name(t);
+        r.v = typed_param(a, t, Use::Operand);
+        return r;
+      }
+      r.desc.untyped = true;
+      r.desc.param = true;
+      r.desc.number = a.param;
+      r.desc.name = "unknown";
+      return r;
+    }
+    if (is_constant(a)) {
+      r.c = numeric_cast_constant(a);
+      if (!r.c) r.c = fold(a);
+      r.desc = jarg_of(*r.c);
+      return r;
+    }
+    r.v = value(a, resolve);
+    r.desc.type = r.v->type;
+    r.desc.name = pg_type_name(r.v->type);
+    return r;
+  }
+
+  // An argument as its kind reads it: a $n of that type (a path's text,
+  // described as text[]), an unknown literal read as it, a constant's slot.
+  auto jsonb_arg_value(JsonbArg& a, JKind kind) -> logical::Expr {
+    auto as = [&](SqlKind k) -> logical::Expr {
+      if (a.desc.param) return typed_param(*a.ast, SqlType{k}, Use::Operand);
+      if (a.c) {
+        if (!a.c->unknown) return constant_value(std::move(*a.c));
+        if (is_null(*a.c)) return constant_value(bound::null_constant(k, a.c->pos));
+        return constant_value(resolved(*a.c, SqlType{k}));
+      }
+      return std::move(*a.v);
+    };
+    switch (kind) {
+      case JKind::Jsonb: return as(SqlKind::Jsonb);
+      case JKind::Text:
+      case JKind::Any: return as(SqlKind::Text);
+      case JKind::Bool: return as(SqlKind::Boolean);
+      case JKind::Int: return as(SqlKind::Integer);
+      case JKind::Path: {
+        if (a.desc.array) return std::move(*a.v);
+        if (a.desc.param) {
+          path_params_.push_back(a.ast->param);
+          auto in = logical::expr(logical::Expr::Kind::Jsonb, SqlType{SqlKind::Text});
+          in.jsonb = logical::Expr::Jsonb::PathIn;
+          in.args.push_back(typed_param(*a.ast, SqlType{SqlKind::Text}, Use::Operand));
+          return in;
+        }
+        if (is_null(*a.c)) return constant_value(bound::null_constant(SqlKind::Text, a.c->pos));
+        return fixed(path_literal(*a.c), SqlType{SqlKind::Text});
+      }
+    }
+    throw std::logic_error{"a jsonb argument of no kind"};
+  }
+
+  // A stage-4 operator or function of values only run time gives
+  // (docs/jsonb_design.md, stage 4), resolved by jsonb_signature.
+  auto jsonb_call(const std::string& name, bool op, std::vector<JsonbArg> args, std::int32_t pos) -> logical::Expr {
+    using J = logical::Expr::Jsonb;
+    std::vector<JArg> descs;
+    for (const auto& a : args) descs.push_back(a.desc);
+    auto sig = jsonb_signature(name, op, descs, pos);
+    if (sig.swap) std::swap(args[0], args[1]);
+    auto out = logical::expr(logical::Expr::Kind::Jsonb, sig.result);
+    out.jsonb = sig.fn;
+    if (sig.fn == J::Path || sig.fn == J::PathText) {
+      // jsonb_extract_path: #> of its text arguments' path.
+      out.args.push_back(jsonb_arg_value(args[0], JKind::Jsonb));
+      auto arr = logical::expr(logical::Expr::Kind::Jsonb, SqlType{SqlKind::Text});
+      arr.jsonb = J::PathArray;
+      for (std::size_t i = 1; i < args.size(); ++i) {
+        auto& a = args[i];
+        if (a.c && !a.c->unknown) {
+          arr.args.push_back(fixed(std::move(a.c->value), a.c->type));  // a NULL element is the path's
+        } else if (a.c) {
+          auto c = is_null(*a.c) ? bound::null_constant(SqlKind::Text, a.c->pos) : resolved(*a.c, SqlType{SqlKind::Text});
+          arr.args.push_back(fixed(std::move(c.value), SqlType{SqlKind::Text}));
+        } else {
+          arr.args.push_back(jsonb_arg_value(a, JKind::Text));
+        }
+      }
+      out.args.push_back(std::move(arr));
+      return strict_null(std::move(out));
+    }
+    for (std::size_t i = 0; i < args.size(); ++i) out.args.push_back(jsonb_arg_value(args[i], sig.kinds[i]));
+    if (sig.fn == J::SetLax) {
+      // create_if_missing true and null_value_treatment 'use_json_null' by default.
+      if (out.args.size() < 4) out.args.push_back(fixed(true, SqlType{SqlKind::Boolean}));
+      if (out.args.size() < 5) out.args.push_back(fixed(bytes_of("use_json_null"), SqlType{SqlKind::Text}));
+    }
+    return strict_null(std::move(out));
+  }
+
+  // a || b with a jsonb operand: jsonb's concatenation, or with a typed
+  // string text concatenation of the jsonb's text.
+  auto jsonb_concat_value(const ast::Expr& e, const Resolve& resolve) -> logical::Expr {
+    std::vector<JsonbArg> args;
+    args.push_back(jsonb_arg(e.args[0], resolve));
+    args.push_back(jsonb_arg(e.args[1], resolve));
+    auto typed = [](const JsonbArg& a, auto pred) { return !a.desc.untyped && !a.desc.array && pred(a.desc.type); };
+    auto is_jsonb_type = [](SqlType t) { return t.kind == SqlKind::Jsonb; };
+    auto stringish = [](SqlType t) { return is_string(t); };
+    auto text_concat = (typed(args[0], is_jsonb_type) && typed(args[1], stringish)) ||
+                       (typed(args[1], is_jsonb_type) && typed(args[0], stringish));
+    if (!text_concat) return jsonb_call("||", true, std::move(args), e.pos);
+    std::vector<logical::Expr> sides;
+    for (auto& a : args) {
+      auto v = a.c ? constant_value(std::move(*a.c)) : std::move(*a.v);
+      if (v.type.kind == SqlKind::Jsonb) {
+        auto t = logical::expr(logical::Expr::Kind::Cast, SqlType{SqlKind::Text});
+        t.args.push_back(std::move(v));
+        v = strict_null(std::move(t));
+      }
+      sides.push_back(std::move(v));
+    }
+    return strict_null(logical::binary(logical::Expr::Kind::Concat, std::move(sides[0]), std::move(sides[1]), SqlType{SqlKind::Text}));
   }
 
   // A constant operand as a value: its slot, NULL marked so a strict
@@ -3929,7 +4554,12 @@ public:
     // arithmetic operator; decided before an unknown literal beside it is
     // read as jsonb, which PostgreSQL reads as text for -.
     if (jsonb_operand(*e.lhs, resolve) || jsonb_operand(*e.rhs, resolve)) {
-      if (op == Arith::Sub) not_supported("the jsonb - operator", e.pos);
+      if (op == Arith::Sub && jsonb_operand(*e.lhs, resolve)) {
+        std::vector<JsonbArg> args;
+        args.push_back(jsonb_arg(*e.lhs, resolve));
+        args.push_back(jsonb_arg(*e.rhs, resolve));
+        return jsonb_call("-", true, std::move(args), e.pos);
+      }
       auto side = [&](const ast::Expr& x) { return untyped(x) ? std::string{"unknown"} : pg_type_name(value(x, resolve).type); };
       throw SqlError{"operator does not exist: " + side(*e.lhs) + " " + std::string{arith_text(op)} + " " + side(*e.rhs), e.pos,
                      kUndefinedFunction}
@@ -6331,7 +6961,7 @@ public:
     switch (e.kind) {
       case K::Column: return {e.column, 2};
       case K::Func:
-        if (e.func == "||" || e.func == "%" || is_jsonb_accessor(e.func)) return {"?column?", 0};
+        if (is_operator_name(e.func)) return {"?column?", 0};
         return {e.func, 2};
       case K::Coalesce: return {"coalesce", 2};
       case K::NullIf: return {"nullif", 2};
@@ -6396,7 +7026,7 @@ public:
       auto name = e.kind == ast::Expr::Kind::Case                       ? std::string{"case"}
                   : e.kind == ast::Expr::Kind::Coalesce                 ? std::string{"coalesce"}
                   : e.kind == ast::Expr::Kind::NullIf                   ? std::string{"nullif"}
-                  : e.kind == ast::Expr::Kind::Func && e.func != "||" && e.func != "%" && !is_jsonb_accessor(e.func) ? e.func
+                  : e.kind == ast::Expr::Kind::Func && !is_operator_name(e.func) ? e.func
                   : param_cast(e)                                       ? e.cast_type
                                                                         : std::string{"?column?"};
       return {value(e, resolve), name};
@@ -6505,7 +7135,7 @@ public:
       case ast::Expr::Kind::Case: return "case";
       case ast::Expr::Kind::Coalesce: return "coalesce";
       case ast::Expr::Kind::NullIf: return "nullif";
-      case ast::Expr::Kind::Func: return e.func == "||" || e.func == "%" || is_jsonb_accessor(e.func) ? "?column?" : e.func;
+      case ast::Expr::Kind::Func: return is_operator_name(e.func) ? "?column?" : e.func;
       case ast::Expr::Kind::Column:
       case ast::Expr::Kind::Param:
       case ast::Expr::Kind::Const:

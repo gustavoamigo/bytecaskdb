@@ -96,6 +96,20 @@ private:
 // Throws TextError with jsonb_in's SQLSTATE, DETAIL and CONTEXT.
 [[nodiscard]] auto jsonb_in(std::string_view text) -> std::string;
 
+// to_jsonb's scalar of a value, not NULL, of type t (datum_to_jsonb), as
+// the text jsonb::scalar reads: a number's output text, a boolean, a date,
+// timestamp or timestamptz as JsonEncodeDateTime writes it (ISO 8601, "T"
+// between the date and the time, a timestamptz's offset as +hh:mm), and
+// any other type's output text as a string. As an object's key (`key`) a
+// number is its output text as a string, a float's float8out text
+// included, and a boolean "true" or "false". A string, a jsonb or a CHAR(n)
+// is the caller's.
+struct JsonbScalarText {
+  jsonb::Scalar kind;
+  std::string text;
+};
+[[nodiscard]] auto jsonb_scalar_text(const Datum& v, SqlType t, bool key) -> JsonbScalarText;
+
 // Text functions of UTF-8 text, counted in characters as PostgreSQL's
 // are, shared by the binder's constant folds and the plan API's runtime
 // (bc_plan.h). UPPER and LOWER fold ASCII only, the layer's one collation
@@ -1386,6 +1400,46 @@ auto integer_name(SqlKind k) -> std::string {
 constexpr std::int64_t kEndTimestampDays = 106'762'940;
 
 }  // namespace
+
+auto jsonb_scalar_text(const Datum& v, SqlType t, bool key) -> JsonbScalarText {
+  using S = jsonb::Scalar;
+  if (const auto* b = std::get_if<bool>(&v)) {
+    if (key) return {S::String, *b ? "true" : "false"};
+    return {*b ? S::True : S::False, {}};
+  }
+  if (const auto* i = std::get_if<std::int64_t>(&v)) {
+    switch (t.kind) {
+      case SqlKind::Date: return {S::String, date_text(*i)};
+      case SqlKind::Timestamp:
+      case SqlKind::TimestampTz: {
+        auto text = timestamp_text(*i, t.kind == SqlKind::TimestampTz);
+        text[text.find(' ')] = 'T';
+        // EncodeTimezone's XSD form: minutes always written.
+        if (t.kind == SqlKind::TimestampTz) text.insert(text.find("+00") + 3, ":00");
+        return {S::String, std::move(text)};
+      }
+      case SqlKind::Time:
+      case SqlKind::TimeTz: return {S::String, to_text(v, t)};
+      case SqlKind::SmallInt:
+      case SqlKind::Integer:
+      case SqlKind::BigInt:
+      case SqlKind::Decimal:
+      case SqlKind::Real:
+      case SqlKind::Double:
+      case SqlKind::Boolean:
+      case SqlKind::Bytea:
+      case SqlKind::Text:
+      case SqlKind::Varchar:
+      case SqlKind::Numeric:
+      case SqlKind::Char:
+      case SqlKind::Name:
+      case SqlKind::Jsonb: break;
+    }
+  }
+  auto text = to_text(v, t);
+  if (t.kind == SqlKind::Bytea || is_string_kind(t.kind)) return {S::String, std::move(text)};
+  return {key ? S::String : S::Number, std::move(text)};
+}
 
 auto cast_kind(SqlType from, SqlType to) -> CastKind {
   using K = SqlKind;

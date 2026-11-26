@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 24). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 25). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime
@@ -424,6 +424,71 @@ bool     bc_jsonb_to_bool(bc_ctx *, bc_jsonb j);
 int64_t  bc_jsonb_to_i64(bc_ctx *, bc_jsonb j, uint32_t int_type, uint32_t object_id);
 double   bc_jsonb_to_f64(bc_ctx *, bc_jsonb j, bool real);
 bc_view  bc_jsonb_to_num(bc_ctx *, bc_jsonb j);
+/* jsonb's containment, existence, modification and construction
+   (docs/jsonb_design.md, stage 4), each as PostgreSQL 17's function of the
+   same operator or name. A value built is a new node in the step's arena,
+   charged: what it does not change is copied as byte ranges, and its depth
+   (54001 past 10000) and size (54000 past 2^28 - 1) are checked before it
+   is written; a result that is its input unchanged is the input's own
+   handle. A path is one bc_jsonb_path_in or bc_jsonb_path_add made; any
+   other view is BC_E_HANDLE. Errors are BC_E_DATA with PostgreSQL's
+   SQLSTATE, message and HINT; a damaged value is BC_E_CORRUPT.
+   - bc_jsonb_contains: a @> b (b <@ a): objects by pairs, arrays by
+     elements in any order, nested values contained, numbers by value; a
+     top-level scalar is an array of itself to an array;
+   - bc_jsonb_exists: j ? key, a top-level key or string element;
+     bc_jsonb_exists_any and _all: ?| and ?& over a path's non-NULL elements;
+   - bc_jsonb_concat: a || b: objects merged (b's keys win), arrays joined,
+     anything else an array of both (a scalar its own element);
+   - bc_jsonb_delete_key: j - key; _delete_index: j - i (from the end when
+     negative); _delete_keys: j - text[]; _delete_path: j #- path. 22023 for
+     a scalar ("cannot delete from scalar", "cannot delete path in
+     scalar") or an object by index, 2202E for a path of two dimensions,
+     22004 for a NULL path element reached, 22P02 for one read as an array
+     index that is no integer;
+   - bc_jsonb_set: jsonb_set(j, path, value, create); bc_jsonb_insert:
+     jsonb_insert(j, path, value, after), 22023 "cannot replace existing
+     key" with its HINT; both 22023 "cannot set path in scalar";
+   - bc_jsonb_set_lax: jsonb_set_lax with its value SQL NULL when
+     value_null (then `value` is not read), by its null_value_treatment
+     (22023 for other text, or SQL NULL when treatment_null; 22004 with
+     DETAIL and HINT for "raise_exception");
+   - bc_jsonb_strip_nulls: every object pair whose value is null dropped;
+   - bc_jsonb_pretty: jsonb_pretty's text, a new view;
+   - bc_jsonb_of_*: to_jsonb of a value: an integer, DECIMAL (at `scale`),
+     date, time, timetz, timestamp or timestamptz (bc_sql_type; dates and
+     timestamps in ISO 8601 with a "T"); a float (float4 when `real`) as a
+     number, or a string for NaN and the infinities, or as an object's key
+     (`key`) its float8out text; a boolean; text as a string; a NUMERIC's
+     text as a number, or a string for NaN and the infinities;
+   - bc_jsonb_build_array: n arguments, each a value or SQL NULL (nulls[i]),
+     a JSON null; bc_jsonb_build_object: n alternating keys and values, the
+     last of equal keys kept: 22023 for an odd n, a NULL key or one whose
+     argument is a jsonb (composite[i]). A key's text is a string's, a
+     number's or "true" or "false". nulls and composite may be NULL for
+     n = 0. */
+bool     bc_jsonb_contains(bc_ctx *, bc_jsonb a, bc_jsonb b);
+bool     bc_jsonb_exists(bc_ctx *, bc_jsonb j, bc_view key);
+bool     bc_jsonb_exists_any(bc_ctx *, bc_jsonb j, bc_view path);
+bool     bc_jsonb_exists_all(bc_ctx *, bc_jsonb j, bc_view path);
+bc_jsonb bc_jsonb_concat(bc_ctx *, bc_jsonb a, bc_jsonb b);
+bc_jsonb bc_jsonb_delete_key(bc_ctx *, bc_jsonb j, bc_view key);
+bc_jsonb bc_jsonb_delete_index(bc_ctx *, bc_jsonb j, int64_t i);
+bc_jsonb bc_jsonb_delete_keys(bc_ctx *, bc_jsonb j, bc_view path);
+bc_jsonb bc_jsonb_delete_path(bc_ctx *, bc_jsonb j, bc_view path);
+bc_jsonb bc_jsonb_set(bc_ctx *, bc_jsonb j, bc_view path, bc_jsonb value, bool create);
+bc_jsonb bc_jsonb_set_lax(bc_ctx *, bc_jsonb j, bc_view path, bc_jsonb value, bool value_null, bool create, bc_view treatment,
+                          bool treatment_null);
+bc_jsonb bc_jsonb_insert(bc_ctx *, bc_jsonb j, bc_view path, bc_jsonb value, bool after);
+bc_jsonb bc_jsonb_strip_nulls(bc_ctx *, bc_jsonb j);
+bc_view  bc_jsonb_pretty(bc_ctx *, bc_jsonb j);
+bc_jsonb bc_jsonb_of_i64(bc_ctx *, int64_t v, uint32_t sql_type, uint32_t scale);
+bc_jsonb bc_jsonb_of_f64(bc_ctx *, double v, bool real, bool key);
+bc_jsonb bc_jsonb_of_bool(bc_ctx *, bool v);
+bc_jsonb bc_jsonb_of_text(bc_ctx *, bc_view text);
+bc_jsonb bc_jsonb_of_num(bc_ctx *, bc_view numeric_text);
+bc_jsonb bc_jsonb_build_array(bc_ctx *, uint32_t n, const bc_jsonb *args, const bool *nulls);
+bc_jsonb bc_jsonb_build_object(bc_ctx *, uint32_t n, const bc_jsonb *args, const bool *nulls, const bool *composite);
 /* Casts computed per row (docs/planner_design.md, *Plan API calls for runtime
    casts*), each over the same functions the binder folds a constant's cast
    with (sql/text.cppm), so a constant, a parameter and a row's value cast

@@ -1890,6 +1890,23 @@ private:
       case J::ElementText:
       case J::Path:
       case J::PathText: break;
+      case J::Contains:
+      case J::Exists:
+      case J::ExistsAny:
+      case J::ExistsAll:
+      case J::Concat:
+      case J::DeleteKey:
+      case J::DeleteIndex:
+      case J::DeleteKeys:
+      case J::DeletePath:
+      case J::Set:
+      case J::SetLax:
+      case J::Insert:
+      case J::StripNulls:
+      case J::Pretty:
+      case J::ToJsonb:
+      case J::BuildArray:
+      case J::BuildObject: return eval_jsonb_function(e);
     }
     auto x = eval(e.args[0]);
     auto k = eval(e.args[1]);
@@ -1910,6 +1927,149 @@ private:
       w_.line("if (!n" + id + ") n" + id + " = " + call + ";");
     }
     return {"n" + id, "v" + id, type};
+  }
+
+  // to_jsonb's call for a value of type t (docs/jsonb_design.md, stage 4):
+  // a jsonb is itself; `key`, an object's key, takes a float's float8out
+  // text as a string.
+  static auto jsonb_of(const Val& x, SqlType t, bool key) -> std::string {
+    switch (t.kind) {
+      case SqlKind::Jsonb: return x.value;
+      case SqlKind::SmallInt:
+      case SqlKind::Integer:
+      case SqlKind::BigInt:
+      case SqlKind::Date:
+      case SqlKind::Time:
+      case SqlKind::TimeTz:
+      case SqlKind::Timestamp:
+      case SqlKind::TimestampTz: return "bc_jsonb_of_i64(cx, " + x.value + ", " + sql_type_code(t.kind) + ", 0)";
+      case SqlKind::Decimal: return "bc_jsonb_of_i64(cx, " + x.value + ", BC_TYPE_DECIMAL, " + std::to_string(t.scale) + ")";
+      case SqlKind::Real:
+      case SqlKind::Double:
+        return "bc_jsonb_of_f64(cx, " + x.value + ", " + (t.kind == SqlKind::Real ? "1" : "0") + ", " + (key ? "1" : "0") + ")";
+      case SqlKind::Boolean: return "bc_jsonb_of_bool(cx, " + x.value + ")";
+      case SqlKind::Text:
+      case SqlKind::Varchar:
+      case SqlKind::Name: return "bc_jsonb_of_text(cx, " + x.value + ")";
+      case SqlKind::Bytea: return "bc_jsonb_of_text(cx, bc_bytea_text(cx, " + x.value + "))";
+      case SqlKind::Numeric: return "bc_jsonb_of_num(cx, " + x.value + ")";
+      case SqlKind::Char: break;
+    }
+    throw std::logic_error{"physical plan: to_jsonb of a CHAR(n)"};
+  }
+
+  // jsonb's operators and functions of stage 4: strict calls guarded by
+  // their operands' NULL tests, but jsonb_set_lax's value and treatment and
+  // the build functions' arguments, which the call itself reads.
+  auto eval_jsonb_function(const Expr& e) -> Val {
+    using J = Expr::Jsonb;
+    std::vector<Val> xs;
+    if (e.jsonb != J::BuildArray && e.jsonb != J::BuildObject) {
+      for (const auto& a : e.args) xs.push_back(eval(a));
+    }
+    auto all_null = [&](std::size_t from, std::size_t to) {
+      std::string null;
+      for (auto i = from; i < to && i < xs.size(); ++i) null = either(null, xs[i].null);
+      return null;
+    };
+    auto strict = [&](const std::string& call, PhysType type) {
+      auto null = all_null(0, xs.size());
+      switch (type) {
+        case PhysType::Bool: return guarded("bool", "0", null, call, type);
+        case PhysType::Bytes: return guarded("bc_view", "bc_empty(cx)", null, call, type);
+        case PhysType::Jsonb:
+        case PhysType::I64:
+        case PhysType::F64:
+        case PhysType::Num: break;
+      }
+      return guarded("bc_jsonb", "", null, call, PhysType::Jsonb);
+    };
+    auto two = [&](const char* fn) { return std::string{fn} + "(cx, " + xs[0].value + ", " + xs[1].value + ")"; };
+    switch (e.jsonb) {
+      case J::Contains: return strict(two("bc_jsonb_contains"), PhysType::Bool);
+      case J::Exists: return strict(two("bc_jsonb_exists"), PhysType::Bool);
+      case J::ExistsAny: return strict(two("bc_jsonb_exists_any"), PhysType::Bool);
+      case J::ExistsAll: return strict(two("bc_jsonb_exists_all"), PhysType::Bool);
+      case J::Concat: return strict(two("bc_jsonb_concat"), PhysType::Jsonb);
+      case J::DeleteKey: return strict(two("bc_jsonb_delete_key"), PhysType::Jsonb);
+      case J::DeleteIndex: return strict(two("bc_jsonb_delete_index"), PhysType::Jsonb);
+      case J::DeleteKeys: return strict(two("bc_jsonb_delete_keys"), PhysType::Jsonb);
+      case J::DeletePath: return strict(two("bc_jsonb_delete_path"), PhysType::Jsonb);
+      case J::StripNulls: return strict("bc_jsonb_strip_nulls(cx, " + xs[0].value + ")", PhysType::Jsonb);
+      case J::Pretty: return strict("bc_jsonb_pretty(cx, " + xs[0].value + ")", PhysType::Bytes);
+      case J::Set:
+      case J::Insert: {
+        auto flag = xs.size() > 3 ? xs[3].value : std::string{e.jsonb == J::Set ? "1" : "0"};
+        auto fn = std::string{e.jsonb == J::Set ? "bc_jsonb_set" : "bc_jsonb_insert"};
+        return strict(fn + "(cx, " + xs[0].value + ", " + xs[1].value + ", " + xs[2].value + ", " + flag + ")", PhysType::Jsonb);
+      }
+      case J::SetLax: {
+        // NULL of the target, the path or create_if_missing is NULL; the
+        // value's and the treatment's are the call's to read.
+        auto null = either(either(xs[0].null, xs[1].null), xs[3].null);
+        auto flag = [](const Val& v) { return v.null.empty() ? std::string{"0"} : "(" + v.null + ")"; };
+        // A NULL value or treatment is not read: a NULL parameter has none.
+        auto unread = [&](const Val& v, PhysType t) {
+          if (v.null.empty()) return v.value;
+          auto id = std::to_string(exprs_++);
+          w_.line(t == PhysType::Jsonb ? declared(t, "u" + id) : "bc_view u" + id + " = bc_empty(cx);");
+          w_.line("if (!(" + v.null + ")) u" + id + " = " + v.value + ";");
+          return "u" + id;
+        };
+        auto value = unread(xs[2], PhysType::Jsonb);
+        auto treatment = unread(xs[4], PhysType::Bytes);
+        auto call = "bc_jsonb_set_lax(cx, " + xs[0].value + ", " + xs[1].value + ", " + value + ", " + flag(xs[2]) + ", " + xs[3].value +
+                    ", " + treatment + ", " + flag(xs[4]) + ")";
+        return guarded("bc_jsonb", "", null, call, PhysType::Jsonb);
+      }
+      case J::ToJsonb:
+        if (e.args[0].type.kind == SqlKind::Jsonb) return xs[0];
+        return guarded("bc_jsonb", "", xs[0].null, jsonb_of(xs[0], e.args[0].type, false), PhysType::Jsonb);
+      case J::BuildArray:
+      case J::BuildObject: return eval_jsonb_build(e);
+      case J::Field:
+      case J::FieldText:
+      case J::Element:
+      case J::ElementText:
+      case J::Path:
+      case J::PathText:
+      case J::Typeof:
+      case J::ArrayLength:
+      case J::PathIn:
+      case J::PathArray: break;
+    }
+    throw std::logic_error{"physical plan: a jsonb function codegen does not print"};
+  }
+
+  // jsonb_build_array and jsonb_build_object: each argument converted by
+  // to_jsonb unless NULL, into arrays the call reads with their NULL marks
+  // (and, for an object's keys, whether one is a jsonb).
+  auto eval_jsonb_build(const Expr& e) -> Val {
+    auto object = e.jsonb == Expr::Jsonb::BuildObject;
+    auto id = std::to_string(exprs_++);
+    auto n = e.args.size();
+    w_.line(declared(PhysType::Jsonb, "v" + id));
+    if (n == 0) {
+      w_.line("v" + id + " = " + (object ? "bc_jsonb_build_object(cx, 0, NULL, NULL, NULL);" : "bc_jsonb_build_array(cx, 0, NULL, NULL);"));
+      return {"", "v" + id, PhysType::Jsonb};
+    }
+    auto count = std::to_string(n);
+    w_.line("bc_jsonb a" + id + "[" + count + "]; bool z" + id + "[" + count + "];");
+    if (object) w_.line("bool c" + id + "[" + count + "];");
+    for (std::size_t i = 0; i < n; ++i) {
+      const auto& a = e.args[i];
+      auto x = eval(a);
+      auto at = "[" + std::to_string(i) + "]";
+      auto key = object && i % 2 == 0;
+      w_.line("a" + id + at + ".i = 0; a" + id + at + ".g = 0;");
+      if (object) w_.line("c" + id + at + " = " + (key && a.type.kind == SqlKind::Jsonb ? "1" : "0") + ";");
+      w_.line("z" + id + at + " = " + (x.null.empty() ? std::string{"0"} : "(" + x.null + ")") + ";");
+      auto conv = "a" + id + at + " = " + jsonb_of(x, a.type, key) + ";";
+      w_.line(x.null.empty() ? conv : "if (!z" + id + at + ") " + conv);
+    }
+    w_.line("v" + id + " = " + (object ? "bc_jsonb_build_object(cx, " + count + ", a" + id + ", z" + id + ", c" + id + ");"
+                                       : "bc_jsonb_build_array(cx, " + count + ", a" + id + ", z" + id + ");"));
+    return {"", "v" + id, PhysType::Jsonb};
   }
 
   // EXTRACT(field FROM x): the plan API's bc_extract, its field the

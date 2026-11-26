@@ -132,13 +132,15 @@ A column declared `jsonb` holds any JSON value PostgreSQL 17's `jsonb_in`
 accepts, in the binary layout `jsonb_design.md` describes, and returns
 `jsonb_out`'s text byte for byte. Everything about the type, its input
 grammar, normalisation, output, layout, limits and stages, is in
-`jsonb_design.md`; this section says where it meets the codec. Stages 1
-and 3 are built: the column, its text in and out, casts with text,
+`jsonb_design.md`; this section says where it meets the codec. Stages 1,
+3 and 4 are built: the column, its text in and out, casts with text,
 `DEFAULT`, `IS [NOT] NULL`, `COUNT`, `CASE` and `COALESCE`; the accessors
 `->`, `->>`, `#>`, `#>>`, `jsonb_typeof`, `jsonb_array_length`, and casts
 to `boolean`, the integers, `real`, `double precision` and `numeric`
-(`frontend_design.md`, *jsonb's accessors and casts out*). `json` is stage
-1c and refused (0A000).
+(`frontend_design.md`, *jsonb's accessors and casts out*); containment,
+existence, modification and construction, `to_jsonb` of every type but
+`CHAR(n)` among them (*jsonb's containment, existence, modification and
+construction*). `json` is stage 1c and refused (0A000).
 
 - **Physical type.** `PhysType::Jsonb` (6), `BC_T_JSONB` in the plan API,
   a variable column (`is_fixed` is false), never a key part (`keyable` is
