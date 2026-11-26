@@ -74,3 +74,31 @@ class Oracle:
 @pytest.fixture
 def dsn() -> str:
     return oracle_dsn()
+
+
+C_DATABASE = "bytecask_proof_c"
+
+
+@pytest.fixture
+def c_dsn(dsn: str) -> str:
+    """The oracle in a database whose default collation is C. jsonb compares
+    its strings and keys under the database's default collation, which
+    COLLATE cannot change, and the layer's is bytewise: a test of jsonb's
+    order needs PostgreSQL in a C database (the postgres image's default is
+    en_US.utf8). The database is made from template0 when the oracle's own
+    is not C, and kept for later runs."""
+    import psycopg
+    from psycopg.conninfo import make_conninfo
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        # The default collation's order itself: datcollate reads C.UTF-8 in
+        # a database whose provider is ICU.
+        (bytewise,) = conn.execute("""SELECT '"B"'::jsonb < '"a"'::jsonb AND 'Z' < 'a' AND 'a' < 'ä'""").fetchone()
+        if bytewise:
+            return dsn
+        if conn.execute("SELECT 1 FROM pg_database WHERE datname = %s", [C_DATABASE]).fetchone() is None:
+            try:
+                conn.execute(f"CREATE DATABASE {C_DATABASE} TEMPLATE template0 ENCODING 'UTF8' LOCALE_PROVIDER libc LOCALE 'C'")
+            except psycopg.errors.DuplicateDatabase:
+                pass
+    return make_conninfo(dsn, dbname=C_DATABASE)

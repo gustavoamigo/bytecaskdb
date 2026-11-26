@@ -6,7 +6,8 @@
 // prepare with jsonb_in's SQLSTATE, DETAIL and CONTEXT, parameters typed
 // jsonb, DEFAULT and ADD COLUMN ... DEFAULT across a reopen, casts with
 // text, CASE and COALESCE, IS NULL and COUNT, and every refusal the stage
-// keeps with its SQLSTATE.
+// keeps with its SQLSTATE; and the later stages' operators, comparison and
+// order (stage 2) among them.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -118,7 +119,7 @@ TEST_CASE("embedded API jsonb: a literal is read at prepare, with jsonb_in's SQL
   CHECK(db->execute("SELECT id FROM j").rows.empty());
 }
 
-TEST_CASE("embedded API jsonb: what stage 1 refuses, each with PostgreSQL's SQLSTATE or 0A000", "[sql][api][jsonb]") {
+TEST_CASE("embedded API jsonb: what the stages refuse, each with PostgreSQL's SQLSTATE or 0A000", "[sql][api][jsonb]") {
   sql_test::TempDir dir{"api_jsonb"};
   auto db = Database::open(dir.path());
   db->execute("CREATE TABLE j (id INTEGER PRIMARY KEY, v jsonb, s TEXT, n INTEGER)");
@@ -127,25 +128,7 @@ TEST_CASE("embedded API jsonb: what stage 1 refuses, each with PostgreSQL's SQLS
     std::string_view state;
   };
   for (const auto& r : {
-           // Comparison, order, groups and duplicates: stage 2.
-           Refusal{"SELECT id FROM j WHERE v = '{}'", "0A000"},
-           Refusal{"SELECT id FROM j WHERE v = v", "0A000"},
-           Refusal{"SELECT v = v FROM j", "0A000"},
-           Refusal{"SELECT id FROM j WHERE v = $1", "0A000"},
-           Refusal{"SELECT id FROM j WHERE v IN ('1', '2')", "0A000"},
-           Refusal{"SELECT v FROM j ORDER BY v", "0A000"},
-           Refusal{"SELECT v FROM j GROUP BY v", "0A000"},
-           Refusal{"SELECT DISTINCT v FROM j", "0A000"},
-           Refusal{"SELECT count(DISTINCT v) FROM j", "0A000"},
-           Refusal{"SELECT v FROM j UNION SELECT v FROM j", "0A000"},
-           Refusal{"SELECT (SELECT v FROM j LIMIT 1)", "0A000"},
-           // The same of constants, an unknown literal beside a jsonb read by
-           // jsonb_in first.
-           Refusal{"SELECT '1'::jsonb = '1'::jsonb", "0A000"},
-           Refusal{"SELECT '1'::jsonb <> '1'", "0A000"},
-           Refusal{"SELECT ('1'::jsonb) < ('2'::jsonb)", "0A000"},
-           Refusal{"SELECT nullif('1'::jsonb, '1')", "0A000"},
-           Refusal{"SELECT CASE '1'::jsonb WHEN '1' THEN 1 END", "0A000"},
+           // A literal beside a jsonb is read by jsonb_in first.
            Refusal{"SELECT '1'::jsonb = 'x'", "22P02"},
            Refusal{"SELECT nullif('1'::jsonb, 'x')", "22P02"},
            // Keys: the next phase.
@@ -266,6 +249,60 @@ TEST_CASE("embedded API jsonb: an assignment refusal reads as PostgreSQL's, with
   CHECK(state_of(*db, "INSERT INTO j (id, c) VALUES (4, '[1]'::jsonb)") == "22001");
   // jsonb || a typed text is text concatenation, as PostgreSQL's anynonarray || text.
   CHECK(db->execute("SELECT '[1]'::jsonb || 'a'::text").rows == Grid{{t("[1]a")}});
+}
+
+TEST_CASE("embedded API jsonb: comparison, order, groups and set operations by PostgreSQL 17's jsonb_ops (stage 2)",
+          "[sql][api][jsonb]") {
+  sql_test::TempDir dir{"api_jsonb_compare"};
+  auto db = Database::open(dir.path());
+  db->execute("CREATE TABLE j (id INTEGER PRIMARY KEY, v jsonb, w jsonb)");
+  db->execute(R"(INSERT INTO j VALUES (1, '{"b": 1, "c": 1}', '1'), (2, '[]', '1.0'), (3, 'true', NULL), (4, '"a"', '"a"'),
+                 (5, '1.00', '1'), (6, 'null', '[1]'), (7, '[1, 2]', '[1,2]'), (8, '{}', '{}'), (9, '-1', '-1.0'),
+                 (10, '[null]', NULL), (11, NULL, '2'), (12, '1', '{"a": 1}'))");
+  auto ids = [&](std::string_view sql, const std::vector<Value>& params = {}) {
+    std::vector<std::int64_t> out;
+    for (const auto& r : db->execute(sql, params).rows) out.push_back(std::get<std::int64_t>(r[0]));
+    return out;
+  };
+  using Ids = std::vector<std::int64_t>;
+  // The type order, the top-level empty array first, NULLs last; equal
+  // values (1.00, 1) in their id order.
+  CHECK(ids("SELECT id FROM j ORDER BY v, id") == Ids{2, 6, 4, 9, 5, 12, 3, 10, 7, 8, 1, 11});
+  CHECK(ids("SELECT id FROM j ORDER BY v DESC, id") == Ids{11, 1, 8, 7, 10, 3, 5, 12, 9, 4, 6, 2});
+  // = by value, columns, literals and parameters alike.
+  CHECK(ids("SELECT id FROM j WHERE v = '1' ORDER BY id") == Ids{5, 12});
+  CHECK(ids("SELECT id FROM j WHERE v = $1 ORDER BY id", {t("1.0")}) == Ids{5, 12});
+  CHECK(ids("SELECT id FROM j WHERE v = w ORDER BY id") == Ids{4, 5, 7, 8, 9});
+  CHECK(ids("SELECT id FROM j WHERE v < w ORDER BY id") == Ids{2, 6, 12});
+  CHECK(ids("SELECT id FROM j WHERE v <> '1' AND v IN ('[]', '\"a\"', 'null') ORDER BY id") == Ids{2, 4, 6});
+  CHECK(ids("SELECT id FROM j WHERE v BETWEEN '\"a\"' AND 'true' ORDER BY id") == Ids{3, 4, 5, 9, 12});
+  CHECK(ids("SELECT id FROM j WHERE v -> 'b' = $1::jsonb", {t("1")}) == Ids{1});
+  CHECK(ids("SELECT id FROM j WHERE v IN (SELECT w FROM j) ORDER BY id") == Ids{4, 5, 7, 8, 9, 12});
+  CHECK(ids("SELECT id FROM j WHERE v > ALL (SELECT w FROM j WHERE w IS NOT NULL) ORDER BY id") == Ids{1});
+  CHECK(ids("SELECT a.id FROM j a JOIN j b ON a.v = b.w WHERE b.id = 2 ORDER BY a.id") == Ids{5, 12});
+  // A correlated subquery carries the outer row's jsonb into its own
+  // comparison (bc_sub_arg_jsonb); m holds j's rows.
+  db->execute("CREATE TABLE m (id INTEGER PRIMARY KEY, v jsonb, w jsonb)");
+  db->execute("INSERT INTO m SELECT id, v, w FROM j");
+  CHECK(ids("SELECT id FROM j WHERE EXISTS (SELECT 1 FROM m WHERE m.w = j.v) ORDER BY id") == Ids{4, 5, 7, 8, 9, 12});
+  CHECK(ids("SELECT id FROM j WHERE NOT EXISTS (SELECT 1 FROM m WHERE m.w = j.v) ORDER BY id") == Ids{1, 2, 3, 6, 10, 11});
+  CHECK(ids("SELECT id FROM j WHERE NOT EXISTS (SELECT 1 FROM m WHERE m.v < j.w) ORDER BY id") == Ids{3, 10});
+  CHECK(db->execute("SELECT v = w, v < w, nullif(v, '1.0') FROM j WHERE id = 5").rows == Grid{{true, false, kNull}});
+  // A group prints its first row's value, its scale kept; DISTINCT,
+  // COUNT(DISTINCT) and UNION merge equal values.
+  CHECK(db->execute("SELECT w, count(*) FROM j GROUP BY w HAVING count(*) > 1 ORDER BY w").rows ==
+        Grid{{t("1"), i(3)}, {kNull, i(2)}});
+  CHECK(db->execute("SELECT count(DISTINCT v), count(DISTINCT w), count(DISTINCT v -> 'b') FROM j").rows ==
+        Grid{{i(10), i(8), i(1)}});
+  CHECK(db->execute("SELECT DISTINCT w FROM j WHERE id < 6 ORDER BY w").rows == Grid{{t("\"a\"")}, {t("1")}, {kNull}});
+  CHECK(db->execute("SELECT v FROM j WHERE id IN (5, 12) UNION SELECT w FROM j WHERE id = 1").rows == Grid{{t("1.00")}});
+  CHECK(db->execute("SELECT (SELECT v FROM j WHERE id = 1), '[1,2]'::jsonb > '[3]', '{\"a\":1,\"b\":2}'::jsonb = '{\"b\":2,\"a\":1}'").rows ==
+        Grid{{t("{\"b\": 1, \"c\": 1}"), true, true}});
+  // Still refused: MIN and MAX (PostgreSQL's 42883), a jsonb key (the next
+  // phase).
+  CHECK(state_of(*db, "SELECT max(v) FROM j") == "42883");
+  CHECK(state_of(*db, "SELECT id FROM j WHERE v = 'x'::text") == "42883");
+  CHECK(state_of(*db, "CREATE INDEX j_v ON j (v)") == "0A000");
 }
 
 TEST_CASE("embedded API jsonb: the accessors and casts out of columns, parameters and constants (stage 3)", "[sql][api][jsonb]") {

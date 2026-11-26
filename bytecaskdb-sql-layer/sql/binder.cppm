@@ -688,23 +688,11 @@ void name_union(SqlType first, SqlType next, const std::string& what, std::int32
   throw SqlError{what + " (NUMERIC without a precision) is not supported yet", pos, kFeatureNotSupported};
 }
 
-// The types the layer stores and carries but does not compare, order,
+// The type the layer stores and carries but does not compare, order,
 // group, compute or aggregate but by COUNT yet (0A000): a NUMERIC of no
-// precision (refuse_numeric), and jsonb, which compares by its sort key
-// (docs/jsonb_design.md, stage 2). One predicate, so no site checks one and
-// forgets the other.
-constexpr auto uncompared(SqlKind k) -> bool { return k == SqlKind::Numeric || k == SqlKind::Jsonb; }
-
-// The name a refusal gives an uncompared type.
-auto uncompared_name(SqlKind k) -> std::string { return k == SqlKind::Jsonb ? "jsonb" : "NUMERIC"; }
-
-[[noreturn]] void refuse_uncompared(SqlKind k, const std::string& what, std::int32_t pos) {
-  if (k != SqlKind::Jsonb) refuse_numeric(what, pos);
-  throw SqlError{what + " is not supported yet", pos, kFeatureNotSupported};
-}
-
-// The uncompared kind of a pair, for a refusal's message: a's, else b's.
-constexpr auto uncompared_of(SqlKind a, SqlKind b) -> SqlKind { return uncompared(a) ? a : b; }
+// precision (refuse_numeric). jsonb compares by its sort key
+// (docs/jsonb_design.md, stage 2).
+constexpr auto uncompared(SqlKind k) -> bool { return k == SqlKind::Numeric; }
 
 auto integer_constant(std::int64_t v, std::int32_t pos) -> Constant {
   return {v, SqlType{std::in_range<std::int32_t>(v) ? SqlKind::Integer : SqlKind::BigInt}, false, {}, pos};
@@ -1296,8 +1284,25 @@ auto order(const Constant& x, const Constant& y, ast::ValueCompare op, std::int3
   refuse();
 }
 
+auto jsonb_value_of(const Constant& c, std::vector<std::byte>& value) -> jsonb::ByteView;
+
+// The order of two jsonb constants: memcmp of their sort keys, the plan's
+// own order (bc_jsonb_cmp), so a folded comparison agrees with a run one.
+auto jsonb_order(const Constant& x, const Constant& y) -> int {
+  std::vector<std::byte> xv;
+  std::vector<std::byte> yv;
+  std::vector<std::byte> xk;
+  std::vector<std::byte> yk;
+  if (!jsonb::sort_key_value(jsonb_value_of(x, xv), xk).ok() || !jsonb::sort_key_value(jsonb_value_of(y, yv), yk).ok()) {
+    throw std::logic_error{"a jsonb constant with no sort key"};
+  }
+  auto o = std::lexicographical_compare_three_way(xk.begin(), xk.end(), yk.begin(), yk.end());
+  return std::is_lt(o) ? -1 : std::is_gt(o) ? 1 : 0;
+}
+
 // x op y, of constants: a BOOLEAN, NULL if either is. An unknown literal
-// takes the other side's type; two compare as text.
+// takes the other side's type; two compare as text; two jsonb by their sort
+// keys.
 auto compare_constants(Constant x, Constant y, ast::ValueCompare op, std::int32_t pos) -> Constant {
   if (!x.unknown && !y.unknown && type_class(x.type.kind) != type_class(y.type.kind)) {
     throw SqlError{"operator does not exist: " + pg_type_name(x.type) + " " + std::string{value_op_text(op)} + " " +
@@ -1314,11 +1319,8 @@ auto compare_constants(Constant x, Constant y, ast::ValueCompare op, std::int32_
   if (std::holds_alternative<std::monostate>(x.value) || std::holds_alternative<std::monostate>(y.value)) {
     return {std::monostate{}, SqlType{SqlKind::Boolean}, false, {}, pos};
   }
-  // jsonb with jsonb (an unknown literal beside it read by jsonb_in above,
-  // so its 22P02 comes first): PostgreSQL's operator, not built until
-  // stage 2.
-  if (is_jsonb(x) || is_jsonb(y)) refuse_uncompared(SqlKind::Jsonb, "a comparison of jsonb values", pos);
-  auto o = order(x, y, op, pos);
+  // jsonb with jsonb (an unknown literal beside it read by jsonb_in above).
+  auto o = is_jsonb(x) && is_jsonb(y) ? jsonb_order(x, y) : order(x, y, op, pos);
   auto truth = [&] {
     switch (op) {
       case ast::ValueCompare::Eq: return o == 0;
@@ -2649,8 +2651,6 @@ auto coerce_value(const Constant& k, const Column& c, bool assigned, std::string
   // compared with a number yet. A string literal is read first, so text that
   // is no number is 22P02 as in PostgreSQL; a boolean, temporal or string
   // constant falls through to PostgreSQL's 42883 (no such operator).
-  // A jsonb likewise: the literal is read by jsonb_in first (22P02), as in
-  // PostgreSQL, and then a jsonb comparison is stage 2's.
   if (uncompared(c.sql.kind) && !assigned) {
     if (k.unknown && !std::holds_alternative<std::monostate>(k.value)) {
       try {
@@ -2660,7 +2660,7 @@ auto coerce_value(const Constant& k, const Column& c, bool assigned, std::string
       }
     }
     if (k.unknown || type_class(k.type.kind) == type_class(c.sql.kind)) {
-      refuse_uncompared(c.sql.kind, "a " + uncompared_name(c.sql.kind) + " column compared or computed with a constant", k.pos);
+      refuse_numeric("a NUMERIC column compared or computed with a constant", k.pos);
     }
   }
   if (k.unknown) {
@@ -3308,7 +3308,7 @@ public:
       type = outs[0].expr.type;
       // AVG's or a NUMERIC column's: compared or matched where a subquery
       // stands, which a NUMERIC is not yet.
-      if (uncompared(type.kind)) refuse_uncompared(type.kind, "a subquery of a " + uncompared_name(type.kind) + " value", pos);
+      if (uncompared(type.kind)) refuse_numeric("a subquery of a NUMERIC value", pos);
       name = outs[0].name;
     }
     // Its parameters, NULL until it runs: its value or values, then its flags.
@@ -3867,7 +3867,7 @@ public:
       auto a = arg(e.args[0], SqlType{SqlKind::Text});
       auto b = arg(e.args[1], SqlType{SqlKind::Text});
       for (const auto* x : {&a, &b}) {
-        if (uncompared(x->type.kind)) refuse_uncompared(x->type.kind, "|| of a " + uncompared_name(x->type.kind), e.pos);
+        if (uncompared(x->type.kind)) refuse_numeric("|| of a NUMERIC", e.pos);
         if (!texty(x->type) && !exact(x->type)) not_yet("|| of a " + pg_type_name(x->type) + " value", e.pos);
       }
       if (!texty(a.type) && !texty(b.type)) {
@@ -4914,11 +4914,7 @@ public:
     // A CHAR(n) compares without its trailing spaces: a parameter would need
     // them cut at run time, as a constant is cut here.
     if (col.sql.kind == SqlKind::Char && use != Use::Assigned) not_yet("a parameter compared with a CHAR(n) column", pos);
-    // A jsonb operand ($1::jsonb, carried) is the comparison's to refuse, where
-    // there is one (numeric_compared).
-    if (uncompared(col.sql.kind) && use != Use::Assigned && !(col.sql.kind == SqlKind::Jsonb && use == Use::Operand)) {
-      refuse_uncompared(col.sql.kind, "a parameter compared or computed with a " + uncompared_name(col.sql.kind), pos);
-    }
+    if (uncompared(col.sql.kind) && use != Use::Assigned) refuse_numeric("a parameter compared or computed with a NUMERIC", pos);
     if (params_.size() <= n) params_.resize(n + 1);
     auto& p = params_[n];
     if (n < fixed_params_ && p.first) {
@@ -5207,7 +5203,6 @@ public:
     if (t.kind == SqlKind::Numeric && (e.fn != Fn::Count || agg.distinct)) {
       refuse_numeric(std::string{aggregate_name(e.fn)} + (agg.distinct ? " of DISTINCT values" : "") + " of a NUMERIC", e.pos);
     }
-    if (t.kind == SqlKind::Jsonb && e.fn == Fn::Count && agg.distinct) refuse_uncompared(t.kind, "COUNT of DISTINCT jsonb values", e.pos);
     if (auto s = aggregate_support(e.fn, t); !s.supported) {
       if (s.sqlstate.view() == kUndefinedFunction.view()) {
         // PostgreSQL's own refusal: it has no such aggregate.
@@ -5358,7 +5353,7 @@ public:
       return std::string{statement} + " of " + article + from_name + " value into column \"" + c.name + "\" of type " +
              pg_type_name(to);
     };
-    if (uncompared(from.kind) || uncompared(to.kind)) {
+    if (uncompared(from.kind) || uncompared(to.kind) || from.kind == SqlKind::Jsonb || to.kind == SqlKind::Jsonb) {
       if (from.kind == to.kind) return v;  // its text or its jsonb value, as it is stored
       if (from.kind == SqlKind::Jsonb && type_class(to.kind) == TypeClass::String) return cast_node(std::move(v), text_for(to));
       if (type_refusal(from.kind, to.kind, true)) throw assignment_mismatch(c.name, pg_type_name(to), pg_type_name(from), pos);
@@ -5909,13 +5904,10 @@ public:
     }
   }
 
-  // A NUMERIC or a jsonb compared: not yet (refuse_uncompared), once
-  // PostgreSQL has the operator (no_operator before it).
+  // A NUMERIC compared: not yet (refuse_numeric), once PostgreSQL has the
+  // operator (no_operator before it).
   static void numeric_compared(SqlType a, SqlType b, std::int32_t pos) {
-    if (uncompared(a.kind) || uncompared(b.kind)) {
-      auto k = uncompared_of(a.kind, b.kind);
-      refuse_uncompared(k, "a comparison of a " + uncompared_name(k) + " column", pos);
-    }
+    if (uncompared(a.kind) || uncompared(b.kind)) refuse_numeric("a comparison of a NUMERIC column", pos);
   }
 
   // A CHAR(n) with a VARCHAR: PostgreSQL compares the two as bpchar, the
@@ -6376,9 +6368,7 @@ public:
         continue;
       }
       auto [t, c] = resolve(e);
-      if (uncompared(c->sql.kind)) {
-        refuse_uncompared(c->sql.kind, std::string{distinct_groups ? "DISTINCT" : "GROUP BY"} + " of a " + uncompared_name(c->sql.kind) + " column", e.pos);
-      }
+      if (uncompared(c->sql.kind)) refuse_numeric(std::string{distinct_groups ? "DISTINCT" : "GROUP BY"} + " of a NUMERIC column", e.pos);
       // A derived relation's groups are keyed by values the plan holds in
       // locals: integers and booleans (#833).
       if (Table::derived(t->id) && c->type != PhysType::I64 && c->type != PhysType::Bool) {
@@ -6494,7 +6484,7 @@ public:
     for (const auto& o : s.order_by) {
       if (o.expr.kind == ast::Expr::Kind::Column) {
         auto [t, c] = resolve(o.expr);
-        if (uncompared(c->sql.kind)) refuse_uncompared(c->sql.kind, "ORDER BY a " + uncompared_name(c->sql.kind) + " column", o.pos);
+        if (uncompared(c->sql.kind)) refuse_numeric("ORDER BY a NUMERIC column", o.pos);
         auto key = aggregated ? grouped(*t, *c, o.pos) : logical::column_of(t->id, *c);
         keys.push_back({std::move(key), o.desc, o.nulls_first.value_or(o.desc)});
         continue;
@@ -6726,7 +6716,7 @@ public:
     }
     auto key = plain_output(e, resolve).expr;
     if (key.kind == logical::Expr::Kind::Param || key.kind == logical::Expr::Kind::Const) return std::nullopt;
-    if (uncompared(key.type.kind)) refuse_uncompared(key.type.kind, "ORDER BY a " + uncompared_name(key.type.kind) + " value", e.pos);
+    if (uncompared(key.type.kind)) refuse_numeric("ORDER BY a NUMERIC value", e.pos);
     return key;
   }
 
@@ -6805,16 +6795,14 @@ public:
         auto type = set_type(lo[i].expr.type, ro[i].expr.type, l.untyped[i], r.untyped[i], what, q.pos);
         // UNION ALL only carries a NUMERIC; the others compare its rows.
         if (uncompared(type.kind) && (op.kind != ast::SetOperation::Kind::Union || !op.all)) {
-          refuse_uncompared(type.kind, what + " of a " + uncompared_name(type.kind) + " column", q.pos);
+          refuse_numeric(what + " of a NUMERIC column", q.pos);
         }
         out.outputs.push_back({logical::param(0, type), lo[i].name});
         arm.untyped.push_back(l.untyped[i] && r.untyped[i]);
       }
       for (const auto& o : q.order_by) {
         out.order.push_back(set_order(o, out.outputs));
-        if (auto k = out.outputs[out.order.back().column].expr.type.kind; uncompared(k)) {
-          refuse_uncompared(k, "ORDER BY a " + uncompared_name(k) + " column", o.pos);
-        }
+        if (uncompared(out.outputs[out.order.back().column].expr.type.kind)) refuse_numeric("ORDER BY a NUMERIC column", o.pos);
       }
       out.left = std::move(l.node);
       out.right = std::move(r.node);
@@ -7192,7 +7180,7 @@ public:
     if (e.kind == K::Param) text_if_untyped(e);
     auto g = e.kind == K::Param ? logical::param(e.param, params_[e.param].first->col->sql) : plain_output(e, resolve).expr;
     const auto* of = distinct ? "DISTINCT" : "GROUP BY";
-    if (uncompared(g.type.kind)) refuse_uncompared(g.type.kind, std::string{of} + " of a " + uncompared_name(g.type.kind) + " value", e.pos);
+    if (uncompared(g.type.kind)) refuse_numeric(std::string{of} + " of a NUMERIC value", e.pos);
     if (g.type.kind == SqlKind::Char && g.kind != logical::Expr::Kind::Column) {
       not_supported(std::string{of} + " of a CHAR expression other than a column", e.pos);
     }

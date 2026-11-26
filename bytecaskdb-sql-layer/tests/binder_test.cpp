@@ -1838,8 +1838,8 @@ TEST_CASE("binder: GROUP BY and DISTINCT of expressions, matched as written (#90
   CHECK(error_of("SELECT a FROM g9 GROUP BY a ORDER BY count(*) DESC, max(b)") == "bound");
   // Keys no sort key holds or groups as PostgreSQL does, and what reads
   // again or per group.
-  CHECK(error_of("SELECT count(*) FROM g9 GROUP BY j->'k'").starts_with("0A000 GROUP BY of a jsonb value is not supported yet @"));
-  CHECK(error_of("SELECT DISTINCT j->'k' FROM g9").starts_with("0A000 DISTINCT of a jsonb value is not supported yet @"));
+  CHECK(error_of("SELECT count(*) FROM g9 GROUP BY j->'k'") == "bound");  // a jsonb by its sort key (jsonb stage 2)
+  CHECK(error_of("SELECT DISTINCT j->'k' FROM g9") == "bound");
   CHECK(error_of("SELECT count(*) FROM g9 GROUP BY coalesce(n, n)").starts_with("0A000 "));
   CHECK(error_of("SELECT count(*) FROM g9 GROUP BY coalesce(ch, ch)") ==
         "0A000 GROUP BY of a CHAR expression other than a column is not supported yet @33");
@@ -1892,7 +1892,7 @@ TEST_CASE("binder: COUNT, SUM and AVG of DISTINCT values of an expression (#904 
   CHECK(error_of("SELECT a % 2, count(DISTINCT lower(b)) FROM g2 GROUP BY 1") == "bound");
   // Refused as PostgreSQL refuses them, or as the argument's type is.
   CHECK(error_of("SELECT sum(DISTINCT lower(b)) FROM g2").starts_with("42883 function sum(text) does not exist"));
-  CHECK(error_of("SELECT count(DISTINCT j->'u') FROM g2").starts_with("0A000 COUNT of DISTINCT jsonb values"));
+  CHECK(error_of("SELECT count(DISTINCT j->'u') FROM g2") == "bound");
   CHECK(error_of("SELECT count(DISTINCT coalesce(n, n)) FROM g2").starts_with("0A000 "));
   CHECK(error_of("SELECT count(DISTINCT coalesce(ch, ch)) FROM g2") ==
         "0A000 COUNT of DISTINCT values of a CHAR expression other than a column is not supported yet @7");

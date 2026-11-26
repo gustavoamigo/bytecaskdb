@@ -132,19 +132,22 @@ A column declared `jsonb` holds any JSON value PostgreSQL 17's `jsonb_in`
 accepts, in the binary layout `jsonb_design.md` describes, and returns
 `jsonb_out`'s text byte for byte. Everything about the type, its input
 grammar, normalisation, output, layout, limits and stages, is in
-`jsonb_design.md`; this section says where it meets the codec. Stages 1,
-3 and 4 are built: the column, its text in and out, casts with text,
+`jsonb_design.md`; this section says where it meets the codec. Stages 1
+to 4 are built: the column, its text in and out, casts with text,
 `DEFAULT`, `IS [NOT] NULL`, `COUNT`, `CASE` and `COALESCE`; the accessors
 `->`, `->>`, `#>`, `#>>`, `jsonb_typeof`, `jsonb_array_length`, and casts
 to `boolean`, the integers, `real`, `double precision` and `numeric`
 (`frontend_design.md`, *jsonb's accessors and casts out*); containment,
 existence, modification and construction, `to_jsonb` of every type but
 `CHAR(n)` among them (*jsonb's containment, existence, modification and
-construction*). `json` is stage 1c and refused (0A000).
+construction*); comparison, `ORDER BY`, `GROUP BY`, `DISTINCT` and set
+operations by the jsonb sort key (stage 2). `json` is stage 1c and refused
+(0A000).
 
 - **Physical type.** `PhysType::Jsonb` (6), `BC_T_JSONB` in the plan API,
-  a variable column (`is_fixed` is false), never a key part (`keyable` is
-  false). Every predicate on `PhysType` is an exhaustive switch, so a type
+  a variable column (`is_fixed` is false), never a table's or index's key
+  part (`keyable` is false), and a sort, group or set key's part by its
+  jsonb sort key (`sortable` is true, `bc_sort_key_jsonb`). Every predicate on `PhysType` is an exhaustive switch, so a type
   added later cannot fall through one.
 - **Row.** The stored value, format byte and node, in the variable region,
   as bytes are. `bc_row_set_param` reads a parameter's text with the parser
@@ -159,8 +162,9 @@ construction*). `json` is stage 1c and refused (0A000).
   at load; text that does not parse, or is not canonical, is a damaged
   catalog (`catalog_design.md`).
 - **Keys.** None yet: a jsonb primary key, `UNIQUE` or index column is
-  0A000 (`refuse_key_type`). Its key form is stage 2's sort key
-  (`jsonb_design.md`, *jsonb as a sort key and group key*).
+  0A000 (`refuse_key_type`). Its key form would be stage 2's sort key
+  (`jsonb_design.md`, *jsonb as a sort key and group key*), which orders
+  sorts, groups and sets today but does not decode.
 - **Edges.** A result, a parameter, a constant and Python's value are the
   canonical text; the binary form never leaves the layer.
 

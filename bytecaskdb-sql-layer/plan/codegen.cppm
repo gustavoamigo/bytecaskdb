@@ -184,11 +184,11 @@ auto suffix(PhysType t) -> std::string {
   return "i64";
 }
 
-// The suffix of a key's, a sort key's or a set's call for a value of type t:
-// a NUMERIC and a jsonb are carried and emitted, never keyed, compared or
-// deduplicated.
+// The suffix of a sort key's or a set's call for a value of type t: a
+// NUMERIC is carried and emitted, never ordered, compared or deduplicated;
+// a jsonb is by its jsonb sort key (bc_sort_key_jsonb, bc_sub_has_jsonb).
 auto key_suffix(PhysType t) -> std::string {
-  if (!keyable(t)) throw std::logic_error{"physical plan: a NUMERIC or a jsonb in a key, a sort key or a set"};
+  if (!sortable(t)) throw std::logic_error{"physical plan: a NUMERIC in a sort key or a set"};
   return suffix(t);
 }
 
@@ -506,7 +506,8 @@ auto op_text(Op op) -> std::string {
 // or an integer with a float: text and bytes compare as bytes (COLLATE "C"),
 // a float in PostgreSQL's float8 order (-0.0 equal to 0.0, NaN equal to NaN
 // and above every other value), an integer beside one cast to double as
-// PostgreSQL casts it to float8, the rest as C compares them.
+// PostgreSQL casts it to float8, a jsonb by its sort key (bc_jsonb_cmp), the
+// rest as C compares them.
 auto compare_text(SqlType at, SqlType bt, Op op, const std::string& a, const std::string& b) -> std::string {
   auto x = phys_type(at);
   auto y = phys_type(bt);
@@ -517,7 +518,7 @@ auto compare_text(SqlType at, SqlType bt, Op op, const std::string& a, const std
   switch (x) {
     case PhysType::Bytes: return "bc_bytes_cmp(cx, " + a + ", " + b + ") " + op_text(op) + " 0";
     case PhysType::Num: throw std::logic_error{"physical plan: a comparison of a NUMERIC"};
-    case PhysType::Jsonb: throw std::logic_error{"physical plan: a comparison of a jsonb"};
+    case PhysType::Jsonb: return "bc_jsonb_cmp(cx, " + a + ", " + b + ") " + op_text(op) + " 0";
     case PhysType::F64:
     case PhysType::I64:
     case PhysType::Bool: break;
@@ -607,7 +608,7 @@ public:
   void run_correlated(std::size_t i) {
     for (const auto& a : w_.p().subs[i].args) {
       auto p = std::to_string(a.param);
-      auto set = "bc_sub_arg_" + suffix(a.col.type) + "(cx, " + p + ", " + read_col(a.col) + ");";
+      auto set = "bc_sub_arg_" + carry_suffix(a.col.type) + "(cx, " + p + ", " + read_col(a.col) + ");";
       if (!a.col.nullable) {
         w_.line(set);
         continue;
@@ -2546,7 +2547,9 @@ private:
       w_.line("++n;");  // COUNT(*)
       return;
     }
-    if (a.distinct && a.args[0].kind == Expr::Kind::Column) {
+    // A jsonb column's stored bytes are no key (1 and 1.0 differ): it is
+    // keyed by its sort key, as an expression is.
+    if (a.distinct && a.args[0].kind == Expr::Kind::Column && a.args[0].col.type != PhysType::Jsonb) {
       const auto& arg = a.args[0].col;
       auto group = "bc_agg_group(cx, groups, bc_col_key(cx, " + row_of(arg) + ", " + w_.col(arg) + "));";
       w_.line(arg.nullable ? "if (!" + arg_of_row(arg).first + ") " + group : group);
@@ -2692,8 +2695,14 @@ private:
       // streamed (physical::check).
       auto slot = std::to_string(g.layout.expr_slot.at(static_cast<std::size_t>(e.constant)));
       auto at = "(cx, " + g.handle + ", " + slot + ")";
-      auto value = std::string{e.phys() == PhysType::F64 ? "bc_agg_f64" : e.phys() == PhysType::Bytes ? "bc_agg_bytes" : "bc_agg_i64"} + at;
+      auto value = std::string{e.phys() == PhysType::F64                                       ? "bc_agg_f64"
+                               : e.phys() == PhysType::Bytes || e.phys() == PhysType::Jsonb ? "bc_agg_bytes"
+                                                                                            : "bc_agg_i64"} +
+                   at;
       if (e.phys() == PhysType::Bool) value = "(" + value + " != 0)";
+      // A jsonb key is held as its first row's text, read back by jsonb_in:
+      // that value, its scale kept (fold_into_structure).
+      if (e.phys() == PhysType::Jsonb) value = "bc_jsonb_in(cx, " + value + ")";
       return {"bc_agg_null" + at, value};
     }
     if (e.kind == Expr::Kind::Column) {
@@ -2919,11 +2928,15 @@ private:
         w_.line(c.nullable ? "if (!" + col_null(c) + ") " + put : put);
       }
       // An expression key's value, set once: on an empty slot a minimum
-      // stores it exactly, -0.0 and NaN included. A NULL leaves it unset.
+      // stores it exactly, -0.0 and NaN included. A NULL leaves it unset. A
+      // jsonb's is its text: the group prints its first row's value, never
+      // one rebuilt from the sort key, which has lost the scale.
       for (std::size_t j = 0; j < exprs.size(); ++j) {
         const auto& v = exprs[j];
-        auto fold = v.type == PhysType::F64 ? "bc_agg_min_f64" : v.type == PhysType::Bytes ? "bc_agg_min_bytes" : "bc_agg_min_i64";
-        auto put = std::string{fold} + "(cx, " + gg + ", " + std::to_string(g.layout.expr_slot[j]) + ", " + v.value + ");";
+        auto jsonb = v.type == PhysType::Jsonb;
+        auto fold = v.type == PhysType::F64 ? "bc_agg_min_f64" : v.type == PhysType::Bytes || jsonb ? "bc_agg_min_bytes" : "bc_agg_min_i64";
+        auto value = jsonb ? "bc_jsonb_text(cx, " + v.value + ")" : v.value;
+        auto put = std::string{fold} + "(cx, " + gg + ", " + std::to_string(g.layout.expr_slot[j]) + ", " + value + ");";
         w_.line(v.null.empty() ? put : "if (" + is_not(v.null) + ") " + put);
       }
       w_.close();

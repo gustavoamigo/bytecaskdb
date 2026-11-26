@@ -1,6 +1,9 @@
 # Plan API: a physical algebra for generated plans
 
-Status: **built**, revision 25 (revision 25 with jsonb's containment,
+Status: **built**, revision 26 (revision 26 with jsonb's comparison and
+order, `bc_jsonb_cmp`, `bc_sort_key_jsonb` and `bc_sub_has_jsonb`, and
+`bc_sort_key_col` of a jsonb column (`jsonb_design.md`, stage 2, *jsonb
+comparison and order in the plan API* below); revision 25 with jsonb's containment,
 existence, modification and construction, `bc_jsonb_contains`,
 `bc_jsonb_exists`, `_exists_any`, `_exists_all`, `bc_jsonb_concat`,
 `bc_jsonb_delete_key`, `_delete_index`, `_delete_keys`, `_delete_path`,
@@ -743,6 +746,27 @@ bc_jsonb bc_jsonb_build_object(bc_ctx *, uint32_t n, const bc_jsonb *args, const
 | `bc_jsonb_of_*` | `to_jsonb` of a value: an integer, DECIMAL (at `scale`), date, time, timetz, timestamp or timestamptz (`bc_sql_type`; ISO 8601 with a `T`); a float as a number, a string for NaN and the infinities, or, as an object's key, its `float8out` text; a boolean; text as a string; a NUMERIC's text as a number, a string for NaN and the infinities. |
 | `bc_jsonb_build_array`, `_build_object` | At most 100 arguments, each converted or NULL (`nulls[i]`, a JSON null); an object's keys alternate with its values, the last of equal keys kept, 22023 for an odd count, a NULL key or a jsonb one (`composite[i]`). |
 
+### jsonb comparison and order in the plan API
+
+Revision 26 (`jsonb_design.md`, stage 2). One encoding orders jsonb: the
+jsonb sort key (`jsonb_design.md`, *jsonb as a sort key and group key*),
+whose `memcmp` order is PostgreSQL 17's `jsonb_ops` order in a C database
+and whose byte equality is its equality (`1` = `1.0`, key order
+irrelevant). It is charged before it is built, never decoded, and a
+damaged value is `BC_E_CORRUPT`.
+
+```c
+int      bc_jsonb_cmp(bc_ctx *, bc_jsonb a, bc_jsonb b);
+void     bc_sort_key_jsonb(bc_ctx *, bc_sort_key, bc_jsonb, uint32_t dir, uint32_t nulls);
+bool     bc_sub_has_jsonb(bc_ctx *, uint32_t sub, bc_jsonb);
+```
+
+| Function | What it does |
+|---|---|
+| `bc_jsonb_cmp` | -1, 0 or 1 as `a < b`, `a = b` or `a > b`: `memcmp` of the two sort keys, each charged while it is held. What codegen prints for every jsonb comparison. |
+| `bc_sort_key_jsonb` | Appends the value's sort key as the next part, inverted under `DESC`, charged its bound (the node's length plus one) before it is built. `bc_sort_key_col` of a jsonb column does the same from the row. A jsonb part has no `bc_sort_key_part_*` decoder: a plan carries the value in a payload part as its text (`bc_jsonb_text`, read back by `bc_jsonb_in`). |
+| `bc_sub_has_jsonb` | Whether a `BC_SUB_SET` subquery of jsonb holds a value equal to this one: the set holds each row's sort key. A `BC_SUB_BOUNDS` subquery of jsonb keeps its extremes by their sort keys and sets their text; a `BC_SUB_VALUE` one sets its text; each read by `bc_param_jsonb`. |
+
 A plan's constants are ids, emitted by the compiler from the catalog
 (`Catalog::constants`) and named from ids too, so that no SQL name has to be
 a C identifier:
@@ -1060,7 +1084,7 @@ bool     bc_sort_key_part_null(bc_ctx *, bc_view key, uint32_t part);
 |---|---|
 | `bc_sort_key_begin` | Starts an empty sort key: no namespace, no id and no layout. Returns a `bc_sort_key`, a handle type of its own, charged `kKeyEntryBytes` and owned by its step as a key builder is. |
 | `bc_sort_key_i64`, `bc_sort_key_f64`, `bc_sort_key_bool`, `bc_sort_key_bytes`, `bc_sort_key_null` | Appends one part: a value, or NULL, with its direction and NULL placement. Every call of one part takes the same `dir` and `nulls`, a NULL's too, so the plan writes a part's placement once. A `DOUBLE` orders as PostgreSQL's `float8`: `-0.0` and `0.0` make one key, every NaN one key above `+∞`. Before a part is built it is charged the most it can take (a `BYTES` value with every byte escaped: its marker, twice its length and the terminator), and a part that could take the key past `UINT32_MAX` bytes, a view's length, is `BC_E_LIMIT`; once built, the key is charged the bytes it holds. A `dir` or `nulls` outside its enum is `BC_E_HANDLE`. |
-| `bc_sort_key_col` | Appends a row's column as the next part, NULL included: what a plan uses for `ORDER BY col`. A column the plan's `bc_schema_ref` does not declare is `BC_E_HANDLE`, as for every column decoder. |
+| `bc_sort_key_col` | Appends a row's column as the next part, NULL included: what a plan uses for `ORDER BY col`; a jsonb column's part is its jsonb sort key (revision 26). A column the plan's `bc_schema_ref` does not declare is `BC_E_HANDLE`, as for every column decoder. |
 | `bc_sort_key_end` | Finalizes the key and returns its view, the step's. The engine's key ceiling does not apply: a sort key never reaches the engine, and its bytes are bounded by the memory budget and the 4 GiB limit on its parts. |
 
 | `bc_sort_key_part_*` | Reads part `part` back from a key built by `bc_sort_key_*`, or from a copy of its bytes: a sorter's payload, which is how a plan holds rows it can read back column by column when they are neither a table's rows nor an index's keys (a set operation's, `planner_design.md`, *Set operations*). `bc_sort_key_part_null` reports a NULL; a typed decoder of a NULL part returns zero or empty. The key holds no layout, so the parts are read in order, part 0 first, each part's type being learned when it is read (a `NULL` is known by its marker, a value by the decoder that read it): a plan calls `_null` and then the typed decoder of a part it does not know to be present, and reads each part again, if it needs to, as the type it read. A part read before its predecessor, or as another type than it was read as, is `BC_E_HANDLE`; a key that does not parse is `BC_E_CORRUPT`. Only `BC_SORT_ASC` parts decode (a `DESC` part is inverted, and reads as another value), and a `DOUBLE` reads back as the key holds it: `-0.0` is `0.0`, every NaN one NaN, so a plan that must keep a zero's sign carries it in a part of its own. A bytes part is unescaped into the arena, the step's, charged. Revision 13. |
@@ -1343,6 +1367,7 @@ void bc_sub_arg_i64(bc_ctx *, uint32_t i, int64_t);
 void bc_sub_arg_f64(bc_ctx *, uint32_t i, double);
 void bc_sub_arg_bool(bc_ctx *, uint32_t i, bool);
 void bc_sub_arg_bytes(bc_ctx *, uint32_t i, bc_view);  /* copied */
+void bc_sub_arg_jsonb(bc_ctx *, uint32_t i, bc_jsonb);  /* as its text (revision 26) */
 ```
 
 | Function | What it does |
@@ -1350,7 +1375,7 @@ void bc_sub_arg_bytes(bc_ctx *, uint32_t i, bc_view);  /* copied */
 | `bc_sub_begin` | Starts subquery `sub`: until `bc_sub_end`, each row emitted is one column of `type`, folded as `kind` says, or, for `BC_SUB_EXISTS`, a row of any columns, counted. One at a time. Its parameters, from `param` on, must be ones the caller passed as NULL, so `bc_sub_end` never overwrites a value the caller gave; one that is not is `BC_E_HANDLE`, before the run starts. An id run before runs again: its set starts empty and what the last run's set was charged is released. |
 | `bc_sub_end` | Sets its parameters, which every `bc_param_*` reads from then on until reset. `BC_SUB_VALUE`: its row's value, NULL for none; a second row fails the plan with `BC_E_CARDINALITY`. `BC_SUB_EXISTS`: a BOOL, whether a row came. `BC_SUB_BOUNDS`: the largest non-NULL value, then the smallest (NULL for none), then NULL if a row was NULL else FALSE, then whether a row came. `BC_SUB_SET`: the last two. Then it releases what the run made, as the end of a loop's step does: the handles (views, keys, rows, cursors, probes) and copies made since `bc_sub_begin`, and the sorters, hash tables and aggregates opened since, with their charge; a handle of one is stale. A subquery that sorts, hashes or groups therefore holds one run's worth however often it runs. A loop outside the subquery that moved on inside it is `BC_E_HANDLE`. |
 | `bc_sub_has_*` | Whether a `BC_SUB_SET` subquery's non-NULL values hold the value, as PostgreSQL's `=` compares: bytes bytewise, a DOUBLE's -0.0 equal to 0.0 and NaN to NaN. The set is charged and lives until reset or until `sub` runs again; a `sub` not run is `BC_E_HANDLE`. |
-| `bc_sub_arg_*` | Sets parameter `i` to the value, for the subquery's next run to read with `bc_param_*`, until it is set again. `i` must be a parameter the caller passed as NULL: a value the caller gave is never overwritten, and another `i` is `BC_E_HANDLE`. Bytes are copied and charged; the parameter is charged its current value only, so setting it again releases the old one. Each write of a parameter, by `bc_sub_arg_*` or by `bc_sub_end`, makes a `bc_param_bytes` view of its old value stale: reading it is `BC_E_HANDLE`, never a dangling read. |
+| `bc_sub_arg_*` | Sets parameter `i` to the value, for the subquery's next run to read with `bc_param_*`, until it is set again. `i` must be a parameter the caller passed as NULL: a value the caller gave is never overwritten, and another `i` is `BC_E_HANDLE`. Bytes are copied and charged; a jsonb is set as its text (`jsonb_out`'s), which `bc_param_jsonb` parses back (revision 26); the parameter is charged its current value only, so setting it again releases the old one. Each write of a parameter, by `bc_sub_arg_*` or by `bc_sub_end`, makes a `bc_param_bytes` view of its old value stale: reading it is `BC_E_HANDLE`, never a dangling read. |
 
 Values order as the layer compares them: integers and BOOLs numerically,
 bytes bytewise (`COLLATE "C"`), DOUBLEs with NaN above every other value.

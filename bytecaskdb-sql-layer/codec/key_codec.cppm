@@ -72,6 +72,22 @@ enum class PhysType : std::uint8_t { I64 = 1, F64 = 2, Bool = 3, Bytes = 4, Num 
   return false;
 }
 
+// Whether a value of this type is a sort or group key's part (a sorter's,
+// a GROUP BY's, a DISTINCT's or a set operation's): every keyable type, and
+// a jsonb by its jsonb sort key (docs/jsonb_design.md, *jsonb as a sort key
+// and group key*), which a sort key carries but never decodes.
+[[nodiscard]] constexpr auto sortable(PhysType t) noexcept -> bool {
+  switch (t) {
+    case PhysType::I64:
+    case PhysType::F64:
+    case PhysType::Bool:
+    case PhysType::Bytes:
+    case PhysType::Jsonb: return true;
+    case PhysType::Num: return false;
+  }
+  return false;
+}
+
 // One part of a key layout: its type, whether it carries a null marker, and
 // whether it is inverted (DESC).
 struct KeyPart {

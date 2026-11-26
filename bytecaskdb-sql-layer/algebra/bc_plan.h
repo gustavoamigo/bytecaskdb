@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT
    Copyright (c) 2026 Gustavo Amigo
 
-   bc_plan.h — the plan API of docs/plan_api_design.md (revision 25). A plan is
+   bc_plan.h — the plan API of docs/plan_api_design.md (revision 26). A plan is
    a function in a restricted subset of C that calls these functions and
    nothing else. Declarations are the document's, verbatim; bc_db, bc_catalog
    and bc_params are opaque here and built by the runtime
@@ -489,6 +489,14 @@ bc_jsonb bc_jsonb_of_text(bc_ctx *, bc_view text);
 bc_jsonb bc_jsonb_of_num(bc_ctx *, bc_view numeric_text);
 bc_jsonb bc_jsonb_build_array(bc_ctx *, uint32_t n, const bc_jsonb *args, const bool *nulls);
 bc_jsonb bc_jsonb_build_object(bc_ctx *, uint32_t n, const bc_jsonb *args, const bool *nulls, const bool *composite);
+/* jsonb's comparison (docs/jsonb_design.md, stage 2): -1, 0 or 1 as a < b,
+   a = b or a > b in PostgreSQL 17's jsonb_ops order in a C database
+   (Object > Array > Boolean > Number > String > Null, a top-level empty
+   array below them all; objects by pair count, then their pairs in storage
+   order; arrays by length, then their elements; numbers by value, so
+   1 = 1.0; strings bytewise). It is memcmp of the two values' sort keys,
+   bc_sort_key_jsonb's, so ORDER BY, GROUP BY, DISTINCT and = agree. */
+int      bc_jsonb_cmp(bc_ctx *, bc_jsonb a, bc_jsonb b);
 /* Casts computed per row (docs/planner_design.md, *Plan API calls for runtime
    casts*), each over the same functions the binder folds a constant's cast
    with (sql/text.cppm), so a constant, a parameter and a row's value cast
@@ -620,6 +628,7 @@ void     bc_sort_key_i64(bc_ctx *, bc_sort_key, int64_t, uint32_t dir, uint32_t 
 void     bc_sort_key_f64(bc_ctx *, bc_sort_key, double, uint32_t dir, uint32_t nulls);   /* -0.0 is 0.0; NaN above +inf */
 void     bc_sort_key_bool(bc_ctx *, bc_sort_key, bool, uint32_t dir, uint32_t nulls);
 void     bc_sort_key_bytes(bc_ctx *, bc_sort_key, bc_view, uint32_t dir, uint32_t nulls);
+void     bc_sort_key_jsonb(bc_ctx *, bc_sort_key, bc_jsonb, uint32_t dir, uint32_t nulls);  /* its jsonb sort key: never decodes */
 void     bc_sort_key_null(bc_ctx *, bc_sort_key, uint32_t dir, uint32_t nulls);
 void     bc_sort_key_col(bc_ctx *, bc_sort_key, bc_view row, uint32_t col, uint32_t dir, uint32_t nulls);  /* NULL included */
 bc_view  bc_sort_key_end(bc_ctx *, bc_sort_key);
@@ -713,10 +722,12 @@ void bc_sub_arg_i64(bc_ctx *, uint32_t i, int64_t);
 void bc_sub_arg_f64(bc_ctx *, uint32_t i, double);
 void bc_sub_arg_bool(bc_ctx *, uint32_t i, bool);
 void bc_sub_arg_bytes(bc_ctx *, uint32_t i, bc_view);  /* copied */
+void bc_sub_arg_jsonb(bc_ctx *, uint32_t i, bc_jsonb);  /* as its text, which bc_param_jsonb reads back */
 bool bc_sub_has_i64(bc_ctx *, uint32_t sub, int64_t);   /* whether the BC_SUB_SET holds the value */
 bool bc_sub_has_f64(bc_ctx *, uint32_t sub, double);    /* -0.0 is 0.0, and NaN is one value, as PostgreSQL's = */
 bool bc_sub_has_bool(bc_ctx *, uint32_t sub, bool);
 bool bc_sub_has_bytes(bc_ctx *, uint32_t sub, bc_view);
+bool bc_sub_has_jsonb(bc_ctx *, uint32_t sub, bc_jsonb);  /* by jsonb equality (1 = 1.0); a BC_SUB_SET of BC_T_JSONB */
 
 /* Ephemeral structures */
 bc_sorter bc_sorter_open(bc_ctx *, int64_t keep);        /* keep the first `keep` in sort order; 0 = all */

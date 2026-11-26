@@ -12,7 +12,9 @@
 //   prints text that parses back to the same bytes; the walks of stage 4
 //   (containment, concatenation, a path's deletion, strip_nulls and
 //   jsonb_pretty) over the node give a result, a user error or Corrupt,
-//   and a node the full check accepts contains itself.
+//   and a node the full check accepts contains itself; its sort key (stage
+//   2) is a key within its bound or Corrupt, and a node the full check
+//   accepts has one.
 // - parse: any text gives a value or one of jsonb_in's errors; the value
 //   passes the full check, and its text parses back to the same value.
 // Each returns false where a property breaks; the fuzz targets abort on it.
@@ -77,6 +79,10 @@ inline auto decode_holds(std::span<const std::byte> bytes) -> bool {
     std::string out(static_cast<std::size_t>(length), '\0');
     if (!jb::write_text(bytes, {}, std::span{out.data(), out.size()}).ok()) return false;
   }
+  std::vector<std::byte> key;
+  auto keyed = jb::sort_key_value(bytes, key);
+  if (keyed.status != jb::Status::Ok && keyed.status != jb::Status::Corrupt) return false;
+  if ((counted.ok() && !keyed.ok()) || key.size() > jb::sort_key_bound(bytes)) return false;
   return stage4_holds(bytes, counted.ok(), counted.ok() && length < (std::uint64_t{1} << 20));
 }
 

@@ -12,7 +12,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -691,7 +693,86 @@ TEST_CASE("jsonb round trip: generated values parse, check, print and parse back
   }
 }
 
-TEST_CASE("PhysType: every predicate answers for every value of the enum, Jsonb a variable non-key type", "[sql][jsonb]") {
+TEST_CASE("jsonb sort key: memcmp order is PostgreSQL 17's jsonb_ops order, byte equality its equality", "[sql][jsonb]") {
+  // Each row one class of equal values, the rows in PostgreSQL 17's order
+  // (C collation), as `SELECT j FROM t ORDER BY j` printed them.
+  const std::vector<std::vector<std::string_view>> order{
+      {"[]"}, {"null"}, {"\"\""}, {"\"10\""}, {"\"9\""}, {"\"B\""}, {"\"a\""}, {"\"ab\""}, {"\"b\""}, {"\"é\""},
+      {"-1e131071"}, {"-10"}, {"-1"}, {"-0.5"}, {"-1e-3"}, {"-1e-16383"}, {"0", "-0", "0.0", "0e-5"}, {"1e-16383"},
+      {"1e-3"}, {"1", "1.0", "1.00", "10e-1"}, {"100", "1e2"}, {"1e131071"}, {"false"}, {"true"}, {"[null]"}, {"[\"a\"]"},
+      {"[-1]"}, {"[1]", "[1.0]"}, {"[2]"}, {"[true]"}, {"[[]]"}, {"[[1]]"}, {"[[3]]"}, {"[[1, 2]]"}, {"[{}]"}, {"[1, 2]"},
+      {"[1, 1, 1]"}, {"{}"}, {"{\"a\": null}"}, {"{\"a\": 1}", "{\"a\": 1.0}"}, {"{\"a\": 2}"}, {"{\"a\": [1]}"},
+      {"{\"a\": {\"b\": null}}"}, {"{\"a\": {\"b\": []}}"}, {"{\"aa\": 0}"}, {"{\"b\": 0}"}, {"{\"z\": 0}"},
+      {"{\"a\": 1, \"b\": 1}", "{\"b\": 1, \"a\": 1}"}, {"{\"a\": 1, \"c\": 1}"}, {"{\"ab\": 1, \"ac\": 1}"},
+      {"{\"b\": 1, \"aa\": 1}"}, {"{\"b\": 1, \"c\": 1}"}, {"{\"z\": 1, \"aa\": 1}"}};
+  struct Keyed {
+    std::size_t rank;
+    Value key;
+  };
+  std::vector<Keyed> keys;
+  for (std::size_t r = 0; r < order.size(); ++r) {
+    for (auto text : order[r]) {
+      Value value;
+      REQUIRE(jb::parse_value(text, value).ok());
+      auto node = *jb::node_of(value);
+      Value key;
+      INFO(text);
+      REQUIRE(jb::sort_key_value(node, key).ok());
+      CHECK(key.size() <= jb::sort_key_bound(node));
+      keys.push_back({r, std::move(key)});
+    }
+  }
+  for (const auto& a : keys) {
+    for (const auto& b : keys) {
+      auto o = std::lexicographical_compare_three_way(a.key.begin(), a.key.end(), b.key.begin(), b.key.end());
+      INFO(a.rank << " vs " << b.rank);
+      CHECK((a.rank < b.rank) == std::is_lt(o));
+      CHECK((a.rank == b.rank) == std::is_eq(o));
+      // Prefix-free: a key concatenates with the next part of a sort key.
+      if (a.key.size() < b.key.size()) CHECK_FALSE(std::equal(a.key.begin(), a.key.end(), b.key.begin()));
+    }
+  }
+  // A nested empty array is an array, not the top level's lowest value.
+  Value inner;
+  REQUIRE(jb::parse_value("[[]]", inner).ok());
+  std::optional<jb::ByteView> found;
+  REQUIRE(jb::element(*jb::node_of(inner), 0, found).ok());
+  Value key;
+  REQUIRE(jb::sort_key_value(*found, key).ok());
+  CHECK(key == bytes({0x01}));  // a value of its own, as PostgreSQL's -> result is
+}
+
+TEST_CASE("jsonb sort key: a damaged node is Corrupt, never a key; its stack is charged", "[sql][jsonb]") {
+  Value key;
+  auto corrupt = [&](const Value& node) { return jb::sort_key_value(node, key).status == jb::Status::Corrupt; };
+  // A NUL in a string or a key would let two keys share a prefix.
+  CHECK(corrupt(bytes({0x05, 'a', 0x00, 'b'})));
+  CHECK(corrupt(object_node(1, {1}, {1}, std::string_view{"\0", 1}, bytes({0x01}))));
+  CHECK(corrupt(number_node(1, 0, 0, "10")));
+  CHECK(corrupt(number_node(1, 0, std::numeric_limits<std::int32_t>::max(), "1")));
+  CHECK(corrupt(array_node(2, {1, 3}, bytes({0x01, 0x01}))));
+  CHECK(corrupt(bytes({0x02, 0x00})));
+  CHECK(corrupt(bytes({0x08})));
+  CHECK(corrupt(Value{}));
+  Value deep{std::byte{0x01}};
+  for (int i = 0; i < 10001; ++i) deep = array_node(1, {static_cast<std::uint32_t>(deep.size())}, deep);
+  CHECK(corrupt(deep));
+  // A buffer short of the bound is Corrupt, never a write past it.
+  Value value;
+  REQUIRE(jb::parse_value("{\"a\": [1, \"x\"]}", value).ok());
+  auto node = *jb::node_of(value);
+  std::vector<std::byte> out(4);
+  std::size_t length = 0;
+  CHECK(jb::sort_key(node, {}, out, length).status == jb::Status::Corrupt);
+  // A refused charge of the walk's stack is Refused.
+  jb::Memory none{nullptr, [](void*, std::uint64_t, jb::Site) { return false; }, nullptr};
+  out.resize(jb::sort_key_bound(node));
+  CHECK(jb::sort_key(node, none, out, length).status == jb::Status::Refused);
+  REQUIRE(jb::parse_value("\"x\"", value).ok());
+  CHECK(jb::sort_key(*jb::node_of(value), none, out, length).ok());  // a scalar takes no stack
+}
+
+TEST_CASE("PhysType: every predicate answers for every value of the enum, Jsonb a variable non-key type that sorts", "[sql][jsonb]") {
   struct Row {
     PhysType t;
     bool fixed, key;
@@ -703,6 +784,7 @@ TEST_CASE("PhysType: every predicate answers for every value of the enum, Jsonb 
     INFO(static_cast<int>(r.t));
     CHECK(is_fixed(r.t) == r.fixed);
     CHECK(keyable(r.t) == r.key);
+    CHECK(sortable(r.t) == (r.key || r.t == PhysType::Jsonb));
     CHECK(phys_type_known(r.t));
     CHECK(plain_sql_type(r.t).kind == r.plain);
     CHECK(fixed_width_valid(r.t, 8) == (r.t == PhysType::I64 || r.t == PhysType::F64));

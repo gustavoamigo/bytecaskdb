@@ -9,7 +9,8 @@
 // and HINT, a result that changes nothing being its input's own handle,
 // BC_E_HANDLE for a view that is no path and a build without its arrays,
 // BC_E_CORRUPT on a damaged stored value, and the budget and
-// allocation-failure sweeps.
+// allocation-failure sweeps. And stage 2's comparison and sort key,
+// bc_jsonb_cmp and bc_sort_key_jsonb (revision 26).
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -45,6 +46,7 @@ const bc_value kNull = std::monostate{};
 constexpr std::array<PhysType, 1> kJsonbRow{PhysType::Jsonb};
 constexpr std::array<PhysType, 1> kBytesRow{PhysType::Bytes};
 constexpr std::array<PhysType, 1> kBoolRow{PhysType::Bool};
+constexpr std::array<PhysType, 1> kI64Row{PhysType::I64};
 
 void make_jt(Fixture& f) {
   auto col = [](std::string name, SqlKind k, bool nullable) { return bytecask::sql::ColumnSpec{std::move(name), {k}, nullable, {}}; };
@@ -200,6 +202,37 @@ void of_bad_type(bc_ctx* cx) {
   bc_emit_jsonb(cx, bc_jsonb_of_i64(cx, 1, BC_TYPE_TEXT, 0));
   bc_emit_end(cx);
 }
+// Stage 2: j compared with $1 (-1, 0 or 1), and jt's keys in the order of
+// a sort by j (its jsonb sort key, or bc_sort_key_col's part), NULLs last,
+// ties by key.
+void compare(bc_ctx* cx) {
+  each_j(cx, [](bc_ctx* c, bc_jsonb j) { bc_emit_i64(c, bc_jsonb_cmp(c, j, bc_param_jsonb(c, 0))); });
+}
+template <bool kCol, std::uint32_t kDir>
+void sorted(bc_ctx* cx) {
+  bc_sorter s = bc_sorter_open(cx, 0);
+  bc_cursor c = bc_scan_open(cx, g_jt, bc_empty(cx), bc_empty(cx), BC_SCAN_FORWARD);
+  while (bc_scan_next(cx, c)) {
+    bc_view row = bc_scan_row(cx, c);
+    bc_sort_key sk = bc_sort_key_begin(cx);
+    if (kCol) {
+      bc_sort_key_col(cx, sk, row, kJCol, kDir, BC_SORT_NULLS_LAST);
+    } else if (bc_col_null(cx, row, kJCol)) {
+      bc_sort_key_null(cx, sk, kDir, BC_SORT_NULLS_LAST);
+    } else {
+      bc_sort_key_jsonb(cx, sk, bc_col_jsonb(cx, row, kJCol), kDir, BC_SORT_NULLS_LAST);
+    }
+    bc_sort_key_i64(cx, sk, bc_col_i64(cx, row, kKCol), BC_SORT_ASC, BC_SORT_NULLS_LAST);
+    bc_sorter_add(cx, s, bc_sort_key_end(cx, sk), row);
+  }
+  bc_view p = bc_empty(cx);
+  while (bc_sorter_next(cx, s, &p)) {
+    bc_emit_begin(cx);
+    bc_emit_i64(cx, bc_col_i64(cx, p, kKCol));
+    bc_emit_end(cx);
+  }
+}
+
 void text_as_path(bc_ctx* cx) {
   each_j(cx, [](bc_ctx* c, bc_jsonb j) { bc_emit_jsonb(c, bc_jsonb_delete_path(c, j, bc_param_bytes(c, 2))); });
 }
@@ -332,6 +365,35 @@ TEST_CASE("plan API jsonb ops: ||, -, #-, jsonb_set, jsonb_insert, jsonb_strip_n
   CHECK(column(g, kJsonbRow) == Col{"[1, [2]]"});
 }
 
+TEST_CASE("plan API jsonb ops: bc_jsonb_cmp and bc_sort_key_jsonb order as PostgreSQL 17's jsonb_ops (stage 2)",
+          "[sql][algebra][jsonb]") {
+  Fixture f;
+  make_jt(f);
+  // Keys 1..12; PostgreSQL 17's ORDER BY j, k: 2 6 4 9 5 12 3 10 7 8 1, then the NULL.
+  fill(f, {R"({"b": 1, "c": 1})", "[]", "true", "\"a\"", "1.00", "null", "[1, 2]", "{}", "-1", "[null]", nullptr, "1"});
+  const Col asc{"2", "6", "4", "9", "5", "12", "3", "10", "7", "8", "1", "11"};
+  const Col desc{"1", "8", "7", "10", "3", "5", "12", "9", "4", "6", "2", "11"};
+  REQUIRE(run(f, sorted<false, BC_SORT_ASC>, {}, kI64Row) == BC_COMMITTED);
+  CHECK(column(f, kI64Row) == asc);
+  REQUIRE(run(f, sorted<true, BC_SORT_ASC>, {}, kI64Row) == BC_COMMITTED);
+  CHECK(column(f, kI64Row) == asc);
+  REQUIRE(run(f, sorted<false, BC_SORT_DESC>, {}, kI64Row) == BC_COMMITTED);
+  CHECK(column(f, kI64Row) == desc);
+  REQUIRE(run(f, sorted<true, BC_SORT_DESC>, {}, kI64Row) == BC_COMMITTED);
+  CHECK(column(f, kI64Row) == desc);
+  // By value: 1.0 equals 1.00 and 1; key order is no order.
+  REQUIRE(run(f, compare, ps("1.0", "a", "{}"), kI64Row) == BC_COMMITTED);
+  CHECK(column(f, kI64Row) == Col{"1", "-1", "1", "-1", "0", "-1", "1", "1", "-1", "1", "NULL", "0"});
+  REQUIRE(run(f, compare, ps(R"({"c": 1, "b": 1.0})", "a", "{}"), kI64Row) == BC_COMMITTED);
+  CHECK(column(f, kI64Row).front() == "0");
+  // A damaged stored value is BC_E_CORRUPT, never an order.
+  put_raw(f, 13, raw({0xF8, 0x05, 'a', 0x00}));
+  for (auto* plan : {compare, sorted<false, BC_SORT_ASC>, sorted<true, BC_SORT_DESC>}) {
+    CHECK(run(f, plan, ps("1", "a", "{}"), kI64Row) == BC_FAILED);
+    CHECK(bc_error(f.cx) == BC_E_CORRUPT);
+  }
+}
+
 TEST_CASE("plan API jsonb ops: errors carry PostgreSQL's SQLSTATE, message and HINT", "[sql][algebra][jsonb]") {
   Fixture f;
   make_jt(f);
@@ -398,7 +460,8 @@ TEST_CASE("plan API jsonb ops: a budget sweep gives BC_E_LIMIT or the whole resu
   };
   for (const auto& c : {Case{contains, ps(R"({"k": [{"n": null}]})", "a", "{}"), kBoolRow},
                         Case{concat, ps(R"({"z": [1]})", "a", "{}"), kJsonbRow}, Case{set, ps("[1]", "a", "{k,39,v}"), kJsonbRow},
-                        Case{strip_nulls, {}, kJsonbRow}, Case{pretty, {}, kBytesRow}, Case{delete_keys, ps("{}", "a", "{n,k}"), kJsonbRow}}) {
+                        Case{strip_nulls, {}, kJsonbRow}, Case{pretty, {}, kBytesRow}, Case{delete_keys, ps("{}", "a", "{n,k}"), kJsonbRow},
+                        Case{compare, ps(R"({"n": 1})", "a", "{}"), kI64Row}, Case{sorted<false, BC_SORT_DESC>, {}, kI64Row}}) {
     REQUIRE(run(f, c.plan, c.params, c.row) == BC_COMMITTED);
     auto want = column(f, c.row);
     auto limits = 0;

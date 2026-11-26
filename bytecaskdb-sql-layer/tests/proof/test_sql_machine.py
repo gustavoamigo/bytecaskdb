@@ -2192,7 +2192,7 @@ def test_a_jsonb_column_returns_postgresqls_text_on_both_targets(dsn):
     it, from a literal, a parameter or a cast of text, normalised (the last
     duplicate key, keys shorter first, numbers with their scale) and returned
     as jsonb_out's text, the edge form the model keeps; embedded and over the
-    wire alike. Not compared, ordered or a key yet (0A000)."""
+    wire alike. Not a key yet (0A000)."""
     m = keyless_machine(dsn)()
     try:
         ddl = "CREATE TABLE j0 (k BIGINT PRIMARY KEY, v jsonb, w jsonb DEFAULT '{\"d\": [1.0]}'::jsonb, s TEXT)"
@@ -2218,8 +2218,7 @@ def test_a_jsonb_column_returns_postgresqls_text_on_both_targets(dsn):
         (table,) = [t for t in m.db.catalog() if t["name"] == "j0"]
         defaults = {c["name"]: c["default"] for c in table["columns"]}
         assert defaults["w"] == '{"d": [1.0]}' and defaults["v"] is None
-        for refused in ("SELECT k FROM j0 WHERE v = '{}'", "SELECT v FROM j0 ORDER BY v", "CREATE INDEX j0_v ON j0 (v)"):
-            assert m.layer(refused).sqlstate == "0A000", refused
+        assert m.layer("CREATE INDEX j0_v ON j0 (v)").sqlstate == "0A000"
         assert o.run_pg(m.pg.conn, "DROP TABLE j0").error is None
     finally:
         m.teardown()
@@ -2260,6 +2259,60 @@ def test_the_jsonb_accessors_agree_with_postgresql_on_both_targets(dsn):
                     "SELECT v -> 1::bigint FROM j1", "SELECT $1 -> 'a'"]:
             m.both(sql, ["{}"] if "$1" in sql else [])
         assert o.run_pg(m.pg.conn, "DROP TABLE j1").error is None
+    finally:
+        m.teardown()
+
+
+def test_jsonb_comparison_order_and_groups_agree_with_postgresql_on_both_targets(c_dsn):
+    """jsonb's comparison and order (docs/jsonb_design.md, stage 2): = <> <
+    <= > >=, IN, BETWEEN, NULLIF, ORDER BY, GROUP BY, DISTINCT, COUNT(DISTINCT),
+    UNION, INTERSECT, EXCEPT and subqueries, of columns, accessors' values,
+    parameters and literals drawn from a seeded generator, PostgreSQL 17's
+    jsonb_ops order in a C database (numbers by value, objects by pair count
+    then pairs, arrays by length, the top-level empty array first). Each
+    result and each SQLSTATE is PostgreSQL 17's, embedded and over the wire.
+    A group prints its first row's value, so the stored values are written
+    one way each; parameters write them other ways (1.0 for 1)."""
+    import random
+
+    m = keyless_machine(c_dsn)()
+    try:
+        assert m.both("CREATE TABLE j2 (k BIGINT PRIMARY KEY, v jsonb, w jsonb)").error is None
+        docs = ["[]", "null", '""', '"a"', '"B"', '"ab"', "-1", "0", "1", "2.50", "1e2", "false", "true", "[null]",
+                '[1, 2]', "[[]]", '[{"a": 1}]', "{}", '{"a": 1}', '{"a": [1]}', '{"b": 1, "aa": 1}', '{"c": 1, "a": 1}', None]
+        params = ["1.0", "1.00", "-1.0", "2.5", "100", "0.0", '{"a": 1.0}', '{"aa": 1, "b": 1.0}', "[1.0, 2.0]", '"a"', "[]",
+                  "{}", "null", "true", '[{"a": 1.0}]']
+        rng = random.Random(20261127)
+        for k in range(30):
+            v, w = rng.choice(docs), rng.choice(docs)
+            assert m.both("INSERT INTO j2 (k, v, w) VALUES ($1, $2, $3)", [k, v, w]).error is None, (k, v, w)
+        for _ in range(30):
+            a, b = rng.choice(params), rng.choice(params)
+            for sql, ps in [
+                ("SELECT k, v = w, v <> w, v < w, v <= w, v > w, v >= w FROM j2 ORDER BY k", []),
+                ("SELECT k FROM j2 WHERE v = $1 ORDER BY k", [a]),
+                ("SELECT k FROM j2 WHERE v < $1 OR w >= $2 ORDER BY k", [a, b]),
+                ("SELECT k FROM j2 WHERE v IN ($1, $2) ORDER BY k", [a, b]),
+                ("SELECT k FROM j2 WHERE v BETWEEN $1 AND $2 ORDER BY k", [a, b]),
+                ("SELECT k, nullif(v, $1) FROM j2 ORDER BY k", [a]),
+                ("SELECT k, v -> 'a' = $1::jsonb FROM j2 ORDER BY k", [a]),
+                ("SELECT $1::jsonb = $2::jsonb, $1::jsonb < $2::jsonb", [a, b]),
+            ]:
+                m.both(sql, ps)
+        for sql in ["SELECT k FROM j2 ORDER BY v, k", "SELECT k FROM j2 ORDER BY v DESC NULLS LAST, w, k",
+                    "SELECT k FROM j2 ORDER BY v -> 'a', k", "SELECT v, count(*) FROM j2 GROUP BY v ORDER BY v",
+                    "SELECT w, count(*), count(DISTINCT v) FROM j2 GROUP BY w ORDER BY w DESC",
+                    "SELECT DISTINCT v FROM j2 ORDER BY v", "SELECT DISTINCT v -> 'a' FROM j2 ORDER BY 1",
+                    "SELECT count(DISTINCT v), count(DISTINCT w), count(DISTINCT v -> 'a') FROM j2",
+                    "SELECT v FROM j2 UNION SELECT w FROM j2 ORDER BY 1", "SELECT v FROM j2 INTERSECT SELECT w FROM j2 ORDER BY 1",
+                    "SELECT v FROM j2 EXCEPT SELECT w FROM j2 ORDER BY 1",
+                    "SELECT a.k, b.k FROM j2 a JOIN j2 b ON a.v = b.w ORDER BY 1, 2",
+                    "SELECT k FROM j2 WHERE v IN (SELECT w FROM j2) ORDER BY k",
+                    "SELECT k FROM j2 WHERE v > ALL (SELECT w FROM j2 WHERE w IS NOT NULL) ORDER BY k",
+                    "SELECT v FROM j2 GROUP BY v HAVING count(*) > 1 ORDER BY v",
+                    "SELECT max(v) FROM j2", "SELECT k FROM j2 WHERE v = 'x'::text", "SELECT k FROM j2 WHERE v = 'x'"]:
+            m.both(sql)
+        assert o.run_pg(m.pg.conn, "DROP TABLE j2").error is None
     finally:
         m.teardown()
 
