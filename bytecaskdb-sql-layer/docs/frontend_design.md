@@ -616,10 +616,14 @@ evaluated on each row a plan reads, never a key's bound.
   selects, or an expression written alike; any other is 42P10, as in
   PostgreSQL. On a set operation a key that is not an output column is
   0A000 (*Set operations*).
-- *Refused (42601).* An expression key in a grouped or aggregated query
-  (an aggregate in `ORDER BY`, `ORDER BY a + 1` under `GROUP BY a`),
-  `ORDER BY random()`, which PostgreSQL draws once per row, and `ORDER BY
-  t.*`, which PostgreSQL orders by the whole row.
+- In a grouped query a key is a grouped column, a `GROUP BY` expression
+  written alike, or an aggregate call other than `AVG`; with no `GROUP
+  BY` there is one row, which a key orders nothing (#904 stage G1).
+- *Refused (42601).* Any other expression key in a grouped or aggregated
+  query (`ORDER BY a + 1` under `GROUP BY a`, an expression over an
+  aggregate, `AVG`, whose quotient is numeric text), after the 42803 of an
+  ungrouped column in it; `ORDER BY random()`, which PostgreSQL draws once
+  per row, and `ORDER BY t.*`, which PostgreSQL orders by the whole row.
 - `LIMIT` takes an integer literal or a parameter. `LIMIT NULL` is no
   limit, and a negative limit is refused (2201W), as in PostgreSQL.
 - `OFFSET` takes an integer literal: that many rows are skipped before
@@ -691,24 +695,30 @@ evaluated on each row a plan reads, never a key's bound.
     PostgreSQL's `SUM` and `MIN` of one are `real`, summed in single
     precision.
 
-**`SELECT DISTINCT`** is a `GROUP BY` of the selected columns, so it
-returns one row per distinct combination, NULL one value and a DOUBLE's
-`-0.0` and `0.0` one, as the grouping below makes them. Its `ORDER BY` must
-name selected columns (42P10) and it takes no `FOR UPDATE` (0A000), as in
-PostgreSQL. Over a query already aggregated it is nothing more where every
-`GROUP BY` column is selected, or where there is no `GROUP BY`; otherwise,
-and with a constant selected or `DISTINCT ON`, it is not taken yet.
+**`SELECT DISTINCT`** is a `GROUP BY` of the selected items, columns or
+expressions (*SELECT DISTINCT and aggregates of DISTINCT values of an
+expression*, #904 stage G1), so it returns one row per distinct
+combination, NULL one value and a DOUBLE's `-0.0` and `0.0` one, as the
+grouping below makes them. Its `ORDER BY` must name selected items (42P10)
+and it takes no `FOR UPDATE` (0A000), as in PostgreSQL. Over a query
+already aggregated it is nothing more where every `GROUP BY` key is
+selected, or where there is no `GROUP BY`; otherwise, and with `DISTINCT
+ON`, it is not taken yet.
 
 **`GROUP BY` and `HAVING`** (`planner_design.md`, *Aggregates*):
-- `GROUP BY` takes a list of columns of the statement's tables, of any type.
-  NULLs form one group, and a DOUBLE's `-0.0` and `0.0` one (its row shows
-  the value of the group's first row, as PostgreSQL's hashed aggregate
-  does). A key may be written as a select-list position (`GROUP BY 1`,
-  `(1)`) or an output name (`SELECT a AS k … GROUP BY k`) of an item that
-  is a column, by PostgreSQL 17's rule: a bare name is an input column
-  first, an output name only where no `FROM` relation has a column of it
-  (*GROUP BY of an expression*, #904 stage G0, **As built (G0)**). No
-  expressions, `GROUPING SETS`, `ROLLUP`, `CUBE` or `GROUP BY DISTINCT`.
+- `GROUP BY` takes a list of columns of the statement's tables, of any type,
+  and of value expressions of them (`lower(b)`, `props->>'k'`, `a + b`,
+  `(x::text)`), each computed per row (*GROUP BY of an expression*, #904
+  stages G0 and G1, **As built (G1)**). NULLs form one group, and a
+  DOUBLE's `-0.0` and `0.0` one (its row shows the value of the group's
+  first row, as PostgreSQL's hashed aggregate does). A key may be written
+  as a select-list position (`GROUP BY 1`, `(1)`) or an output name
+  (`SELECT a AS k … GROUP BY k`) of an item, by PostgreSQL 17's rule: a
+  bare name is an input column first, an output name only where no `FROM`
+  relation has a column of it (**As built (G0)**). A select item, `HAVING`
+  operand or `ORDER BY` key that is a key expression written alike is that
+  key's value; an expression over keys or aggregates waits for stage P3.
+  No `GROUPING SETS`, `ROLLUP`, `CUBE` or `GROUP BY DISTINCT`.
 - A column the select list, `ORDER BY` or `HAVING` names must be grouped,
   or of a table whose whole primary key is grouped: PostgreSQL's
   functional dependency. Every row of a group holds the same value of such
@@ -716,8 +726,9 @@ and with a constant selected or `DISTINCT ON`, it is not taken yet.
   from the group's rows, and the `GROUP BY` stays as written, so an
   index's order can still stream the groups. Anything else is 42803,
   PostgreSQL's message.
-- `HAVING` is a conjunction of comparisons of a grouped column or an
-  aggregate with a parameter. An aggregate written as the select list
+- `HAVING` is a conjunction of comparisons of a grouped column, a `GROUP
+  BY` expression written alike, or an aggregate with a parameter or a
+  constant. An aggregate written as the select list
   writes it is the same call, which the planner finds by its bound
   expression and folds once; any other is folded alongside. The parameter takes the column's type, or the
   aggregate's: `COUNT`'s and an integer `SUM`'s `bigint`, a `SUM` of a
@@ -737,8 +748,8 @@ and with a constant selected or `DISTINCT ON`, it is not taken yet.
   type of its own (`SqlKind::Numeric`), the type of a `NUMERIC` column
   declared without a precision; a result row carries its value as its
   text. A subquery of it is refused (0A000).
-- `ORDER BY` takes grouped columns; it sorts the groups, and `LIMIT` counts
-  them.
+- `ORDER BY` takes grouped columns, `GROUP BY` expressions written alike
+  and aggregates but `AVG`; it sorts the groups, and `LIMIT` counts them.
 
 **`FOR UPDATE`**, on a single-table `SELECT`:
 - every row returned is guarded with `bc_guard_unchanged`, and the commit
@@ -1291,10 +1302,14 @@ That includes:
   `IN` as a value, `GREATEST` and `LEAST`, `CASE` outside the plain select
   list (#685);
 - the quotient of a numeric other than constants, arithmetic and
-  comparison of `REAL` and `DOUBLE PRECISION` as values, an expression in
-  `GROUP BY`, an aggregated select list or the `ORDER BY` of a
-  grouped or aggregated query (#685, #686), `ORDER BY random()` and
-  `ORDER BY t.*`;
+  comparison of `REAL` and `DOUBLE PRECISION` as values, an expression
+  over keys or aggregates in an aggregated select list or the `ORDER BY`
+  of a grouped or aggregated query (#685, #686, stage P3), `ORDER BY` of
+  `AVG` in one, `ORDER BY random()` and `ORDER BY t.*`; a `GROUP BY` or
+  `DISTINCT` key of jsonb, NUMERIC of no precision (0A000) or CHAR type
+  other than a column (0A000), or of `random()`, the time, a subquery or a
+  grouped view's columns (42601) (*GROUP BY of an expression*, **What
+  stays refused**);
 - `OVERLAY` of columns and parameters,
   `||` of a boolean, float or date value, `LENGTH`, `CONCAT`,
   `REPLACE`, the regular-expression `SUBSTRING`, `bytea` string functions
@@ -1660,9 +1675,9 @@ until then.
   arithmetic and comparison as a value (unary `-` and `abs` of one are
   taken). An
   aggregate inside an expression (an expression is taken inside an
-  aggregate, *Aggregates*), an expression in the select list of an
-  aggregated query or under `DISTINCT`, an expression in the `ORDER BY` of
-  a grouped or aggregated query, in `GROUP BY` or a `WHERE`. `SET` takes
+  aggregate, *Aggregates*), an expression over keys or aggregates in the
+  select list or the `ORDER BY` of an aggregated query (a key expression
+  written alike is taken, #904 stage G1), or in a `WHERE`. `SET` takes
   any value expression (*Expressions in UPDATE … SET*, #904 stage S1).
 
 ### Expressions in WHERE, ON and HAVING (stage P)
@@ -2301,8 +2316,9 @@ constants included**, its as-built notes), and stage C1, casts of any
 expression (*Casts of an expression*, **As built (C1)**), and stage S1,
 expressions in `UPDATE … SET` (*Expressions in UPDATE … SET (#896)*,
 **As built (S1)**), and stage G0, `GROUP BY` positions and output names
-of column items (*GROUP BY of an expression*, **As built (G0)**); the
-other stages are not yet. It covers the six gaps #904 lists,
+of column items (*GROUP BY of an expression*, **As built (G0)**), and
+stage G1, `GROUP BY` and `SELECT DISTINCT` of expressions (**As built
+(G1)**, there); stage G2 is not yet. It covers the six gaps #904 lists,
 found while building jsonb stage 3: a cast of an expression, `GROUP BY`
 of an expression, `SELECT DISTINCT` and `COUNT(DISTINCT …)` of an
 expression, an expression in `UPDATE … SET` (#896), `MIN`/`MAX` of text,
@@ -2637,6 +2653,54 @@ keys stay columns, so nothing below the binder changed.
   whose item is an unqualified column no relation has is 42703 `column
   "zz" does not exist` at the item, where PG 17 reports it while binding
   the select list, before `GROUP BY`: same SQLSTATE, message and position.
+
+**As built (G1).** Expression keys, written or by a position or output
+name, and `SELECT DISTINCT` of expressions, as above, with these notes:
+- The parser takes any value expression in `GROUP BY` (`group_key`,
+  `sql/parser.cppm`): one holding an aggregate is 42803 at the aggregate, a
+  subquery 42601 `a subquery in GROUP BY is not supported yet`, a grouping
+  set, `ROLLUP`, `CUBE` and `()` stay 42601 `GROUP BY takes columns`. G0's
+  42601 for a position or name naming an expression item is gone.
+- The binder (`Binder::select`) keeps each expression key once, by
+  `ast::same_expr` with a column comparator that resolves both references
+  (`lower(t.b)` is `lower(b)`; an integer's text is its value's, so `01` is
+  `1`; `1.0` and `1.00` differ). A key is bound as a select item is
+  (`group_expression`); a bare `$n` nothing typed is text, as PostgreSQL
+  types an unknown there. A key PG 17 binds to the column itself, a cast
+  to the column's own type and modifier (`a::int4` of an INTEGER `a`,
+  `n::numeric(10,2)` of a NUMERIC(10,2) `n`, cast over cast), groups the
+  column (`Binder::bare_column`): the column and the columns its table's
+  primary key determines may be selected, as in PG 17. Any other key that
+  binds to a column, unary `+a` or a relabel to another type (`s::varchar`
+  of a TEXT `s`), is an expression key, as PG's `int4up` and RelabelType
+  are not `equal()` to the column: `SELECT a … GROUP BY +a` is 42803 at
+  `a`, and `+id` determines nothing. A select item, `HAVING` operand or `ORDER BY` key written as
+  a key is `logical::group_key(i)`; anything else is first walked for an
+  ungrouped column (42803 at it, PostgreSQL's order), then refused as
+  before (42601). The item is named as in a plain select list
+  (`expression_name`, which `constant_output` shares).
+- `ORDER BY` of an aggregate call sorts the groups by its value (`SELECT
+  lower(s), count(*) … GROUP BY lower(s) ORDER BY 2 DESC`, the stage's
+  acceptance example, whose position names `count(*)`). The approved G1
+  scope names only keys written alike, so this is an addition the owner
+  confirms on this stage's PR, or it is split into a PR of its own: `AVG`
+  stays 42601
+  (`ORDER BY AVG in a grouped or aggregated query`), its quotient being
+  numeric text. With no `GROUP BY` the one row orders nothing: the binder
+  drops the keys after binding them, so `SELECT count(*) … ORDER BY count(*)`
+  runs as PostgreSQL's.
+- Refused keys, each at the key's position: jsonb and NUMERIC of no
+  precision 0A000 (`GROUP BY of a jsonb value`, `DISTINCT of a jsonb
+  value`); a CHAR-typed expression 0A000 (`GROUP BY of a CHAR expression
+  other than a column`); `random()` 42601 (`GROUP BY random()`), the time
+  42601 (`the time in GROUP BY`, PG 17 runs it), a subquery inside one
+  42601, and an expression of a grouped view's columns 42601.
+- A view whose column is an expression may be grouped by it: the merge no
+  longer refuses `grouping by a view column that is an expression`, since
+  the substituted item is a key like any other.
+- Unchanged departures: `SELECT * … GROUP BY 1` stays 42601 (G0's), and an
+  expression over a dependent column (`SELECT lower(v) AS id … GROUP BY
+  id`, `id` the primary key) is 42601 where PG 17 runs it (P3).
 
 **Matching the select list, ORDER BY and HAVING to the keys.** PG 17
 walks each select item, `HAVING` conjunct and `ORDER BY` key top-down: a
@@ -3203,7 +3267,7 @@ tests.
 | C1 (built) | casts of expressions: `cast_kind`, the `Cast` kind replacing `JsonbCast`, the plan API's cast helpers, cast naming; casts in procedure expressions | `WHERE (Props->>'x')::bigint > $1`, `ORDER BY (Props->>'n')::int`, `sum((Props->>'n')::int)`, `$1::text::int` | ~1,150 lines: binder 190, physical 50, codegen 150, plan API 330, tests 370, docs 60 |
 | S1 (built) | expressions in `SET` with the assignment table, the store shared with `INSERT … SELECT` (closes #824), column-order evaluation, `$n::T` of another type; needs C1's output and rounding helpers | `UPDATE … SET Message = lower(Message)`, `SET n = (Props->>'n')::int`, `SET s = Props->>'k'`, `SET flag = CASE … END`; with jsonb stage 4, `SET Props = jsonb_set(Props, $2, $3)` | ~950 lines: binder 240, physical 60, codegen 130, tests 440, docs 80 |
 | G0 (built) | `GROUP BY` positions and output names over **column** items (the input-column-first rule, 42P10, 42702, 42601 for a non-integer constant); binder only, keys stay columns; a position naming an expression item stays 42601 until G1 | `SELECT UserId, count(*) … GROUP BY 1` | ~350 lines: parser 60, binder 110, tests 160, docs 20 |
-| G1 | `GROUP BY` of expressions (positions naming one included), keys the same for every row; `SELECT DISTINCT` of expressions; `same_expr` extended; the grouped resolver's exact-key case; `GroupKey`; expression keys in the structure, never streamed | `SELECT Props->>'k', count(*) … GROUP BY 1`, `SELECT DISTINCT Props->>'type'` | ~1,050 lines: binder 190, logical 30, search 140, physical 80, codegen 180, tests 390, docs 40 |
+| G1 (built) | `GROUP BY` of expressions (positions naming one included), keys the same for every row; `SELECT DISTINCT` of expressions; `same_expr` extended; the grouped resolver's exact-key case; `GroupKey`; expression keys in the structure, never streamed | `SELECT Props->>'k', count(*) … GROUP BY 1`, `SELECT DISTINCT Props->>'type'` | ~1,050 lines: binder 190, logical 30, search 140, physical 80, codegen 180, tests 390, docs 40 |
 | G2 | `COUNT`, `SUM`, `AVG` of `DISTINCT` values of an expression: `GroupLayout::distinct` as an `Expr`, the evaluated value appended as a key part, the one-row Aggregate's fold (`codegen.cppm:2271`) keying an expression by its value | `count(DISTINCT Props->>'user_id')` | ~550 lines: binder 40, physical 60, codegen 150, tests 260, docs 40 |
 
 `GREATEST`/`LEAST` (Mattermost's `SET LastPostAt = GREATEST(LastPostAt,

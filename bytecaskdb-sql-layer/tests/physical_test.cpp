@@ -649,14 +649,15 @@ TEST_CASE("physical: check refuses a grouped aggregate codegen can't print", "[s
   };
   CHECK(refusal(sorted(false, kId)).empty());
   refused(sorted(true, kId), "a sort of groups not over a structure of them");
-  refused(sorted(false, name), "a sort of groups by a column not of them");
-  // A sort of groups keys on columns alone, never an expression.
+  refused(sorted(false, name), "a sort of groups by other than a key or an aggregate of them");
+  // A sort of groups keys on its keys and aggregates, never an expression of
+  // columns, which no group holds a row for.
   {
     const auto big = SqlType{SqlKind::BigInt};
     auto g = node(physical::GroupAggregate{rows(), {kId}, {count}, false, {}});
     auto key = physical::ExprTarget{logical::binary(logical::Expr::Kind::Add, logical::column(kId, big), logical::column(kId, big), big)};
     auto s = node(physical::Sort{std::move(g), {{std::move(key), false, false}}, 0, {}, {}, true});
-    refused(plan(node(physical::GroupEmit{std::move(s), {count}}), {0}), "a sort of groups by a column not of them");
+    refused(plan(node(physical::GroupEmit{std::move(s), {count}}), {0}), "a sort of groups by other than a key or an aggregate of them");
   }
   // A stream holds no row: its BOOLEAN key read from a covering scan's
   // entry, as an I64's is. A structure reads it from the row it holds.
@@ -678,6 +679,52 @@ TEST_CASE("physical: check refuses a grouped aggregate codegen can't print", "[s
   refused(dependent({kId}, {name}, true), "a streamed GROUP BY key held in no local");
   refused(dependent({}, {name}, true), "a dependent column of one group of every row");
   refused(dependent({kId, name}, {name}, false), "a dependent column that is a key");
+}
+
+TEST_CASE("physical: check takes an expression key in a structure only, read by GroupKey (#904 G1)", "[sql][physical][group]") {
+  using Kind = logical::Expr::Kind;
+  const logical::ColumnRef name{1, 2, PhysType::Bytes, true};
+  const auto text = SqlType{SqlKind::Text};
+  auto count = logical::expr(Kind::Aggregate, SqlType{SqlKind::BigInt});
+  auto lower = logical::expr(Kind::TextFn, text);
+  lower.text = logical::Expr::Text::Lower;
+  lower.args.push_back(logical::column(name, text));
+  auto rows = [] { return node(scan({p(0)}, std::monostate{})); };
+  auto grouped = [&](std::vector<logical::Expr> exprs, bool streamed, std::vector<logical::Expr> outputs) {
+    auto g = node(physical::GroupAggregate{rows(), {}, {count}, streamed, {}, std::move(exprs)});
+    return plan(node(physical::GroupEmit{std::move(g), std::move(outputs)}), {0});
+  };
+  CHECK(refusal(grouped({lower}, false, {logical::group_key(0, text), count})).empty());
+  // No index orders an expression: never streamed.
+  refused(grouped({lower}, true, {count}), "a streamed GROUP BY key that is an expression");
+  // A GroupKey names a key of the groups below, of its type.
+  refused(grouped({lower}, false, {logical::group_key(1, text)}), "no key or aggregate of its groups");
+  refused(grouped({lower}, false, {logical::group_key(0, SqlType{SqlKind::BigInt})}), "no key or aggregate of its groups");
+  // A key a sort key holds and groups as PostgreSQL's, never random()'s.
+  auto jsonb = logical::column({1, 3, PhysType::Jsonb, true}, SqlType{SqlKind::Jsonb});
+  auto cast = logical::expr(Kind::Cast, SqlType{SqlKind::Jsonb});
+  cast.args.push_back(jsonb);
+  refused(grouped({cast}, false, {count}), "an expression key of a type no sort key groups");
+  auto random = logical::binary(Kind::Random, p(0), p(1), SqlType{SqlKind::BigInt});
+  refused(grouped({random}, false, {count}), "an expression key of random()");
+  refused(grouped({logical::column(name, text)}, false, {count}), "an expression key that is a column");
+  // A GroupKey outside the rows of groups is no value.
+  auto emit = node(physical::Emit{rows(), {physical::ExprTarget{logical::group_key(0, text)}}});
+  refused(plan(std::move(emit), {0}), "a group key outside the rows of its groups");
+  // A HAVING and a sort of the groups read it; a sort by AVG is refused.
+  const auto big = SqlType{SqlKind::BigInt};
+  auto plus = logical::binary(Kind::Add, logical::column(kId, big), logical::column(kId, big), big);
+  auto sorted = [&](logical::Expr by) {
+    auto g = node(physical::GroupAggregate{rows(), {}, {count}, false, {}, {plus}});
+    auto f = node(physical::Filter{std::move(g), {logical::compare(ast::Compare::Op::Gt, logical::group_key(0, big), p(1))}});
+    auto o = node(physical::Sort{std::move(f), {{physical::ExprTarget{std::move(by)}, true, false}}, 0, {}, {}, true});
+    return plan(node(physical::GroupEmit{std::move(o), {logical::group_key(0, big), count}}), {0});
+  };
+  CHECK(refusal(sorted(logical::group_key(0, big))).empty());
+  CHECK(refusal(sorted(count)).empty());
+  auto avg = logical::expr(Kind::Aggregate, SqlType{SqlKind::Numeric});
+  avg.fn = logical::Expr::Fn::Avg;
+  refused(sorted(avg), "a sort of groups by other than a key or an aggregate of them");
 }
 
 TEST_CASE("physical: a derived relation is its query's groups, read by a grouped aggregate alone", "[sql][physical]") {

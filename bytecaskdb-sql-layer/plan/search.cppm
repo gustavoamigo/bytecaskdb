@@ -295,6 +295,7 @@ auto use_of(const Expr& c, const Tables& here, const Tables& other) -> Use {
     case Expr::Kind::Extract:
     case Expr::Kind::Cast:
     case Expr::Kind::Jsonb:
+    case Expr::Kind::GroupKey:
     case Expr::Kind::Mod:
     case Expr::Kind::Neg:
     case Expr::Kind::Abs:
@@ -2373,6 +2374,7 @@ private:
         case Expr::Kind::Extract:
         case Expr::Kind::Cast:
         case Expr::Kind::Jsonb:
+        case Expr::Kind::GroupKey:
         case Expr::Kind::Mod:
         case Expr::Kind::Neg:
         case Expr::Kind::Abs:
@@ -2707,10 +2709,11 @@ private:
   // share groups or values, it switches at fewer rows than the least that
   // would pass, never at more. Under it a structure fits whenever its rows
   // and key parts are no larger than those bounds.
-  auto group_past(const Query& q, const physical::GroupLayout& l, const std::vector<ColumnRef>& keys,
+  auto group_past(const Query& q, const physical::GroupLayout& l, const std::vector<ColumnRef>& keys, std::size_t exprs,
                   const SortSpec* sort) const -> std::uint64_t {
     std::uint64_t key = 0;
     for (const auto& k : keys) key += least_part_bytes(k, k.nullable);
+    key += exprs;  // an expression key may be NULL: its marker alone
     auto fixed = kAggBytes + l.slots + l.held.size() * kHashBytes + l.distinct.size() * (kAggBytes + 1) +
                  (sort != nullptr ? kSorterBytes : 0);
     auto per = key + kGroupEntryBytes + l.slots * kAggSlotBytes;
@@ -2721,8 +2724,9 @@ private:
     if (sort != nullptr) {
       per += kSortEntryBytes + key;
       for (const auto& part : sort->keys) {
-        const auto& col = std::get<ColumnRef>(part.key);  // a GROUP BY's keys are columns
-        per += least_part_bytes(col, col.nullable);
+        // A GroupKey's or an aggregate's part may be NULL: its marker alone.
+        const auto* col = std::get_if<ColumnRef>(&part.key);
+        per += col != nullptr ? least_part_bytes(*col, col->nullable) : 1;
       }
     }
     return least_past(memory_, fixed, per);
@@ -2752,7 +2756,32 @@ private:
       }
       return out;
     };
-    const auto keys = columns_of_exprs(agg.group_by, "a GROUP BY key that is not a column");
+    // The column keys, and the expression keys, computed per row: a
+    // GroupKey(i) of the logical plan names group_by[i], renumbered here to
+    // its place among the expression keys.
+    std::vector<ColumnRef> keys;
+    std::vector<Expr> exprs;
+    std::vector<std::size_t> expr_at(agg.group_by.size(), 0);
+    for (std::size_t i = 0; i < agg.group_by.size(); ++i) {
+      const auto& k = agg.group_by[i];
+      if (k.kind == Expr::Kind::Column) {
+        keys.push_back(k.col);
+      } else {
+        expr_at[i] = exprs.size();
+        exprs.push_back(k);
+      }
+    }
+    std::function<void(Expr&)> renumber = [&](Expr& e) {
+      if (e.kind == Expr::Kind::GroupKey) {
+        if (e.constant < 0 || std::cmp_greater_equal(e.constant, agg.group_by.size()) ||
+            agg.group_by[static_cast<std::size_t>(e.constant)].kind == Expr::Kind::Column) {
+          no_plan("a GroupKey that names no expression key");
+        }
+        e.constant = static_cast<std::int64_t>(expr_at[static_cast<std::size_t>(e.constant)]);
+      }
+      for (auto& a : e.args) renumber(a);
+    };
+    const auto keyless = keys.empty() && exprs.empty();
     const auto dependent = columns_of_exprs(agg.dependent, "a dependent column that is not a column");
     // What a group gives of its rows: its keys, then the columns they
     // determine.
@@ -2763,22 +2792,25 @@ private:
     auto add_agg = [&](const Expr& e) {
       if (std::ranges::find(aggs, e) == aggs.end()) aggs.push_back(e);
     };
+    auto of_key = [&](const Expr& e) { return e.kind == Expr::Kind::GroupKey || (e.kind == Expr::Kind::Column && of_group(e.col)); };
     std::vector<Expr> outputs;
     for (const auto& o : agg.aggs) {
+      outputs.push_back(o.expr);
+      renumber(outputs.back());
       if (o.expr.kind == Expr::Kind::Aggregate) {
         add_agg(o.expr);
-      } else if (o.expr.kind != Expr::Kind::Column || !of_group(o.expr.col)) {
+      } else if (!of_key(o.expr)) {
         no_plan("a result column that is not grouped");
       }
-      outputs.push_back(o.expr);
     }
     Conjuncts having = g.having != nullptr ? g.having->conjuncts : Conjuncts{};
-    for (const auto& c : having) {
+    for (auto& c : having) {
       if (!is_compare(c) || operand_of(c).kind != Expr::Kind::Param) no_plan("a HAVING conjunct that does not compare with a parameter");
+      renumber(c);
       const auto& lhs = c.args[0];
       if (lhs.kind == Expr::Kind::Aggregate) {
         add_agg(lhs);
-      } else if (lhs.kind != Expr::Kind::Column || !of_group(lhs.col)) {
+      } else if (!of_key(lhs)) {
         no_plan("a HAVING conjunct that compares no grouped column or aggregate");
       }
     }
@@ -2786,17 +2818,30 @@ private:
       if ((a.fn != Expr::Fn::Count || a.distinct) && a.args.empty()) no_plan("an aggregate call with no argument");
       if (a.distinct && a.args[0].kind != Expr::Kind::Column) no_plan("an aggregate of DISTINCT values of other than a column");
     }
+    // The ORDER BY of the groups: by key columns, which an access path's
+    // order may give, or by GroupKeys and aggregates, which only a sort of
+    // the groups gives. One group of every row orders nothing.
     std::vector<OrderItem> order_by;
-    if (g.sort != nullptr && (!g.limit || *g.limit > 0)) {
+    if (g.sort != nullptr && (!g.limit || *g.limit > 0) && !keyless) {
       for (const auto& k : g.sort->keys) {
-        if (k.expr.kind != Expr::Kind::Column || !of_group(k.expr.col)) no_plan("an ORDER BY key that is not grouped");
-        order_by.push_back({k.expr.col, k.desc, k.nulls_first});
+        if (k.expr.kind == Expr::Kind::Column && of_group(k.expr.col)) {
+          order_by.push_back({k.expr.col, k.desc, k.nulls_first});
+          continue;
+        }
+        auto key = k.expr;
+        renumber(key);
+        if (key.kind == Expr::Kind::Aggregate) {
+          add_agg(key);
+        } else if (key.kind != Expr::Kind::GroupKey) {
+          no_plan("an ORDER BY key that is not grouped");
+        }
+        order_by.push_back({std::move(key), k.desc, k.nulls_first});
       }
     }
     // The rows of the groups: GroupEmit over Limit? over the branch, or a
     // choice point between two.
     auto branch = [&](physical::NodePtr rows, bool streamed, const SortSpec* sort) {
-      auto n = physical::node(physical::GroupAggregate{std::move(rows), keys, aggs, streamed, dependent});
+      auto n = physical::node(physical::GroupAggregate{std::move(rows), keys, aggs, streamed, dependent, exprs});
       if (!having.empty()) n = physical::node(physical::Filter{std::move(n), having});
       if (sort != nullptr) n = physical::node(physical::Sort{std::move(n), sort->keys, sort->keep, {}, {}, true});
       return n;
@@ -2809,7 +2854,7 @@ private:
     const auto* source = agg.input.get();
     if (const auto* e = std::get_if<logical::Empty>(&source->op)) {
       for (const auto* t : e->tables) constants(*t);
-      out.push_back({rooted(branch(physical::node(physical::Empty{}), keys.empty(), nullptr)), {}, {}, 0});
+      out.push_back({rooted(branch(physical::node(physical::Empty{}), keyless, nullptr)), {}, {}, 0});
       return out;
     }
     if (const auto* d = derived_below(root)) {
@@ -2824,8 +2869,8 @@ private:
       for (const auto& o : ordered) sort.keys.push_back(o.part());
       const auto* where = std::get_if<logical::Filter>(&source->op);
       for (auto& f : derived_rows(*d, where != nullptr ? where->conjuncts : Conjuncts{})) {
-        auto sorts = !keys.empty() && !sort.keys.empty();
-        out.push_back({rooted(branch(std::move(f.root), keys.empty(), sorts ? &sort : nullptr)), std::move(f.null_checks),
+        auto sorts = !keyless && !sort.keys.empty();
+        out.push_back({rooted(branch(std::move(f.root), keyless, sorts ? &sort : nullptr)), std::move(f.null_checks),
                        std::move(f.computed), f.cost});
       }
       return out;
@@ -2856,30 +2901,32 @@ private:
     // A stream keeps its columns in locals, integers and booleans, read from
     // a row or a covering scan's entry. A COUNT(DISTINCT) keys each value
     // from its row; a structure's columns other than integers are read from
-    // a row its group holds, so its plan reads those tables' rows.
+    // a row its group holds, so its plan reads those tables' rows. An
+    // expression key is evaluated from the row in hand and never streams:
+    // no access path orders an expression, and one ordered by a column key
+    // beside it would split its groups.
     auto in_locals = std::ranges::all_of(columns, [](const ColumnRef& k) {
       return k.type == PhysType::I64 || k.type == PhysType::Bool;
     });
-    auto may_cover = !distinct && in_locals;
-    auto searched =
-        candidates(q, ordered, agg.input->output, may_cover, false, keys.empty() ? Grouping{} : Grouping{grouping});
-    const auto layout = physical::group_layout(columns, aggs);
+    auto may_cover = !distinct && in_locals && exprs.empty();
+    auto searched = candidates(q, ordered, agg.input->output, may_cover, false, keyless ? Grouping{} : Grouping{grouping});
+    const auto layout = physical::group_layout(columns, aggs, exprs);
     std::vector<std::size_t> held;
     for (auto t : layout.held) held.push_back(q.index_of(t));
     auto kept = selectivity(having);
     auto sink_of = [&](bool hash, bool sorted) {
-      return Sink{g.limit, distinct, false, 0, 0, GroupCost{true, hash, grouping.size(), kept, sorted}};
+      return Sink{g.limit, distinct, false, 0, 0, GroupCost{true, hash, grouping.size() + exprs.size(), kept, sorted}};
     };
     // One group of COUNT(*), MIN and MAX alone, nothing filtering a row
     // after its range: answered from the keys.
-    if (keys.empty() && having.empty()) {
+    if (keyless && having.empty()) {
       for (const auto& c : searched.plans) {
         if (auto f = from_keys(q, c, outputs, (!g.limit || *g.limit > 0) && g.offset == 0)) out.push_back(std::move(*f));
       }
     }
     const auto hashes = std::ranges::any_of(searched.plans, [](const Candidate& c) { return c.hash() != nullptr; });
     // A hash join streams only one group, of no key.
-    const auto avoiding = hashes && keys.empty() ? without_hash(q, searched, sink_of(false, false), nullptr) : std::nullopt;
+    const auto avoiding = hashes && keyless ? without_hash(q, searched, sink_of(false, false), nullptr) : std::nullopt;
     // Streamed: every plan whose rows come in groups, in the ORDER BY's order
     // where it has one, since nothing holds its groups to sort them. The
     // cheapest one that is not a hash join is a structure's other plan, built
@@ -2887,9 +2934,9 @@ private:
     const Candidate* stream = nullptr;
     auto stream_cost = 0.0;
     for (const auto& c : searched.plans) {
-      if (!(keys.empty() || (in_locals && c.streams())) || (!ordered.empty() && !c.ordered())) continue;
+      if (!(keyless || (in_locals && exprs.empty() && c.streams())) || (!ordered.empty() && !c.ordered())) continue;
       auto sink = sink_of(false, false);
-      auto f = finish_prepared(q, c, sink, searched, nullptr, Needs{!ordered.empty(), !keys.empty(), {}}, avoiding,
+      auto f = finish_prepared(q, c, sink, searched, nullptr, Needs{!ordered.empty(), !keyless, {}}, avoiding,
                                [&](physical::NodePtr rows) { return rooted(branch(std::move(rows), true, nullptr)); });
       if (!f) continue;
       if (c.hash() == nullptr) {
@@ -2901,7 +2948,7 @@ private:
       }
       out.push_back(std::move(*f));
     }
-    if (keys.empty()) return out;
+    if (keyless) return out;
     // In a structure: every plan, sorted where it does not give the ORDER BY,
     // since groups come in the order their first rows do, each table whose
     // row it holds read by rows; a hash join's other plan, by the budget, of
@@ -2925,11 +2972,12 @@ private:
     std::optional<Avoiding> avoiding_ordered;
     if (hashes) {
       avoiding_unordered = without_hash(q, structured, sink_of(true, false), nullptr);
-      if (!ordered.empty()) {
+      // Sorting the rows before grouping keys only columns: an ORDER BY of
+      // a GroupKey or an aggregate sorts the groups.
+      if (!ordered.empty() && std::ranges::all_of(ordered, [](const OrderItem& o) { return o.column() != nullptr; })) {
         auto sorted = q;
         sorted.sort_by.clear();
-        // A grouped ORDER BY keys only columns (above).
-        for (const auto& o : ordered) sorted.sort_by.push_back(std::get<ColumnRef>(o.key));
+        for (const auto& o : ordered) sorted.sort_by.push_back(*o.column());
         sorted.above = columns;
         for (const auto& a : aggs) {
           if (!a.args.empty()) logical::columns_of(a.args[0], sorted.above);
@@ -2942,7 +2990,7 @@ private:
       const auto& avoiding_structure = !ordered.empty() && !sorts ? avoiding_ordered : avoiding_unordered;
       auto sink = sink_of(true, sorts);
       const auto* in = sorts ? &sort : nullptr;
-      const auto past = group_past(q, layout, keys, in);
+      const auto past = group_past(q, layout, keys, exprs.size(), in);
       const auto known = past == 0 || c.access.max_entries <= 1;
       // The choice by the budget counts one table's range, which holds every
       // row the structure groups.
@@ -3021,7 +3069,7 @@ private:
       const auto* g = physical::group_below(*below);
       if (g == nullptr) continue;
       const auto may_be_null = [&](std::uint32_t p) { return !std::ranges::contains(never_null_, p); };
-      if (g->keys.empty() && (std::ranges::any_of(f.null_checks, may_be_null) || one_row(*g->input))) continue;
+      if (g->keyless() && (std::ranges::any_of(f.null_checks, may_be_null) || one_row(*g->input))) continue;
       auto rows = physical::node(physical::Derived{std::move(f.root), d.table->id, columns});
       out.push_back({std::move(rows), std::move(f.null_checks), std::move(f.computed), f.cost, f.rows});
     }

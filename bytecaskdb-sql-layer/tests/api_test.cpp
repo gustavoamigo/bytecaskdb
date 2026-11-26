@@ -3880,6 +3880,60 @@ TEST_CASE("embedded API: ORDER BY of a set operation's rows sorts them as a SELE
   CHECK(state("SELECT x FROM oa UNION SELECT y FROM ob ORDER BY x + 1") == "0A000");  // only output columns, as PostgreSQL
 }
 
+TEST_CASE("embedded API: GROUP BY and DISTINCT of expressions give PostgreSQL 17's groups (#904 G1)", "[sql][api][group]") {
+  sql_test::TempDir dir{"api_group_expr"};
+  auto db = Database::open(dir.path());
+  auto run = [&](std::string_view sql, const std::vector<Value>& params = {}) { return db->execute(sql, params).rows; };
+  (void)run("CREATE TABLE ge (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, s TEXT, d DOUBLE PRECISION, j JSONB)");
+  (void)run("CREATE TABLE ge0 (id INTEGER PRIMARY KEY, a INTEGER, s TEXT)");
+  (void)run("INSERT INTO ge VALUES (1, 1, 2, 'Ab', 0.0, '{\"k\": \"x\", \"type\": \"t1\"}'), (2, 1, 3, 'ab', -0.0, '{\"k\": \"y\"}'), "
+            "(3, 2, 2, NULL, 'NaN', '{\"k\": \"x\", \"type\": \"t2\"}'), (4, NULL, NULL, 'AB', 'NaN', NULL), "
+            "(5, 1, 1, 'x', 1, '{\"type\": \"t1\"}')");
+  // Each PostgreSQL 17's rows, its NULL keys one group.
+  CHECK(run("SELECT j->>'k', count(*) FROM ge GROUP BY 1 ORDER BY 1") ==
+        Grid{{bytes("x"), i(2)}, {bytes("y"), i(1)}, {kNull, i(2)}});
+  CHECK(run("SELECT DISTINCT j->>'type' FROM ge ORDER BY 1") == Grid{{bytes("t1")}, {bytes("t2")}, {kNull}});
+  CHECK(run("SELECT lower(s), count(*) FROM ge GROUP BY lower(s) ORDER BY 2 DESC, 1") ==
+        Grid{{bytes("ab"), i(3)}, {bytes("x"), i(1)}, {kNull, i(1)}});
+  CHECK(run("SELECT a + b, count(*) FROM ge GROUP BY a + b ORDER BY 1") ==
+        Grid{{i(2), i(1)}, {i(3), i(1)}, {i(4), i(2)}, {kNull, i(1)}});
+  CHECK(run("SELECT (a::text), count(*) FROM ge GROUP BY (a::text) ORDER BY 1") ==
+        Grid{{bytes("1"), i(3)}, {bytes("2"), i(1)}, {kNull, i(1)}});
+  CHECK(run("SELECT lower(s) FROM ge GROUP BY lower(s) HAVING lower(s) = $1", {bytes("ab")}) == Grid{{bytes("ab")}});
+  CHECK(run("SELECT a, count(*) FROM ge GROUP BY a, lower(s) ORDER BY 1, 2") ==
+        Grid{{i(1), i(1)}, {i(1), i(2)}, {i(2), i(1)}, {kNull, i(1)}});
+  // -0.0 and 0.0 are one group, every NaN one: the group shows its first
+  // row's value, -0 here.
+  auto neg = run("SELECT DISTINCT -d FROM ge ORDER BY 1");
+  REQUIRE(neg.size() == 3);
+  CHECK(std::get<double>(neg[0][0]) == -1.0);
+  CHECK(std::get<double>(neg[1][0]) == 0.0);
+  CHECK(std::signbit(std::get<double>(neg[1][0])));
+  CHECK(std::isnan(std::get<double>(neg[2][0])));
+  // A key the same for every row: one group over rows, none over no rows.
+  CHECK(run("SELECT count(*) FROM ge GROUP BY 1 + 1") == Grid{{i(5)}});
+  CHECK(run("SELECT count(*) FROM ge0 GROUP BY 1 + 1").empty());
+  CHECK(run("SELECT count(*) FROM ge0 GROUP BY $1", {bytes("x")}).empty());
+  CHECK(run("SELECT count(*) FROM ge0 GROUP BY 'x'::text").empty());
+  CHECK(run("SELECT 1, count(*) FROM ge0 GROUP BY 1").empty());
+  CHECK(run("SELECT DISTINCT 1 FROM ge0").empty());
+  CHECK(run("SELECT DISTINCT lower(s) FROM ge0").empty());
+  CHECK(run("SELECT count(*) FROM ge0") == Grid{{i(0)}});
+  // A key's error is the statement's, raised by the row that meets it.
+  auto state = [&](std::string_view sql) -> std::string {
+    try {
+      (void)db->execute(sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()};
+    } catch (const ExecError& e) {
+      return std::string{sqlstate(e)};
+    }
+    return "ran";
+  };
+  CHECK(state("SELECT count(*) FROM ge GROUP BY a / (a - 2)") == "22012");
+  CHECK(state("SELECT count(*) FROM ge GROUP BY (j->>'k')::int") == "22P02");
+}
+
 TEST_CASE("embedded API: ORDER BY an expression of the FROM columns sorts by its value per row", "[sql][api]") {
   sql_test::TempDir dir{"api_order_expr"};
   auto db = Database::open(dir.path());
@@ -3929,7 +3983,8 @@ TEST_CASE("embedded API: ORDER BY an expression of the FROM columns sorts by its
   CHECK(state("SELECT id FROM oe ORDER BY random(1, 9)") == "42601");
   CHECK(state("SELECT id FROM oe ORDER BY oe.*") == "42601");
   CHECK(state("SELECT a FROM oe GROUP BY a ORDER BY a + 1") == "42601");
-  CHECK(state("SELECT count(*) AS n FROM oe ORDER BY n") == "42601");
+  // One group of every row orders nothing.
+  CHECK(state("SELECT count(*) AS n FROM oe ORDER BY n") == "ran");
   // A correlated subquery is refused (42601) inside a function's args too,
   // whether the subquery is the arg or the outer column is an arg within it.
   CHECK(state("SELECT id FROM oe ORDER BY coalesce((SELECT a FROM of2 WHERE of2.id = oe.id), 0)") == "42601");

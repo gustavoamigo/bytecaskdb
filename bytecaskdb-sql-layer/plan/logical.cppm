@@ -16,6 +16,7 @@
 // columns*).
 
 module;
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -69,7 +70,7 @@ struct ColumnRef {
 // expressions) only.
 struct Expr {
   enum class Kind { Column, Param, Const, Add, Sub, Mul, Div, Compare, Aggregate, And, Or, Not, IsNull, Like, Truth, InSet, Case, Coalesce,
-                    Concat, Substr, Random, Mod, Neg, Abs, TextFn, Extract, Cast, Jsonb };
+                    Concat, Substr, Random, Mod, Neg, Abs, TextFn, Extract, Cast, Jsonb, GroupKey };
   enum class Fn { Count, Sum, Min, Max, Avg };
   // TextFn's function: PostgreSQL's of the same name, over UTF-8 text.
   enum class Text { Upper, Lower, CharLength, OctetLength, Btrim, Ltrim, Rtrim, Position };
@@ -84,7 +85,8 @@ struct Expr {
   std::uint32_t param{0};       // Param: zero-based ($1 is 0)
   std::int64_t constant{0};     // Const: in its type's representation, a DECIMAL's scaled; a BOOLEAN's 0 or 1;
                                 // Like: the escape's code point, -1 for none; InSet: its subquery;
-                                // Extract: the field, a DateField (bc_plan.h's bc_date_field)
+                                // Extract: the field, a DateField (bc_plan.h's bc_date_field);
+                                // GroupKey: the index of its key in Aggregate::group_by
   Op op{Op::Eq};                // Compare
   Fn fn{Fn::Count};             // Aggregate
   Text text{Text::Upper};       // TextFn
@@ -105,7 +107,7 @@ struct Expr {
                                 // takes; a relabel only over another Cast, whose type it keeps;
                                 // Jsonb: the jsonb, then the key (text), the index (an integer) or the path
                                 // (a PathIn of text or a PathArray of text elements, any NULL); Typeof and
-                                // ArrayLength: the jsonb alone
+                                // ArrayLength: the jsonb alone; GroupKey: none
 
   [[nodiscard]] auto phys() const -> PhysType { return phys_type(type); }
 
@@ -140,6 +142,13 @@ struct Expr {
 [[nodiscard]] auto constant(std::int64_t v, SqlType type) -> Expr {
   auto e = expr(Expr::Kind::Const, type);
   e.constant = v;
+  return e;
+}
+
+// The value of key `i` of the Aggregate below, of the key's type.
+[[nodiscard]] auto group_key(std::size_t i, SqlType type) -> Expr {
+  auto e = expr(Expr::Kind::GroupKey, type);
+  e.constant = static_cast<std::int64_t>(i);
   return e;
 }
 
@@ -239,8 +248,13 @@ struct Join {
 };
 
 // One row per group of the input's rows whose `group_by` columns are equal,
-// NULL equal to NULL, of `aggs`: aggregate calls and grouped columns, in the
-// select list's order. Not `grouped` (no GROUP BY): one row over all the
+// NULL equal to NULL, of `aggs`: aggregate calls, grouped columns and
+// GroupKeys, in the select list's order. A key is a column or an expression
+// of the input's columns, computed per row (docs/planner_design.md, *Group
+// keys and DISTINCT values of an expression*); a select item, HAVING operand
+// or ORDER BY key that is an expression key is a GroupKey naming it, never a
+// copy of its tree, and is legal only in `aggs`, a HAVING Filter directly
+// above and a Sort of the groups. Not `grouped` (no GROUP BY): one row over all the
 // input's rows, none of `aggs` a column. A HAVING is a Filter above it.
 // `dependent` holds the columns selected, ordered by or compared in HAVING
 // that are not grouped but whose table's whole primary key is: equal in
@@ -249,7 +263,7 @@ struct Join {
 struct Aggregate {
   NodePtr input;
   std::vector<Output> aggs;
-  std::vector<Expr> group_by;  // columns, each once, as the GROUP BY writes them
+  std::vector<Expr> group_by;  // columns or expressions, each once, as the GROUP BY writes them
   bool grouped{false};
   std::vector<Expr> dependent;  // columns, each once, none of group_by
 };

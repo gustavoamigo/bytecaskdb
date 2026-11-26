@@ -408,7 +408,7 @@ TEST_CASE("binder: comparisons of constants fold to a BOOLEAN; a string literal 
   CHECK(rejected(cat, "SELECT DATE '2016-03-26' < TIMESTAMP '2016-03-26 00:00:00'").first ==
         "comparing a date with a timestamp without time zone is not supported yet");
   CHECK(rejected(cat, "SELECT k + k, COUNT(*) FROM ct").first ==
-        "an expression in the select list of an aggregated query is not supported yet");
+        "column \"ct.k\" must appear in the GROUP BY clause or be used in an aggregate function");
 
   // A cast of a string literal: read as the type, named by it.
   CHECK(out("SELECT DATE '1970-01-02'") == std::tuple{std::string{"date"}, SqlType{SqlKind::Date}, Datum{std::int64_t{1}}});
@@ -509,7 +509,12 @@ TEST_CASE("binder: SELECT DISTINCT is a GROUP BY of the selected columns", "[sql
   CHECK(state("SELECT DISTINCT qty FROM t FOR UPDATE") == "0A000");
   CHECK(rejected(cat, "SELECT DISTINCT COUNT(*) FROM t GROUP BY qty").first ==
         "SELECT DISTINCT of groups it does not select every GROUP BY column of is not supported yet");
-  CHECK(rejected(cat, "SELECT DISTINCT qty, 5 FROM t").first == "SELECT DISTINCT of other than columns is not supported yet");
+  // An item that is no column is a key computed per row (#904 G1); a
+  // constant one too.
+  auto constant = bind_sql(cat, "SELECT DISTINCT qty, 5 FROM t");
+  REQUIRE(get<logical::Aggregate>(constant).group_by.size() == 2);
+  CHECK(get<logical::Aggregate>(constant).group_by[1].kind == logical::Expr::Kind::Param);
+  CHECK(get<logical::Aggregate>(constant).aggs[1].expr.kind == logical::Expr::Kind::GroupKey);
   CHECK(rejected(cat, "SELECT DISTINCT ON (qty) qty FROM t").first == "DISTINCT ON is not supported");
 }
 
@@ -1723,7 +1728,126 @@ TEST_CASE("binder: GROUP BY, HAVING and the aggregates, as PostgreSQL binds them
   CHECK(bind_sql(cat, "SELECT a FROM g GROUP BY a HAVING max(f) <= $1").param_types == std::vector<PhysType>{PhysType::F64});
   CHECK(bind_sql(cat, "SELECT a FROM g GROUP BY a HAVING count(f) > $1").param_types == std::vector<PhysType>{PhysType::I64});
   CHECK(rejected(cat, "SELECT a FROM g GROUP BY a HAVING avg(a) > $1").first == "HAVING on AVG is not supported yet");
-  CHECK(rejected(cat, "SELECT a FROM g GROUP BY a + 1").first == "GROUP BY takes columns");
+  CHECK(rejected(cat, "SELECT a FROM g GROUP BY a + 1").first ==
+        "column \"g.a\" must appear in the GROUP BY clause or be used in an aggregate function");
+}
+
+TEST_CASE("binder: GROUP BY and DISTINCT of expressions, matched as written (#904 G1)", "[sql][binder][group]") {
+  sql_test::Fixture f;
+  auto ddl = [&](std::string_view sql) { f.ddl(std::get<Ddl>(bind_sql(f.cat(), sql).stmt)); };
+  ddl("CREATE TABLE g9 (id BIGINT PRIMARY KEY, a INTEGER, b TEXT, s TEXT, d DOUBLE PRECISION, j JSONB, ch CHAR(3), n NUMERIC)");
+  ddl("CREATE VIEW g9v AS SELECT a, count(*) AS k FROM g9 GROUP BY a");
+  const auto& cat = f.cat();
+  using Kind = logical::Expr::Kind;
+  auto error_of = [&](std::string_view sql) -> std::string {
+    try {
+      (void)bind_sql(cat, sql);
+    } catch (const ast::SqlError& e) {
+      return std::string{e.sqlstate()} + " " + e.what() + " @" + std::to_string(e.pos());
+    }
+    return "bound";
+  };
+  // A key is computed per row; an item written alike is its GroupKey, never
+  // a copy of its tree, and named as in a select list.
+  auto b = bind_sql(cat, "SELECT lower(b), count(*) FROM g9 GROUP BY lower(g9.b) HAVING lower(b) > $1 ORDER BY lower(b)");
+  const auto& agg = get<logical::Aggregate>(b);
+  REQUIRE(agg.group_by.size() == 1);
+  CHECK(agg.group_by[0].kind == Kind::TextFn);
+  CHECK(agg.aggs[0].expr.kind == Kind::GroupKey);
+  CHECK(agg.aggs[0].expr.constant == 0);
+  CHECK(agg.aggs[0].expr.type == SqlType{SqlKind::Text});
+  CHECK(agg.aggs[0].name == "lower");
+  const auto* having = find<logical::Filter>(root(b));
+  REQUIRE(having != nullptr);
+  CHECK(having->conjuncts[0].args[0].kind == Kind::GroupKey);
+  CHECK(b.param_types == std::vector<PhysType>{PhysType::Bytes});
+  const auto* sort = find<logical::Sort>(root(b));
+  REQUIRE(sort != nullptr);
+  CHECK(sort->keys[0].expr.kind == Kind::GroupKey);
+  // A position or an output name naming an expression item; keys kept once
+  // each, a column beside them a column key.
+  auto mixed = bind_sql(cat, "SELECT s || 'x' AS k, a, count(*) FROM g9 GROUP BY k, 2, s || 'x', a + 1");
+  const auto& m = get<logical::Aggregate>(mixed);
+  REQUIRE(m.group_by.size() == 3);
+  CHECK(m.group_by[0].kind == Kind::Concat);
+  CHECK(m.group_by[1].kind == Kind::Column);
+  CHECK(m.group_by[2].kind == Kind::Add);
+  CHECK(m.aggs[0].expr.kind == Kind::GroupKey);
+  CHECK(m.aggs[0].name == "k");
+  CHECK(m.aggs[1].expr.kind == Kind::Column);
+  // A key the same for every row stays a key: the query stays grouped, so
+  // it gives no group over no rows (PostgreSQL 17).
+  for (const auto* sql : {"SELECT count(*) FROM g9 GROUP BY 1+1", "SELECT count(*) FROM g9 GROUP BY $1",
+                          "SELECT 1, count(*) FROM g9 GROUP BY 1", "SELECT DISTINCT 1 FROM g9"}) {
+    auto k = bind_sql(cat, sql);
+    CHECK(get<logical::Aggregate>(k).grouped);
+    CHECK(get<logical::Aggregate>(k).group_by.size() == 1);
+  }
+  CHECK(bind_sql(cat, "SELECT count(*) FROM g9 GROUP BY $1").param_types == std::vector<PhysType>{PhysType::Bytes});
+  // DISTINCT of expressions: each item a key.
+  auto distinct = bind_sql(cat, "SELECT DISTINCT j->>'k', lower(b) FROM g9 ORDER BY 2");
+  CHECK(get<logical::Aggregate>(distinct).group_by.size() == 2);
+  CHECK(get<logical::Aggregate>(distinct).aggs[0].name == "?column?");
+  CHECK(error_of("SELECT DISTINCT lower(b) FROM g9 ORDER BY b") ==
+        "42P10 for SELECT DISTINCT, ORDER BY expressions must appear in select list @42");
+  // An ungrouped column outside a key is 42803 at it, found before the
+  // 42601 of an expression over keys (stage P3), as PostgreSQL 17 finds it.
+  const auto ungrouped_b = std::string{"42803 column \"g9.b\" must appear in the GROUP BY clause or be used in an aggregate function"};
+  CHECK(error_of("SELECT upper(b) FROM g9 GROUP BY lower(b)") == ungrouped_b + " @13");
+  CHECK(error_of("SELECT b FROM g9 GROUP BY lower(b)") == ungrouped_b + " @7");
+  CHECK(error_of("SELECT count(*) FROM g9 GROUP BY lower(b) HAVING upper(b) > 'a'") == ungrouped_b + " @55");
+  CHECK(error_of("SELECT count(*) FROM g9 GROUP BY lower(b) ORDER BY b || 'x'") == ungrouped_b + " @51");
+  const auto ungrouped_a = std::string{"42803 column \"g9.a\" must appear in the GROUP BY clause or be used in an aggregate function"};
+  CHECK(error_of("SELECT a + 1 FROM g9 GROUP BY 1+a") == ungrouped_a + " @7");
+  CHECK(error_of("SELECT a + 1.0 FROM g9 GROUP BY a + 1") == ungrouped_a + " @7");
+  CHECK(error_of("SELECT a + 1.0 FROM g9 GROUP BY a + 1.00") == ungrouped_a + " @7");
+  CHECK(error_of("SELECT a FROM g9 GROUP BY 1::int") == ungrouped_a + " @7");
+  CHECK(error_of("SELECT a + 01 FROM g9 GROUP BY a + 1") == "bound");
+  // A grouped primary key determines its columns beside an expression key;
+  // an expression key determines nothing.
+  CHECK(error_of("SELECT id, a, lower(b) FROM g9 GROUP BY 1, lower(b)") == "bound");
+  CHECK(error_of("SELECT id, a FROM g9 GROUP BY id + 0") ==
+        "42803 column \"g9.id\" must appear in the GROUP BY clause or be used in an aggregate function @7");
+  // A key PostgreSQL binds to the column itself, a cast to the column's own
+  // type, groups the column; any other key that binds to a column (unary +,
+  // a relabel to another type) is an expression the column is not: 42803.
+  CHECK(error_of("SELECT a, count(*) FROM g9 GROUP BY a::int4") == "bound");
+  CHECK(error_of("SELECT a FROM g9 GROUP BY a::integer::int4 HAVING a > 1 ORDER BY a") == "bound");
+  CHECK(error_of("SELECT s FROM g9 GROUP BY s::text") == "bound");
+  CHECK(error_of("SELECT id, a FROM g9 GROUP BY id::int8") == "bound");
+  CHECK(error_of("SELECT a::int4, count(*) FROM g9 GROUP BY a") == "bound");
+  CHECK(error_of("SELECT a, count(*) FROM g9 GROUP BY +a") == ungrouped_a + " @7");
+  CHECK(error_of("SELECT +a FROM g9 GROUP BY 1 ORDER BY a") == ungrouped_a + " @38");
+  CHECK(error_of("SELECT a FROM g9 GROUP BY +a HAVING a > 1") == ungrouped_a + " @7");
+  CHECK(error_of("SELECT +a, count(*) FROM g9 GROUP BY +a HAVING a > 1") == ungrouped_a + " @47");
+  CHECK(error_of("SELECT +a, count(*) FROM g9 GROUP BY +a") == "bound");
+  CHECK(error_of("SELECT s, count(*) FROM g9 GROUP BY s::varchar") ==
+        "42803 column \"g9.s\" must appear in the GROUP BY clause or be used in an aggregate function @7");
+  CHECK(error_of("SELECT id, a FROM g9 GROUP BY +id") ==
+        "42803 column \"g9.id\" must appear in the GROUP BY clause or be used in an aggregate function @7");
+  CHECK(error_of("SELECT a::int8 FROM g9 GROUP BY a::int4") ==
+        "42601 an expression in the select list of an aggregated query is not supported yet @8");
+  // Not yet: an expression over keys or aggregates (P3), over a dependent
+  // column, and ORDER BY of AVG.
+  CHECK(error_of("SELECT lower(b) || 'z' FROM g9 GROUP BY lower(b)") ==
+        "42601 an expression in the select list of an aggregated query is not supported yet @16");
+  CHECK(error_of("SELECT lower(b) FROM g9 GROUP BY id") ==
+        "42601 an expression in the select list of an aggregated query is not supported yet @7");
+  CHECK(error_of("SELECT a FROM g9 GROUP BY a ORDER BY avg(id)").starts_with("42601 ORDER BY AVG"));
+  // ORDER BY an aggregate sorts the groups.
+  CHECK(error_of("SELECT a FROM g9 GROUP BY a ORDER BY count(*) DESC, max(b)") == "bound");
+  // Keys no sort key holds or groups as PostgreSQL does, and what reads
+  // again or per group.
+  CHECK(error_of("SELECT count(*) FROM g9 GROUP BY j->'k'").starts_with("0A000 GROUP BY of a jsonb value is not supported yet @"));
+  CHECK(error_of("SELECT DISTINCT j->'k' FROM g9").starts_with("0A000 DISTINCT of a jsonb value is not supported yet @"));
+  CHECK(error_of("SELECT count(*) FROM g9 GROUP BY coalesce(n, n)").starts_with("0A000 "));
+  CHECK(error_of("SELECT count(*) FROM g9 GROUP BY coalesce(ch, ch)") ==
+        "0A000 GROUP BY of a CHAR expression other than a column is not supported yet @33");
+  CHECK(error_of("SELECT count(*) FROM g9 GROUP BY random()") == "42601 GROUP BY random() is not supported yet @33");
+  CHECK(error_of("SELECT count(*) FROM g9 GROUP BY a + (SELECT 1)").starts_with("42601 a subquery in GROUP BY"));
+  CHECK(error_of("SELECT count(*) FROM g9 GROUP BY now()") == "42601 the time in GROUP BY is not supported yet @33");
+  CHECK(error_of("SELECT k + 1, count(*) FROM g9v GROUP BY k + 1").starts_with(
+      "42601 GROUP BY of an expression of a grouped view's columns"));
 }
 
 TEST_CASE("binder: a GROUP BY name is an input column first, else an output name (#904 G0)", "[sql][binder][group]") {
@@ -1781,8 +1905,8 @@ TEST_CASE("binder: a GROUP BY name is an input column first, else an output name
   CHECK(error_of("SELECT b AS k, a AS zz FROM g0 GROUP BY zz") ==
         "42803 column \"g0.b\" must appear in the GROUP BY clause or be used in an aggregate function @7");
   CHECK(error_of("SELECT a AS k FROM g0 GROUP BY k HAVING k > 1").starts_with("42703 "));
-  // An expression item is not a key yet (G1).
-  CHECK(error_of("SELECT a + 1 AS k FROM g0 GROUP BY k") == "42601 GROUP BY of an expression is not supported yet @35");
+  // An expression item is its expression's key (G1).
+  CHECK(error_of("SELECT a + 1 AS k FROM g0 GROUP BY k") == "bound");
   // A table's system columns are input columns PostgreSQL groups by: the
   // layer has none, so the name is refused, never an output name.
   CHECK(error_of("SELECT a AS ctid, count(*) FROM g0 GROUP BY ctid") == "42703 column \"ctid\" does not exist @44");
@@ -1791,7 +1915,7 @@ TEST_CASE("binder: a GROUP BY name is an input column first, else an output name
   // An unaliased item's name is PostgreSQL's FigureColname's.
   CHECK(error_of("SELECT count(*) FROM g0 GROUP BY count") == "42803 aggregate functions are not allowed in GROUP BY @7");
   CHECK(error_of("SELECT max(c) FROM g0 GROUP BY max") == "42803 aggregate functions are not allowed in GROUP BY @7");
-  CHECK(error_of("SELECT upper(b) FROM g0 GROUP BY upper") == "42601 GROUP BY of an expression is not supported yet @33");
+  CHECK(error_of("SELECT upper(b) FROM g0 GROUP BY upper") == "bound");
   CHECK(error_of("SELECT count(*) AS n FROM g0 GROUP BY count") == "42703 column \"count\" does not exist @38");
   // A USING column is the merged one: the left side's of an inner or LEFT
   // join, the right table's of a RIGHT join.

@@ -898,6 +898,7 @@ private:
       case Expr::Kind::Extract:
       case Expr::Kind::Cast:
       case Expr::Kind::Jsonb:
+      case Expr::Kind::GroupKey:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
       case Expr::Kind::Abs:
@@ -947,6 +948,7 @@ private:
       case Expr::Kind::Extract:
       case Expr::Kind::Cast:
       case Expr::Kind::Jsonb:
+      case Expr::Kind::GroupKey:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
       case Expr::Kind::Abs:
@@ -1767,7 +1769,8 @@ private:
                        "bc_sub_has_" + key_suffix(col.type) + "(cx, " + std::to_string(e.constant) + ", " + x.value + ")",
                        PhysType::Bool);
       }
-      case Expr::Kind::Aggregate: break;
+      case Expr::Kind::Aggregate:
+      case Expr::Kind::GroupKey: break;  // the group in hand's (group_value)
     }
     throw std::logic_error{"physical plan: an expression over columns codegen does not print"};
   }
@@ -1839,6 +1842,7 @@ private:
       case Expr::Kind::Extract:
       case Expr::Kind::Cast:
       case Expr::Kind::Jsonb:
+      case Expr::Kind::GroupKey:
       case Expr::Kind::Random:
       case Expr::Kind::Mod:
       case Expr::Kind::Neg:
@@ -2512,6 +2516,15 @@ private:
   // NULL, as C ("" if never), and its value.
   auto group_value(const Expr& e) -> std::pair<std::string, std::string> {
     const auto& g = *group_;
+    if (e.kind == Expr::Kind::GroupKey) {
+      // An expression key, in its slot from the group's first row; never
+      // streamed (physical::check).
+      auto slot = std::to_string(g.layout.expr_slot.at(static_cast<std::size_t>(e.constant)));
+      auto at = "(cx, " + g.handle + ", " + slot + ")";
+      auto value = std::string{e.phys() == PhysType::F64 ? "bc_agg_f64" : e.phys() == PhysType::Bytes ? "bc_agg_bytes" : "bc_agg_i64"} + at;
+      if (e.phys() == PhysType::Bool) value = "(" + value + " != 0)";
+      return {"bc_agg_null" + at, value};
+    }
     if (e.kind == Expr::Kind::Column) {
       const auto& c = e.col;
       auto j = key_index(g, c);
@@ -2602,7 +2615,8 @@ private:
       return;
     }
     auto [is_null, value] = group_value(e);
-    auto type = e.kind == Expr::Kind::Column ? e.col.type
+    auto type = e.kind == Expr::Kind::Column     ? e.col.type
+                : e.kind == Expr::Kind::GroupKey ? e.phys()
                 : folds_f64(e)                ? PhysType::F64
                 : folds_bytes(e)              ? PhysType::Bytes
                                               : PhysType::I64;
@@ -2644,13 +2658,22 @@ private:
   void group_sort_part(const physical::SortPart& part) {
     auto dir = std::string{part.desc ? "BC_SORT_DESC" : "BC_SORT_ASC"} + ", " +
                (part.nulls_first ? "BC_SORT_NULLS_FIRST" : "BC_SORT_NULLS_LAST");
-    const auto& col = std::get<ColumnRef>(part.key);  // a group's keys are columns (physical::check)
-    if (auto row = held_row(*group_, col)) {
-      w_.line("bc_sort_key_col(cx, sk, " + *row + ", " + w_.col(col) + ", " + dir + ");");
-      return;
+    // A key column, or a GroupKey or an aggregate (physical::check).
+    const auto* col = std::get_if<ColumnRef>(&part.key);
+    if (col != nullptr) {
+      if (auto row = held_row(*group_, *col)) {
+        w_.line("bc_sort_key_col(cx, sk, " + *row + ", " + w_.col(*col) + ", " + dir + ");");
+        return;
+      }
     }
-    auto [is_null, value] = group_value(Expr{logical::column(col, {})});
-    auto put = "bc_sort_key_" + key_suffix(col.type) + "(cx, sk, " + value + ", " + dir + ");";
+    const auto e = col != nullptr ? logical::column(*col, {}) : std::get<physical::ExprTarget>(part.key).expr;
+    auto [is_null, value] = group_value(e);
+    const auto type = col != nullptr                     ? col->type
+                      : e.kind == Expr::Kind::GroupKey ? e.phys()
+                      : folds_f64(e)                   ? PhysType::F64
+                      : folds_bytes(e)                 ? PhysType::Bytes
+                                                       : PhysType::I64;
+    auto put = "bc_sort_key_" + key_suffix(type) + "(cx, sk, " + value + ", " + dir + ");";
     if (is_null.empty()) {
       w_.line(put);
       return;
@@ -2689,11 +2712,29 @@ private:
     const auto gb = "gb" + g.i;
     const auto gr = "gr" + g.i;
     const auto gg = "gg" + g.i;
+    // The expression keys first: eval prints statements, which must not run
+    // inside an open key builder. Each is a part after the columns',
+    // ascending, NULLs first; a DOUBLE's -0.0 and NaN key as PostgreSQL's
+    // equality groups them (bc_sort_key_f64).
+    std::vector<Val> exprs;
+    for (const auto& x : op.exprs) exprs.push_back(eval(x));
     w_.line("bc_sort_key " + gb + " = bc_sort_key_begin(cx);");
     for (const auto& k : op.keys) sort_key_part(gb, k);
+    for (const auto& v : exprs) {
+      auto put = "bc_sort_key_" + key_suffix(v.type) + "(cx, " + gb + ", " + v.value + ", BC_SORT_ASC, BC_SORT_NULLS_FIRST);";
+      if (v.null.empty()) {
+        w_.line(put);
+        continue;
+      }
+      w_.open("if (" + v.null + ")");
+      w_.line("bc_sort_key_null(cx, " + gb + ", BC_SORT_ASC, BC_SORT_NULLS_FIRST);");
+      w_.otherwise();
+      w_.line(put);
+      w_.close();
+    }
     w_.line("bc_view " + gr + " = bc_sort_key_end(cx, " + gb + ");");
     w_.line("bc_group " + gg + " = bc_agg_group(cx, a" + g.i + ", " + gr + ");");
-    auto keyed = std::ranges::any_of(g.layout.key_slot, [](const auto& s) { return s.has_value(); });
+    auto keyed = !exprs.empty() || std::ranges::any_of(g.layout.key_slot, [](const auto& s) { return s.has_value(); });
     if (!g.layout.held.empty() || keyed) {
       w_.open("if (bc_agg_null(cx, " + gg + ", 0))");
       for (std::size_t j = 0; j < g.layout.held.size(); ++j) {
@@ -2705,6 +2746,14 @@ private:
         const auto& c = g.columns[j];
         auto put = "bc_agg_min_i64(cx, " + gg + ", " + std::to_string(*slot) + ", " + read_col(c) + ");";
         w_.line(c.nullable ? "if (!" + col_null(c) + ") " + put : put);
+      }
+      // An expression key's value, set once: on an empty slot a minimum
+      // stores it exactly, -0.0 and NaN included. A NULL leaves it unset.
+      for (std::size_t j = 0; j < exprs.size(); ++j) {
+        const auto& v = exprs[j];
+        auto fold = v.type == PhysType::F64 ? "bc_agg_min_f64" : v.type == PhysType::Bytes ? "bc_agg_min_bytes" : "bc_agg_min_i64";
+        auto put = std::string{fold} + "(cx, " + gg + ", " + std::to_string(g.layout.expr_slot[j]) + ", " + v.value + ");";
+        w_.line(v.null.empty() ? put : "if (" + is_not(v.null) + ") " + put);
       }
       w_.close();
     }
@@ -2813,7 +2862,7 @@ private:
   // given one at a time (stream).
   void produce(const physical::GroupAggregate& op, const Consume& k) {
     const auto columns = op.columns();
-    Group g{&op, columns, physical::group_layout(columns, op.aggs), std::to_string(groups_++), {}};
+    Group g{&op, columns, physical::group_layout(columns, op.aggs, op.exprs), std::to_string(groups_++), {}};
     open_structures(g);
     if (op.streamed) {
       stream(g, k);
@@ -3106,7 +3155,7 @@ private:
       n = l->input.get();
     }
     const auto* g = physical::group_below(*n);
-    if (g == nullptr || !g->keys.empty()) return {};
+    if (g == nullptr || !g->keyless()) return {};
     std::string cond;
     if (const auto* f = std::get_if<physical::Filter>(&n->op)) {
       for (const auto& c : f->conjuncts) {

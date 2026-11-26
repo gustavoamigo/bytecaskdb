@@ -1836,7 +1836,9 @@ Stage C1, casts of any expression, is built, with its as-built notes under
 expression*. Stage G0, `GROUP BY` positions and output names of column
 items, is built in the parser and binder alone: its keys are columns, so
 nothing here changed (its notes are `frontend_design.md`'s **As built
-(G0)**). The other stages are not yet. The dialect, PG 17's behaviour, the
+(G0)**). Stage G1, `GROUP BY` and `SELECT DISTINCT` of expressions, is
+built, with its as-built notes under *Group keys and DISTINCT values of an
+expression*. Stage G2 is not yet. The dialect, PG 17's behaviour, the
 refusals, the stages (M1, C0, C1, S1, G0, G1, G2) and the open questions are
 `frontend_design.md`, *Expressions in casts, GROUP BY, DISTINCT, SET and
 MIN/MAX of text (#904)*. This section is how the plan, the search, the
@@ -2115,6 +2117,44 @@ a scalar's text is at most a few dozen bytes. Each cast of fixed size
 - **Plan API.** Nothing new: the sort-key builders and decoders
   (`bc_plan.h:499-523`) and the i64/f64 slots cover integer, date, time,
   DECIMAL, boolean, double and text keys.
+
+As built (G1), where it departs from the above:
+
+- `physical::GroupAggregate` keeps `keys` as columns and gains `exprs`, the
+  expression keys, keyed after the columns; `keyless()` is neither. The
+  search splits `Aggregate::group_by` into the two and renumbers each
+  `GroupKey(i)`, which the binder numbers by `group_by`, to its place in
+  `exprs`; a key that binds to a column is a column key, so a `GroupKey`
+  always names an expression. No variant key type was needed.
+- Every expression key takes a slot, Bytes included: its value is set on
+  the group's first row by `bc_agg_min_bytes` on the empty slot, as I64,
+  Bool (`bc_agg_min_i64`) and F64 (`bc_agg_min_f64`) are, and read with
+  `bc_agg_bytes`. Nothing decodes the group's key, so `in_group` needs no
+  prologue; the held copy is charged as a text `MIN` is.
+- A plan with an expression key takes no covering scan (`may_cover` is
+  false): the key is evaluated from the row in hand.
+- `avoiding_ordered` is built only when every ordered item is a column;
+  `group_past` counts an expression key's part, and a sort part of a
+  `GroupKey` or an aggregate, at its marker byte alone.
+- `ORDER BY` an aggregate other than `AVG` (`frontend_design.md`, **As built
+  (G1)**) is a sort part of the groups (`physical::ExprTarget` of the
+  aggregate), read by `group_value` as a `HAVING` reads it; the search adds
+  the call to the group's aggregates. `check` refuses an `AVG` there.
+- `check` (`physical::of_groups`) takes a `GroupKey` in a `GroupEmit`, a
+  `HAVING` over its groups and a sort of them when it names one of the
+  `exprs` of its type, and refuses one anywhere else (`value()`), a
+  streamed expression key, one of random(), of a type no sort key holds or
+  of CHAR type, or over a derived relation's columns.
+- Tests: `physical: check takes an expression key in a structure only,
+  read by GroupKey (#904 G1)`, `search: an expression key is held in a
+  structure, never streamed, its groups sorted (#904 G1)`, `binder: GROUP
+  BY and DISTINCT of expressions, matched as written (#904 G1)`, `parser:
+  GROUP BY takes any value expression (#904 G1)`, `embedded API: GROUP BY
+  and DISTINCT of expressions give PostgreSQL 17's groups (#904 G1)`, the
+  allocation sweep's `a structure keyed by an expression, its value in a
+  slot` (`tests/plan_alloc_faults_test.cpp`), `proof:
+  group_by_an_expression` in `tests/proof/test_sql_machine.py`, and
+  `tests/functional/cases/postgresql/aggregates.yaml`. No golden plan.
 
 #### UPDATE SET of an expression
 

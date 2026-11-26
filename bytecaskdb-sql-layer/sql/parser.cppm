@@ -1590,25 +1590,27 @@ void resolve_output_names(Select& sel) {
   }
 }
 
-// The select item a GROUP BY position or output name names, as a key: a
-// column item is that column. An item holding an aggregate is 42803 at the
-// aggregate, as PostgreSQL's; an expression item is not a key yet (#904
-// stage G1), refused at `at`, the position or name.
-auto group_key(const Expr& item, std::int32_t at) -> Expr {
-  std::function<const Expr*(const Expr&)> aggregate = [&](const Expr& e) -> const Expr* {
-    if (e.kind == Expr::Kind::Aggregate) return &e;
-    for (const auto* x : {e.lhs.get(), e.rhs.get()}) {
-      if (x == nullptr) continue;
-      if (const auto* a = aggregate(*x)) return a;
-    }
-    for (const auto& a : e.args) {
-      if (const auto* found = aggregate(a)) return found;
-    }
-    return nullptr;
-  };
-  if (const auto* a = aggregate(item)) reject("aggregate functions are not allowed in GROUP BY", a->pos, kGroupingError);
-  if (item.kind != Expr::Kind::Column) reject("GROUP BY of an expression is not supported yet", at);
-  return clone(item);
+// The aggregate call in e, or null: the first, outermost and leftmost.
+auto aggregate_in(const Expr& e) -> const Expr* {
+  if (e.kind == Expr::Kind::Aggregate) return &e;
+  for (const auto* x : {e.lhs.get(), e.rhs.get()}) {
+    if (x == nullptr) continue;
+    if (const auto* a = aggregate_in(*x)) return a;
+  }
+  for (const auto& a : e.args) {
+    if (const auto* found = aggregate_in(a)) return found;
+  }
+  return nullptr;
+}
+
+// A GROUP BY key: a column or any value expression of the FROM's columns
+// (docs/frontend_design.md, *GROUP BY of an expression*). One holding an
+// aggregate is 42803 at the aggregate, as PostgreSQL's; a subquery is not
+// taken yet.
+auto group_key(const Expr& key) -> Expr {
+  if (const auto* a = aggregate_in(key)) reject("aggregate functions are not allowed in GROUP BY", a->pos, kGroupingError);
+  if (key.kind == Expr::Kind::Subquery) reject("a subquery in GROUP BY is not supported yet", key.pos);
+  return clone(key);
 }
 
 // ORDER BY 2 of a plain SELECT orders by the second select-list item's
@@ -1806,9 +1808,9 @@ void resolve_aliases(Select& sel, bool nested) {
 }
 
 // GROUP BY's keys, as PostgreSQL 17's findTargetlistEntrySQL92 reads them:
-// a column, or an integer constant, the select-list item at that position
-// (group_key). Any other constant is 42601, as PostgreSQL's; an expression,
-// grouping sets, ROLLUP and CUBE are refused. A bare name that is no input
+// a column or an expression, or an integer constant, the select-list item
+// at that position (group_key). Any other constant is 42601, as
+// PostgreSQL's; grouping sets, ROLLUP, CUBE and () are refused. A bare name that is no input
 // column is an output name, which only the binder can tell
 // (group_output_names). Runs before resolve_aliases, so a position's item is
 // requalified as the item is.
@@ -1825,11 +1827,11 @@ void group_items(const PgQuery__SelectStmt* s, Select& sel, std::int32_t pos) {
       if (std::ranges::any_of(sel.targets, [](const Expr& e) { return e.kind == Expr::Kind::Star; })) {
         reject("GROUP BY position with * in the select list is not supported yet", c->location);
       }
-      sel.group_by.push_back(group_key(sel.targets[static_cast<std::size_t>(position - 1)], c->location));
+      sel.group_by.push_back(group_key(sel.targets[static_cast<std::size_t>(position - 1)]));
       continue;
     }
-    if (g->node_case != PG_QUERY__NODE__NODE_COLUMN_REF) reject("GROUP BY takes columns", pos);
-    sel.group_by.push_back(expr(g));
+    if (g->node_case == PG_QUERY__NODE__NODE_GROUPING_SET) reject("GROUP BY takes columns", pos);
+    sel.group_by.push_back(group_key(expr(g)));
   }
 }
 
@@ -2647,7 +2649,7 @@ auto group_output_names(const Select& s, const std::function<bool(const std::str
       out.emplace();
       for (const auto& e : s.group_by) out->push_back(clone(e));
     }
-    (*out)[i] = group_key(*hit, g.pos);
+    (*out)[i] = group_key(*hit);
   }
   return out;
 }

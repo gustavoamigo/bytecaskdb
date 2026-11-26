@@ -3176,36 +3176,7 @@ public:
   // by its type's name (int4, date), anything else ?column?.
   auto constant_output(const ast::Expr& e) -> logical::Output {
     auto c = fold(e);
-    auto name = [&]() -> std::string {
-      switch (e.kind) {
-        case ast::Expr::Kind::Cast: return figure_colname(e).first;
-        case ast::Expr::Kind::Case: return "case";
-        case ast::Expr::Kind::Coalesce: return "coalesce";
-        case ast::Expr::Kind::NullIf: return "nullif";
-        case ast::Expr::Kind::Func: return e.func == "||" || e.func == "%" || is_jsonb_accessor(e.func) ? "?column?" : e.func;  // an operator is unnamed
-        case ast::Expr::Kind::Column:
-        case ast::Expr::Kind::Param:
-        case ast::Expr::Kind::Const:
-        case ast::Expr::Kind::Literal:
-        case ast::Expr::Kind::Add:
-        case ast::Expr::Kind::Sub:
-        case ast::Expr::Kind::Mul:
-        case ast::Expr::Kind::Div:
-        case ast::Expr::Kind::Star:
-        case ast::Expr::Kind::Plus:
-        case ast::Expr::Kind::Neg:
-        case ast::Expr::Kind::Compare:
-        case ast::Expr::Kind::IsNull:
-        case ast::Expr::Kind::Not:
-        case ast::Expr::Kind::And:
-        case ast::Expr::Kind::Or:
-        case ast::Expr::Kind::Aggregate:
-        case ast::Expr::Kind::Clock:
-        case ast::Expr::Kind::Default:
-        case ast::Expr::Kind::Subquery: break;
-      }
-      return "?column?";
-    }();
+    auto name = expression_name(e);
     return {fixed(std::move(c.value), c.type), name};
   }
 
@@ -3289,6 +3260,7 @@ public:
         case K::InSet:
         case K::Case:
         case K::Coalesce:
+        case K::GroupKey:
         case K::Random: return false;
       }
       return false;
@@ -5696,28 +5668,24 @@ public:
     // selected, each group then one row; else not yet. Checked in
     // PostgreSQL's order.
     auto distinct_groups = s.distinct && !aggregated;
+    // Two expressions alike as group keys: written alike, each column
+    // reference resolving to the same column (#904, open question 7).
+    auto same_ref = [&](const ast::Expr& x, const ast::Expr& y) { return resolve(x) == resolve(y); };
+    auto alike = [&](const ast::Expr& x, const ast::Expr& y) { return ast::same_expr(x, y, same_ref); };
     if (s.distinct) {
       if (s.for_update) throw SqlError{"FOR UPDATE is not allowed with DISTINCT clause", s.pos, kFeatureNotSupported};
+      // A key is selected where an item is written alike.
       auto selected = [&](const ast::Expr& e) {
-        auto ref = resolve(e);
-        return std::ranges::any_of(list, [&](const ast::Expr& t) { return t.kind == ast::Expr::Kind::Column && resolve(t) == ref; });
-      };
-      // An expression key is selected where an item is written alike.
-      auto key_selected = [&](const ast::Expr& e) {
-        if (e.kind == ast::Expr::Kind::Column) return selected(e);
-        return std::ranges::any_of(list, [&](const ast::Expr& t) { return ast::same_expr(t, e); });
+        return std::ranges::any_of(list, [&](const ast::Expr& t) { return alike(t, e); });
       };
       for (const auto& o : s.order_by) {
-        if (!key_selected(o.expr)) {
+        if (!selected(o.expr)) {
           throw SqlError{"for SELECT DISTINCT, ORDER BY expressions must appear in select list", o.pos,
                          kInvalidColumnReference};
         }
       }
       if (aggregated && !std::ranges::all_of(s.group_by, selected)) {
         not_yet("SELECT DISTINCT of groups it does not select every GROUP BY column of", s.pos);
-      }
-      for (const auto& e : list) {
-        if (distinct_groups && e.kind != ast::Expr::Kind::Column) not_yet("SELECT DISTINCT of other than columns", e.pos);
       }
     }
     aggregated = aggregated || distinct_groups;
@@ -5726,7 +5694,25 @@ public:
     }
     auto grouping = !s.group_by.empty() || distinct_groups;
     std::vector<logical::Expr> group_by;
+    // Each expression key as written, and its index in group_by: a select
+    // item, HAVING operand or ORDER BY key written alike is that key.
+    std::vector<std::pair<const ast::Expr*, std::size_t>> expr_keys;
+    // The grouped columns: a key written as a column, or as a cast of one to
+    // its own type (bare_column), which PostgreSQL binds to the column
+    // itself. Only these make a column grouped, or its table's primary key
+    // grouped; any other key that binds to a column (+a, s::varchar of a
+    // text s) is an expression PostgreSQL does not equate with the column.
+    std::vector<logical::Expr> column_keys;
     for (const auto& e : distinct_groups ? list : s.group_by) {
+      if (e.kind != ast::Expr::Kind::Column) {
+        if (std::ranges::any_of(expr_keys, [&](const auto& k) { return alike(e, *k.first); })) continue;
+        auto g = group_expression(e, resolve, distinct_groups);
+        if (bare_column(e, resolve) != nullptr && std::ranges::find(column_keys, g) == column_keys.end()) column_keys.push_back(g);
+        auto at = std::ranges::find(group_by, g);
+        expr_keys.emplace_back(&e, static_cast<std::size_t>(at - group_by.begin()));
+        if (at == group_by.end()) group_by.push_back(std::move(g));
+        continue;
+      }
       auto [t, c] = resolve(e);
       if (uncompared(c->sql.kind)) {
         refuse_uncompared(c->sql.kind, std::string{distinct_groups ? "DISTINCT" : "GROUP BY"} + " of a " + uncompared_name(c->sql.kind) + " column", e.pos);
@@ -5737,6 +5723,7 @@ public:
         not_yet("grouping a grouped view's rows by a " + pg_type_name(c->sql) + " column", e.pos);
       }
       auto g = logical::column_of(t->id, *c);
+      if (std::ranges::find(column_keys, g) == column_keys.end()) column_keys.push_back(g);
       if (std::ranges::find(group_by, g) == group_by.end()) group_by.push_back(std::move(g));
     }
     // A column of an aggregated query: grouped, or dependent, as its
@@ -5744,14 +5731,46 @@ public:
     std::vector<logical::Expr> dependent;
     auto grouped = [&](const Table& t, const Column& c, std::int32_t pos) -> logical::Expr {
       auto g = logical::column_of(t.id, c);
-      if (std::ranges::find(group_by, g) != group_by.end()) return g;
+      if (std::ranges::find(column_keys, g) != column_keys.end()) return g;
       // A table with no primary key, a derived relation, determines nothing.
       auto by_key = grouping && !t.pk_col_ids.empty() && std::ranges::all_of(t.pk_col_ids, [&](std::uint32_t id) {
-        return std::ranges::find(group_by, logical::column_of(t.id, *t.column(id))) != group_by.end();
+        return std::ranges::find(column_keys, logical::column_of(t.id, *t.column(id))) != column_keys.end();
       });
       if (!by_key) ungrouped(t, c.name, pos);
       if (std::ranges::find(dependent, g) == dependent.end()) dependent.push_back(g);
       return g;
+    };
+    // The value of the expression key written as e, or nullopt: a key that
+    // binds to a column (a relabel of one) is that column; any other the
+    // Aggregate's GroupKey. A cast of a column to its own type is that
+    // column, grouped or 42803 at it, as PostgreSQL binds it.
+    auto key_of = [&](const ast::Expr& e) -> std::optional<logical::Expr> {
+      for (const auto& [written, i] : expr_keys) {
+        if (!alike(e, *written)) continue;
+        const auto& g = group_by[i];
+        if (g.kind == logical::Expr::Kind::Column) return g;
+        return logical::group_key(i, g.type);
+      }
+      if (const auto* col = bare_column(e, resolve)) {
+        auto [t, c] = resolve(*col);
+        return grouped(*t, *c, col->pos);
+      }
+      return std::nullopt;
+    };
+    // PostgreSQL's check of an expression over the groups, top down: a
+    // subtree alike a key is grouped, an aggregate is folded, and any other
+    // column must be grouped or dependent (42803 at it).
+    std::function<void(const ast::Expr&)> check_grouped = [&](const ast::Expr& x) {
+      if (x.kind == ast::Expr::Kind::Aggregate || x.kind == ast::Expr::Kind::Subquery || key_of(x)) return;
+      if (x.kind == ast::Expr::Kind::Column) {
+        auto [t, c] = resolve(x);
+        (void)grouped(*t, *c, x.pos);
+        return;
+      }
+      for (const auto* side : {x.lhs.get(), x.rhs.get()}) {
+        if (side != nullptr) check_grouped(*side);
+      }
+      for (const auto& a : x.args) check_grouped(a);
     };
     std::vector<logical::Output> targets;
     std::vector<bool> deferred(list.size(), false);
@@ -5770,6 +5789,12 @@ public:
         targets.push_back(plain_output(e, resolve));
         continue;
       }
+      if (e.kind != ast::Expr::Kind::Column) {
+        if (auto k = key_of(e)) {
+          targets.push_back({std::move(*k), expression_name(e)});
+          continue;
+        }
+      }
       if (e.kind == ast::Expr::Kind::Clock) {
         if (clock_words(e).starts_with("CURRENT_DATE")) not_yet("the time in the select list of an aggregated query", e.pos);
         refuse_clock(e, "in the select list of an aggregated query");
@@ -5779,7 +5804,12 @@ public:
                     " in the select list of an aggregated query",
                 e.pos);
       }
-      if (e.kind != ast::Expr::Kind::Column) not_yet("an expression in the select list of an aggregated query", e.pos);
+      if (e.kind != ast::Expr::Kind::Column) {
+        // An expression over keys and aggregates is stage P3's; an ungrouped
+        // column in it is PostgreSQL's 42803 first.
+        check_grouped(e);
+        not_yet("an expression in the select list of an aggregated query", e.pos);
+      }
       auto [t, c] = resolve(e);
       targets.push_back({grouped(*t, *c, e.pos), c->name});
     }
@@ -5792,7 +5822,7 @@ public:
       key_table_ = t.storage_id();
     }
     std::vector<logical::Expr> having;
-    for (const auto& h : s.having) having.push_back(having_conjunct(h, resolve, grouped));
+    for (const auto& h : s.having) having.push_back(having_conjunct(h, resolve, grouped, key_of, check_grouped));
     // 0A000, as PostgreSQL refuses it, and in its order of checks.
     if (aggregated && s.for_update) {
       auto what = !s.group_by.empty() ? "GROUP BY clause" : !s.having.empty() ? "HAVING clause" : "aggregate functions";
@@ -5807,7 +5837,10 @@ public:
         keys.push_back({std::move(key), o.desc, o.nulls_first.value_or(o.desc)});
         continue;
       }
-      if (aggregated) not_yet("ORDER BY an expression in a grouped or aggregated query", o.pos);
+      if (aggregated) {
+        keys.push_back({grouped_order_key(o, key_of, check_grouped, resolve), o.desc, o.nulls_first.value_or(o.desc)});
+        continue;
+      }
       if (auto key = order_key(o.expr, resolve)) keys.push_back({std::move(*key), o.desc, o.nulls_first.value_or(o.desc)});
     }
 
@@ -5829,6 +5862,9 @@ public:
     }
     if (!where_conjuncts.empty()) rows = logical::node(logical::Filter{std::move(rows), std::move(where_conjuncts)});
     if (aggregated) {
+      // One group of every row is one row: its ORDER BY, bound above for
+      // its errors, orders nothing.
+      if (!grouping) keys.clear();
       rows = logical::node(logical::Aggregate{std::move(rows), std::move(targets), std::move(group_by), grouping,
                                               std::move(dependent)});
       if (!having.empty()) rows = logical::node(logical::Filter{std::move(rows), std::move(having)});
@@ -5998,6 +6034,16 @@ public:
     p->input = logical::node(logical::Filter{std::move(p->input), {std::move(unmatched)}});
   }
 
+  // A bare $n nothing typed before is typed as text, as PostgreSQL types an
+  // unknown in ORDER BY, GROUP BY and DISTINCT.
+  void text_if_untyped(const ast::Expr& e) {
+    if (params_.size() > e.param && params_[e.param].first) return;
+    const auto text = SqlType{SqlKind::Text};
+    const auto& col =
+        typed_params_.emplace_back(Column{0, "$" + std::to_string(e.param + 1), text, phys_type(text), true, std::monostate{}});
+    use_param(e.param, phys_type(text), e.pos, col, 0, Use::Operand);
+  }
+
   // An ORDER BY key of a query that is not aggregated, an expression of its
   // FROM columns bound as a select item is (plain_output), and evaluated per
   // row by the sort. A constant orders nothing and is no key (nullopt): a bare
@@ -6013,12 +6059,7 @@ public:
     if (holds(e, ast::Expr::Kind::Func, "random")) not_yet("ORDER BY random()", e.pos);
     if (holds(e, ast::Expr::Kind::Aggregate, nullptr)) not_yet("an aggregate in ORDER BY", e.pos);
     if (e.kind == ast::Expr::Kind::Param) {
-      if (params_.size() <= e.param || !params_[e.param].first) {
-        const auto text = SqlType{SqlKind::Text};
-        const auto& col = typed_params_.emplace_back(
-            Column{0, "$" + std::to_string(e.param + 1), text, phys_type(text), true, std::monostate{}});
-        use_param(e.param, phys_type(text), e.pos, col, 0, Use::Operand);
-      }
+      text_if_untyped(e);
       return std::nullopt;
     }
     auto key = plain_output(e, resolve).expr;
@@ -6423,15 +6464,133 @@ public:
     return rows;
   }
 
-  // One HAVING conjunct: a grouped column or an aggregate call compared with
-  // a parameter, in either order. The parameter takes the column's type, or
+  // An item's output name where it is no column, aggregate, clock or
+  // subquery: PostgreSQL 17's FigureColname of a cast, else the function's
+  // name, or ?column? for an operator, a constant or a parameter.
+  static auto expression_name(const ast::Expr& e) -> std::string {
+    switch (e.kind) {
+      case ast::Expr::Kind::Cast: return figure_colname(e).first;
+      case ast::Expr::Kind::Case: return "case";
+      case ast::Expr::Kind::Coalesce: return "coalesce";
+      case ast::Expr::Kind::NullIf: return "nullif";
+      case ast::Expr::Kind::Func: return e.func == "||" || e.func == "%" || is_jsonb_accessor(e.func) ? "?column?" : e.func;
+      case ast::Expr::Kind::Column:
+      case ast::Expr::Kind::Param:
+      case ast::Expr::Kind::Const:
+      case ast::Expr::Kind::Literal:
+      case ast::Expr::Kind::Add:
+      case ast::Expr::Kind::Sub:
+      case ast::Expr::Kind::Mul:
+      case ast::Expr::Kind::Div:
+      case ast::Expr::Kind::Star:
+      case ast::Expr::Kind::Plus:
+      case ast::Expr::Kind::Neg:
+      case ast::Expr::Kind::Compare:
+      case ast::Expr::Kind::IsNull:
+      case ast::Expr::Kind::Not:
+      case ast::Expr::Kind::And:
+      case ast::Expr::Kind::Or:
+      case ast::Expr::Kind::Aggregate:
+      case ast::Expr::Kind::Clock:
+      case ast::Expr::Kind::Default:
+      case ast::Expr::Kind::Subquery: break;
+    }
+    return "?column?";
+  }
+
+  // A GROUP BY key or SELECT DISTINCT item that is an expression of the
+  // FROM's columns (docs/frontend_design.md, *GROUP BY of an expression*),
+  // bound as a select item is and computed for each row; a constant or a
+  // parameter is a key the same for every row, never dropped. Refused: a
+  // type no sort key holds (jsonb, NUMERIC of no precision, 0A000), a CHAR
+  // expression (#904, open question 9), random(), the time and a subquery
+  // (42601), and an expression of a grouped view's columns, which live in
+  // the plan's locals.
+  auto group_expression(const ast::Expr& e, const Resolve& resolve, bool distinct) -> logical::Expr {
+    const std::string what = distinct ? "SELECT DISTINCT" : "GROUP BY";
+    std::function<const ast::Expr*(const ast::Expr&, const std::function<bool(const ast::Expr&)>&)> find =
+        [&](const ast::Expr& x, const std::function<bool(const ast::Expr&)>& is) -> const ast::Expr* {
+      if (is(x)) return &x;
+      for (const auto* side : {x.lhs.get(), x.rhs.get()}) {
+        if (side == nullptr) continue;
+        if (const auto* found = find(*side, is)) return found;
+      }
+      for (const auto& a : x.args) {
+        if (const auto* found = find(a, is)) return found;
+      }
+      return nullptr;
+    };
+    using K = ast::Expr::Kind;
+    if (find(e, [](const ast::Expr& x) { return x.kind == K::Func && x.func == "random"; })) not_yet(what + " random()", e.pos);
+    if (const auto* q = find(e, [](const ast::Expr& x) { return x.kind == K::Subquery; })) not_yet("a subquery in " + what, q->pos);
+    if (const auto* c = find(e, [](const ast::Expr& x) { return x.kind == K::Clock; })) not_yet("the time in " + what, c->pos);
+    auto derived = [&](const ast::Expr& x) { return x.kind == K::Column && Table::derived(resolve(x).first->id); };
+    if (const auto* c = find(e, derived)) not_yet(what + " of an expression of a grouped view's columns", c->pos);
+    // A bare $n is of the type its first use gave it, else text.
+    if (e.kind == K::Param) text_if_untyped(e);
+    auto g = e.kind == K::Param ? logical::param(e.param, params_[e.param].first->col->sql) : plain_output(e, resolve).expr;
+    const auto* of = distinct ? "DISTINCT" : "GROUP BY";
+    if (uncompared(g.type.kind)) refuse_uncompared(g.type.kind, std::string{of} + " of a " + uncompared_name(g.type.kind) + " value", e.pos);
+    if (g.type.kind == SqlKind::Char && g.kind != logical::Expr::Kind::Column) {
+      not_supported(std::string{of} + " of a CHAR expression other than a column", e.pos);
+    }
+    return g;
+  }
+
+  // The column e is a cast of, to that column's own type and modifier
+  // (a::int4 of an INTEGER a, n::numeric(10,2) of a NUMERIC(10,2) n), cast
+  // over cast: what PostgreSQL binds it to, the column itself; else null.
+  // A relabel (s::varchar of a TEXT s) or any other operator is no column.
+  auto bare_column(const ast::Expr& e, const Resolve& resolve) -> const ast::Expr* {
+    using K = ast::Expr::Kind;
+    if (e.kind != K::Cast) return nullptr;
+    const auto* x = &e;
+    while (x->kind == K::Cast) x = x->rhs.get();
+    if (x->kind != K::Column) return nullptr;
+    const auto& want = resolve(*x).second->sql;
+    // A modifier on a type that keeps none (timestamptz(6)) is a coercion
+    // PostgreSQL applies; NUMERIC of no precision is a NUMERIC column's own.
+    auto modified = want.kind == SqlKind::Varchar || want.kind == SqlKind::Char || want.kind == SqlKind::Decimal;
+    for (const auto* k = &e; k->kind == K::Cast; k = k->rhs.get()) {
+      if (!k->cast_schema.empty()) return nullptr;
+      if (k->cast_type == "numeric" && k->cast_typmods.empty()) {
+        if (want.kind != SqlKind::Numeric) return nullptr;
+        continue;
+      }
+      if (k->cast_typmods.empty() == modified) return nullptr;
+      if (k->cast_type == "varchar" && want.kind != SqlKind::Varchar) return nullptr;
+      if (cast_type(*k) != want) return nullptr;
+    }
+    return x;
+  }
+
+  // An ORDER BY key of an aggregated query that is no column: an expression
+  // key written alike, or an aggregate call, which sorts the groups by its
+  // value (AVG not yet: its quotient is numeric text no sort key holds).
+  // Any other expression is 42803 at an ungrouped column, else 42601.
+  auto grouped_order_key(const ast::OrderItem& o, const auto& key_of, const auto& check_grouped, const Resolve& resolve)
+      -> logical::Expr {
+    if (auto k = key_of(o.expr)) return std::move(*k);
+    if (o.expr.kind == ast::Expr::Kind::Aggregate) {
+      auto agg = aggregate(aggregate_arg(o.expr, resolve), o.expr).expr;
+      if (agg.fn == logical::Expr::Fn::Avg) not_yet("ORDER BY AVG in a grouped or aggregated query", o.pos);
+      return agg;
+    }
+    check_grouped(o.expr);
+    not_yet("ORDER BY an expression in a grouped or aggregated query", o.pos);
+  }
+
+  // One HAVING conjunct: a grouped column, an expression key written alike
+  // (key_of) or an aggregate call compared with a parameter, in either
+  // order; an operand with an ungrouped column is 42803 (check_grouped). The parameter takes the column's type, or
   // the aggregate's: COUNT's and SUM's of a SMALLINT or INTEGER a BIGINT,
   // SUM's of a BIGINT or DECIMAL the numeric at its scale, checked as a
   // BIGINT is (compared_type), MIN's and MAX's their column's (of text,
   // text); SUM's, MIN's and MAX's of a DOUBLE PRECISION a double precision, compared in
   // PostgreSQL's float8 order. HAVING on AVG is not supported: its quotient
   // is numeric text (PhysType::Num), which a plan does not compare.
-  auto having_conjunct(const ast::Compare& w, const auto& resolve, const auto& grouped) -> logical::Expr {
+  auto having_conjunct(const ast::Compare& w, const auto& resolve, const auto& grouped, const auto& key_of,
+                       const auto& check_grouped) -> logical::Expr {
     if (w.kind != ast::Compare::Kind::Compare) not_yet("HAVING with AND, OR, NOT, IS NULL, <>, BETWEEN, IN or a constant", w.pos);
     const auto* lhs = &w.lhs;
     const auto* rhs = &w.rhs;
@@ -6455,9 +6614,23 @@ public:
         not_supported("HAVING comparing a CHAR(n) column, or MIN or MAX of one, with a text value", w.pos);
       }
     };
-    if ((lhs->kind != ast::Expr::Kind::Column && lhs->kind != ast::Expr::Kind::Aggregate) ||
+    // An expression key written alike: the group's value of it, compared as
+    // a value of the key's type.
+    std::optional<logical::Expr> key;
+    if (lhs->kind != ast::Expr::Kind::Column && lhs->kind != ast::Expr::Kind::Aggregate) {
+      key = key_of(*lhs);
+      if (!key) check_grouped(*lhs);
+    }
+    if ((lhs->kind != ast::Expr::Kind::Column && lhs->kind != ast::Expr::Kind::Aggregate && !key) ||
         (rhs->kind != ast::Expr::Kind::Param && !constant)) {
       throw SqlError{"HAVING must compare a grouped column or an aggregate with a parameter or a constant", w.pos};
+    }
+    if (key) {
+      synthetic_.push_back(Column{0, "?column?", key->type, key->phys(), true, {}});
+      const auto& as = synthetic_.back();
+      if (constant) return logical::compare(op, std::move(*key), fixed(coerce(fold(*rhs), as, false, op_text(op)), as.sql));
+      auto sql = having_param(rhs->param, as.type, rhs->pos, as, 0);
+      return logical::compare(op, std::move(*key), logical::param(rhs->param, sql));
     }
     if (lhs->kind == ast::Expr::Kind::Column) {
       auto [t, c] = resolve(*lhs);
@@ -7720,7 +7893,8 @@ private:
   }
 
   // The query's clauses, each view column replaced by its item. A select-list
-  // column keeps its view name; a grouping column must stay a column.
+  // column keeps its view name; a grouping column may become an expression,
+  // a key like any other (#904 stage G1).
   void apply(ast::Select& s, const ColumnSwap& swap) {
     for (auto& e : s.targets) {
       auto name = e.kind == ast::Expr::Kind::Column ? (e.alias.empty() ? e.column : e.alias) : std::string{};
@@ -7729,10 +7903,7 @@ private:
     }
     for (auto& c : s.where) swap_columns(c, swap);
     for (auto& c : s.having) swap_columns(c, swap);
-    for (auto& g : s.group_by) {
-      swap_columns(g, swap);
-      if (g.kind != ast::Expr::Kind::Column) not_yet("grouping by a view column that is an expression", g.pos);
-    }
+    for (auto& g : s.group_by) swap_columns(g, swap);
     for (auto& o : s.order_by) swap_columns(o.expr, swap);
   }
 

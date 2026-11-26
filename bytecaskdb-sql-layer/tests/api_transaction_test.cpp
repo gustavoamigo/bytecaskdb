@@ -1593,6 +1593,33 @@ TEST_CASE("embedded API: a structure of groups compiled while its table was smal
   }
 }
 
+TEST_CASE("embedded API: a GROUP BY or DISTINCT of an expression of many groups is 54000 past the budget (#904 G1)",
+          "[sql][api][group][memory]") {
+  sql_test::TempDir dir{"api_group_expr_budget"};
+  auto db = Database::open(dir.path(), {.statement_memory_bytes = 64u << 10});
+  db->execute("CREATE TABLE g (k BIGINT PRIMARY KEY, a BIGINT, s TEXT)");
+  db->execute("CREATE INDEX g_a ON g (a)");
+  for (std::int64_t k = 1; k <= 2000; ++k) db->execute("INSERT INTO g VALUES ($1, $1, $2)", {k, sql_test::bytes("S" + std::to_string(k))});
+  // No index orders an expression key, g_a's included: each runs in the
+  // structure, whose 2,000 groups pass 64 KiB. Its HAVING keeps no group,
+  // so the groups alone take it past.
+  auto past = [&](const std::string& sql) {
+    try {
+      (void)db->execute(sql, {std::int64_t{1}, std::int64_t{1}});
+    } catch (const std::exception& e) {
+      return std::string{sqlstate(e)};
+    }
+    return std::string{"ran"};
+  };
+  CHECK(past("SELECT lower(s), count(*) FROM g WHERE k >= $1 GROUP BY lower(s) HAVING count(*) > $2") == "54000");
+  CHECK(past("SELECT a + 0, count(*) FROM g WHERE k >= $1 GROUP BY 1 HAVING count(*) > $2") == "54000");
+  CHECK(past("SELECT DISTINCT lower(s) FROM g WHERE k >= $1 AND a >= $2") == "54000");
+  // Over few groups the same statements run in the budget.
+  CHECK(db->execute("SELECT lower(s), count(*) FROM g WHERE k >= $1 AND k < 20 GROUP BY lower(s) HAVING count(*) > $2",
+                    {std::int64_t{1}, std::int64_t{0}}).rows.size() == 19);
+  CHECK(db->execute("SELECT DISTINCT a % 3 FROM g WHERE k >= $1 AND a >= $2", {std::int64_t{1}, std::int64_t{1}}).rows.size() == 3);
+}
+
 TEST_CASE("embedded API: a streamed COUNT(DISTINCT) holds only its group's values; a structure's count takes their bytes",
           "[sql][api][group][memory]") {
   sql_test::TempDir dir{"api_group_distinct"};
